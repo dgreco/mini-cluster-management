@@ -1,0 +1,15 @@
+---
+# The live Cluster dataplatform_pg_restore_cluster: sets
+# dataplatform_pg_restore_live (the object, {} when there is none).
+- name: The live Cluster {{ dataplatform_pg_restore_cluster }}
+  ansible.builtin.command: >-
+    {{ dataplatform_pg_restore_kubectl }} -n {{ dataplatform_pg_restore_namespace }}
+    get clusters.postgresql.cnpg.io {{ dataplatform_pg_restore_cluster }} -o json
+  register: dataplatform_pg_restore_live_out
+  changed_when: false
+  failed_when: dataplatform_pg_restore_live_out.rc != 0 and 'NotFound' not in dataplatform_pg_restore_live_out.stderr
+
+- name: Keep it
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_live: >-
+      {{ dataplatform_pg_restore_live_out.stdout | from_json if dataplatform_pg_restore_live_out.rc == 0 else {} }}

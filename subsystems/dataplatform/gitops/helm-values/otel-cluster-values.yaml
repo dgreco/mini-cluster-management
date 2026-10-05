@@ -1,0 +1,266 @@
+# OpenTelemetry collector for the whole cluster (one replica), the platform's
+# telemetry gateway:
+# - metrics: scrapes every Prometheus endpoint and receives OTLP metrics (the
+#   Vector aggregator's own), and sends them to VictoriaMetrics with
+#   Prometheus remote write (names unchanged);
+# - logs: Kubernetes events, and the OTLP logs sent to it. The Vector
+#   aggregator's (log.collector=vector: the Stackable products' logs) go to
+#   VictoriaLogs' Stackable tenant (AccountID 1), any other OTLP log to the
+#   default tenant 0.
+#
+# What is scraped:
+# - pods and services annotated prometheus.io/scrape=true (Keycloak, CNPG,
+#   OpenBao, Argo CD, NGF, kube-state-metrics, ...) and services labelled so
+#   (Stackable's *-metrics services: Trino, Spark history);
+# - the kubelets and cAdvisor through the API server;
+# - the Ceph side on every node: cephadm's node-exporter (:9100) and
+#   ceph-exporter (:9926), and the mgr's prometheus module (:9283). No second
+#   node-exporter is deployed.
+# In this file '$$' is a literal '$' (the collector expands ${...}).
+mode: deployment
+replicaCount: 1
+# the collector's own metrics (:8888), scraped by itself
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8888"
+image:
+  repository: otel/opentelemetry-collector-contrib
+presets:
+  kubernetesEvents:
+    enabled: true
+clusterRole:
+  create: true
+  rules:
+    - apiGroups: [""]
+      resources: [nodes, nodes/proxy, nodes/metrics, services, endpoints, pods]
+      verbs: [get, list, watch]
+    - apiGroups: [discovery.k8s.io]
+      resources: [endpointslices]
+      verbs: [get, list, watch]
+    - nonResourceURLs: [/metrics, /metrics/cadvisor]
+      verbs: [get]
+resources:
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {memory: 1Gi}
+config:
+  receivers:
+    jaeger: null
+    zipkin: null
+    otlp:
+      protocols:
+        grpc: {endpoint: "${env:MY_POD_IP}:4317"}
+        http: {endpoint: "${env:MY_POD_IP}:4318"}
+    prometheus:
+      config:
+        scrape_configs:
+          # honor_labels: a metric's own namespace/pod/service labels win over
+          # the target's (kube-state-metrics describes objects of every
+          # namespace; without it they all read "observability")
+          - job_name: kubernetes-pods
+            honor_labels: true
+            # the platform's namespaces only: a pod in a user namespace could
+            # annotate itself and, with honor_labels, wear another namespace's name
+            kubernetes_sd_configs:
+              - role: pod
+                namespaces: {names: [argocd, core, nginx-gateway, governance, compute, observability, operators, kube-system, ceph-csi-rbd, ceph-csi-cephfs]}
+            relabel_configs:
+              - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                action: keep
+                regex: "true"
+              - source_labels: [__meta_kubernetes_pod_phase]
+                action: drop
+                regex: Pending|Succeeded|Failed
+              - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                action: replace
+                target_label: __metrics_path__
+                regex: (.+)
+              - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+                action: replace
+                regex: ([^:]+)(?::\d+)?;(\d+)
+                replacement: $$1:$$2
+                target_label: __address__
+              - source_labels: [__meta_kubernetes_namespace]
+                target_label: namespace
+              - source_labels: [__meta_kubernetes_pod_name]
+                target_label: pod
+              - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+                target_label: app
+          - job_name: kubernetes-services
+            honor_labels: true
+            kubernetes_sd_configs:
+              - role: endpoints
+                namespaces: {names: [argocd, core, nginx-gateway, governance, compute, observability, operators, kube-system, ceph-csi-rbd, ceph-csi-cephfs]}
+            relabel_configs:
+              - source_labels:
+                  - __meta_kubernetes_service_annotation_prometheus_io_scrape
+                  - __meta_kubernetes_service_label_prometheus_io_scrape
+                action: keep
+                regex: .*true.*
+              # a pod the kubernetes-pods job scrapes already (CloudNativePG
+              # annotates its pods and, through inheritedMetadata, its r/ro/rw
+              # services) is not scraped a second time through a service
+              - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                action: drop
+                regex: "true"
+              - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]
+                action: replace
+                target_label: __scheme__
+                regex: (https?)
+              - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+                action: replace
+                target_label: __metrics_path__
+                regex: (.+)
+              - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+                action: replace
+                regex: ([^:]+)(?::\d+)?;(\d+)
+                replacement: $$1:$$2
+                target_label: __address__
+              - source_labels: [__meta_kubernetes_namespace]
+                target_label: namespace
+              - source_labels: [__meta_kubernetes_service_name]
+                target_label: service
+              - source_labels: [__meta_kubernetes_pod_name]
+                target_label: pod
+              # the job name dashboards expect (CloudNativePG, kubernetes-mixin)
+              - source_labels: [__meta_kubernetes_service_name]
+                regex: (kube-state-metrics)
+                target_label: job
+          - job_name: kubelet
+            scheme: https
+            authorization:
+              credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+            tls_config:
+              ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            kubernetes_sd_configs: [{role: node}]
+            relabel_configs:
+              - target_label: __address__
+                replacement: kubernetes.default.svc:443
+              - source_labels: [__meta_kubernetes_node_name]
+                target_label: __metrics_path__
+                replacement: /api/v1/nodes/$$1/proxy/metrics
+              - source_labels: [__meta_kubernetes_node_name]
+                target_label: node
+          - job_name: cadvisor
+            scheme: https
+            authorization:
+              credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+            tls_config:
+              ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            kubernetes_sd_configs: [{role: node}]
+            relabel_configs:
+              - target_label: __address__
+                replacement: kubernetes.default.svc:443
+              - source_labels: [__meta_kubernetes_node_name]
+                target_label: __metrics_path__
+                replacement: /api/v1/nodes/$$1/proxy/metrics/cadvisor
+              - source_labels: [__meta_kubernetes_node_name]
+                target_label: node
+          - job_name: node
+            kubernetes_sd_configs: [{role: node}]
+            relabel_configs:
+              - source_labels: [__address__]
+                regex: ([^:]+):\d+
+                replacement: $$1:9100
+                target_label: __address__
+              - source_labels: [__meta_kubernetes_node_name]
+                target_label: instance
+          - job_name: ceph-exporter
+            kubernetes_sd_configs: [{role: node}]
+            relabel_configs:
+              - source_labels: [__address__]
+                regex: ([^:]+):\d+
+                replacement: $$1:9926
+                target_label: __address__
+              - source_labels: [__meta_kubernetes_node_name]
+                target_label: instance
+          # OpenBao needs ?format=prometheus (unauthenticated_metrics_access is on)
+          - job_name: openbao
+            metrics_path: /v1/sys/metrics
+            params:
+              format: [prometheus]
+            kubernetes_sd_configs:
+              - role: pod
+                namespaces:
+                  names: [governance]
+            relabel_configs:
+              - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name, __meta_kubernetes_pod_container_port_number]
+                action: keep
+                regex: openbao;8200
+              - source_labels: [__meta_kubernetes_pod_name]
+                target_label: pod
+          # the active manager answers; a standby returns an empty page
+          - job_name: ceph
+            honor_labels: true
+            static_configs:
+              - targets: ["192.168.1.101:9283", "192.168.1.102:9283"]
+  exporters:
+    prometheusremotewrite:
+      endpoint: http://victoria-metrics.observability.svc:8428/api/v1/write
+      resource_to_telemetry_conversion:
+        enabled: false
+    otlphttp/victorialogs-events:
+      logs_endpoint: http://victoria-logs.observability.svc:9428/insert/opentelemetry/v1/logs
+      headers:
+        VL-Stream-Fields: k8s.namespace.name,k8s.object.kind
+        # the event's text is the log message (events.k8s.io/v1: note, v1: message)
+        VL-Msg-Field: object.note,object.message
+        VL-Ignore-Fields: object.metadata.managedFields
+    # OTLP logs of anything but Vector: the default tenant
+    otlphttp/victorialogs:
+      logs_endpoint: http://victoria-logs.observability.svc:9428/insert/opentelemetry/v1/logs
+      headers:
+        VL-Stream-Fields: service.name,k8s.namespace.name,k8s.pod.name,k8s.container.name
+    # the Stackable tenant ("VictoriaLogs Stackable" in Grafana): one stream per
+    # product, role group and container
+    otlphttp/victorialogs-stackable:
+      logs_endpoint: http://victoria-logs.observability.svc:9428/insert/opentelemetry/v1/logs
+      headers:
+        AccountID: "1"
+        ProjectID: "0"
+        VL-Stream-Fields: k8s.namespace.name,service.name,stackable.role,stackable.role_group,k8s.container.name
+  connectors:
+    # OTLP logs marked by the Vector aggregator go to the Stackable tenant; the
+    # rest (and anything whose condition fails) to the default tenant
+    routing/otlp-logs:
+      default_pipelines: [logs/otlp-default]
+      error_mode: ignore
+      table:
+        - context: resource
+          condition: attributes["log.collector"] == "vector"
+          pipelines: [logs/stackable]
+  processors:
+    # cluster="homelab" on every metric that has no cluster label of its own
+    # (the Kubernetes dashboards select on it; CloudNativePG and OpenBao use
+    # the label for their own clusters)
+    transform/cluster:
+      error_mode: ignore
+      metric_statements:
+        - context: datapoint
+          statements:
+            - set(attributes["cluster"], "homelab") where attributes["cluster"] == nil
+    resource/events:
+      attributes:
+        - {key: log.collector, value: otel-cluster, action: insert}
+  service:
+    pipelines:
+      traces: null
+      metrics:
+        receivers: [prometheus, otlp]
+        processors: [memory_limiter, transform/cluster, batch]
+        exporters: [prometheusremotewrite]
+      logs:
+        receivers: [k8sobjects]
+        processors: [memory_limiter, resource/events, batch]
+        exporters: [otlphttp/victorialogs-events]
+      logs/otlp:
+        receivers: [otlp]
+        processors: [memory_limiter]
+        exporters: [routing/otlp-logs]
+      logs/stackable:
+        receivers: [routing/otlp-logs]
+        processors: [batch]
+        exporters: [otlphttp/victorialogs-stackable]
+      logs/otlp-default:
+        receivers: [routing/otlp-logs]
+        processors: [batch]
+        exporters: [otlphttp/victorialogs]

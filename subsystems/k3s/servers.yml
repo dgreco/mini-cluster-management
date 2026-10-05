@@ -1,0 +1,8 @@
+---
+# Servers one at a time: the first bootstraps etcd, the others join it in turn.
+- name: Set up the k3s servers
+  hosts: k3s_servers
+  serial: 1
+  roles:
+    - role: k3s_node
+      k3s_node_role: server

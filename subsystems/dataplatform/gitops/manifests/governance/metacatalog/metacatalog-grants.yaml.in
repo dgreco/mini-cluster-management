@@ -1,0 +1,99 @@
+# What is granted on the platform's data: Meta Catalog is the only place where
+# data access is managed (provisioning/lib-iam.sh, lib-grants.sh).
+#
+# The record: one key per resource a member of <%= site_admin_group %> authorized in
+# Meta Catalog, {"path": ..., "grants": [{access, users, groups}]}. Argo CD
+# only creates it (seeded, on 2026-10-05, with the grants then in force; a
+# record made anew starts empty): the provisioning scripts write its data (authorize puts a
+# resource's key, reject removes it; the Application ignores /data), and it is
+# never pruned or deleted with the Application. iam-sync reads it (Trino's S3
+# mapping); iam-reconcile applies it to Ceph's STS roles every hour and copies
+# it to s3://<%= site_backup_bucket %>/metacatalog-grants/.
+# make dataplatform-grants lists it, plans, applies, removes a key and
+# restores a copy.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metacatalog-grants
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+---
+# What the scripts need to reach Ceph's IAM: the platform's values (as
+# inventory/group_vars/dataplatform.yml; make dataplatform-render checks the
+# endpoint, region and account). IAM_PLATFORM_ROLES are the roles Ansible
+# keeps (make dataplatform-iam: access.yaml's admin groups and Meta Catalog's
+# provisioner); the scripts never touch them, and their RGW user may not.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metacatalog-iam
+data:
+  GRANTS_CONFIGMAP: metacatalog-grants
+  MEDALLION_BUCKET: <%= dataplatform_bucket %>
+  MEDALLION_PREFIX: lakehouse                      # access.yaml metacatalog.prefix
+  IAM_ENDPOINT: https://<%= site_s3_host %>
+  IAM_REGION: <%= dataplatform_s3_region %>
+  IAM_ACCOUNT_ID: <%= dataplatform_rgw_account_id %>
+  IAM_OIDC_PROVIDER: keycloak.<%= dataplatform_domain %>/realms/<%= dataplatform_keycloak_realm %>
+  IAM_TRINO_USER: trino
+  IAM_MAX_SESSION: "43200"
+  IAM_PLATFORM_ROLES: grp-<%= site_admin_group %> usr-service-account-metacatalog-provisioner
+  IAM_KEY_DIR: /etc/metacatalog/iam
+---
+# Meta Catalog's pod (its scripts write the record) and iam-reconcile (reads
+# it) talk to the Kubernetes API for that one ConfigMap only.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: metacatalog
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: iam-reconcile
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: metacatalog-grants-writer
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [metacatalog-grants]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: metacatalog-grants-writer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: metacatalog-grants-writer
+subjects:
+  - kind: ServiceAccount
+    name: metacatalog
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: metacatalog-grants-reader
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [metacatalog-grants]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: metacatalog-grants-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: metacatalog-grants-reader
+subjects:
+  - kind: ServiceAccount
+    name: iam-reconcile

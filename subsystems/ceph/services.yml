@@ -1,0 +1,5 @@
+---
+- name: Core services (mon, mgr, crash) and cluster config
+  hosts: ceph_mons[0]
+  roles:
+    - ceph_services

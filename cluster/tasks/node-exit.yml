@@ -1,0 +1,17 @@
+---
+# Puts one node back into service: the subsystems' node-exit hooks in the
+# reverse order of node-enter.yml. Each hook returns only once its subsystem
+# is healthy again. Also used on a node whose enter hooks failed, so the hooks
+# do not rely on anything the enter hooks set. Included per node by
+# cluster/rolling-reboot.yml and cluster/power-on.yml.
+- name: Take the node out of Ceph maintenance
+  ansible.builtin.include_tasks: ../../subsystems/ceph/hooks/node-exit.yml
+  when: inventory_hostname in groups['ceph'] | default([])
+
+- name: Bring the node back in k3s
+  ansible.builtin.include_tasks: ../../subsystems/k3s/hooks/node-exit.yml
+  when: inventory_hostname in groups['k3s'] | default([])
+
+- name: Wait for the data platform
+  ansible.builtin.include_tasks: ../../subsystems/dataplatform/hooks/node-exit.yml
+  when: inventory_hostname in groups['dataplatform'] | default([])

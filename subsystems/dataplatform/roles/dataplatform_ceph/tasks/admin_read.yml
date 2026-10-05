@@ -1,0 +1,69 @@
+---
+# The S3 browser's view of all of Ceph (gitops/manifests/tools/s3browser): the
+# admin role may read every bucket, and an index lists them. radosgw-admin
+# sees every bucket; the owners' keys set the read statement in their bucket
+# policies (files/admin_read.py, on the control node). A bucket made later
+# appears after the next make dataplatform-ceph (or make dataplatform-admin-read).
+- name: Every bucket with its owner and usage
+  ansible.builtin.command: cephadm shell -- radosgw-admin bucket stats --format json
+  register: dataplatform_ceph_all_buckets
+  changed_when: false
+
+- name: Owners outside the platform's account
+  ansible.builtin.set_fact:
+    dataplatform_ceph_other_owners: >-
+      {{ dataplatform_ceph_all_buckets.stdout | from_json | map(attribute='owner') | unique
+         | reject('equalto', dataplatform_rgw_account_id) | reject('search', '\$') | list }}
+
+- name: Their keys (a bucket policy is set by the bucket's owner)
+  ansible.builtin.command: cephadm shell -- radosgw-admin user info --uid={{ item }}
+  loop: "{{ dataplatform_ceph_other_owners }}"
+  register: dataplatform_ceph_owner_info
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Key of the account's root (writes the index)
+  ansible.builtin.command: cephadm shell -- radosgw-admin user info --uid={{ dataplatform_account_root_uid }}
+  register: dataplatform_ceph_root_info
+  changed_when: false
+  no_log: true
+
+- name: Read grants for the admin role, and the bucket index
+  ansible.builtin.command:
+    argv: ["{{ ansible_playbook_python }}", "{{ role_path }}/files/admin_read.py"]
+    stdin: "{{ _doc | to_json }}"
+  vars:
+    _keys: >-
+      {%- set out = {} -%}
+      {%- for r in dataplatform_ceph_owner_info.results if r.rc == 0 and (r.stdout | from_json)['keys'] | length > 0 -%}
+      {%- set k = (r.stdout | from_json)['keys'][0] -%}
+      {%- set _ = out.update({r.item: {'access_key': k.access_key, 'secret_key': k.secret_key}}) -%}
+      {%- endfor -%}
+      {{ out }}
+    _root: "{{ (dataplatform_ceph_root_info.stdout | from_json)['keys'][0] }}"
+    _doc:
+      endpoint: "{{ dataplatform_s3_endpoint }}"
+      region: "{{ dataplatform_s3_region }}"
+      account: "{{ dataplatform_rgw_account_id }}"
+      role_arn: "arn:aws:iam::{{ dataplatform_rgw_account_id }}:role/{{ dataplatform_iam_group_role_prefix }}{{ dataplatform_iam_admin_groups | first }}"
+      index_bucket: "{{ dataplatform_bucket }}"
+      index_key: "{{ dataplatform_s3browser_index_key }}"
+      root: {access_key: "{{ _root.access_key }}", secret_key: "{{ _root.secret_key }}"}
+      buckets: >-
+        {%- set out = [] -%}
+        {%- for b in dataplatform_ceph_all_buckets.stdout | from_json -%}
+        {%- set u = (b.usage | default({}))['rgw.main'] | default({}) -%}
+        {%- set _ = out.append({'name': b.bucket, 'owner': b.owner, 'objects': u.num_objects | default(0),
+                                'size': u.size_actual | default(0), 'owner_keys': _keys.get(b.owner)}) -%}
+        {%- endfor -%}
+        {{ out }}
+  delegate_to: localhost
+  become: false
+  register: dataplatform_ceph_admin_read
+  changed_when: (dataplatform_ceph_admin_read.stdout | from_json).granted | length > 0
+  no_log: true
+
+- name: Admin read access
+  ansible.builtin.debug:
+    msg: "{{ dataplatform_ceph_admin_read.stdout | from_json }}"

@@ -1,0 +1,43 @@
+---
+# HARD power off through the BMC, of the whole cluster or of some nodes
+# (-e target=<node>, any inventory pattern). No OS shutdown, no subsystem
+# hooks. Use cluster/shutdown.yml unless the nodes are already unreachable.
+- name: Scope of the power-off
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Resolve the target
+      ansible.builtin.set_fact:
+        power_off_targets: "{{ query('inventory_hostnames', target | default('nodes')) | select('in', groups['nodes']) | list }}"
+
+    - name: The target names nodes of the inventory
+      ansible.builtin.assert:
+        that: power_off_targets | length > 0
+        fail_msg: "-e target={{ target | default('') }} matches no node; use one of {{ groups['nodes'] | join(', ') }}"
+        quiet: true
+
+- name: Hard power off via Turing Pi BMC
+  hosts: bmc
+  gather_facts: false
+  tasks:
+    - name: Power off all nodes
+      ansible.builtin.raw: tpi power off
+      changed_when: true
+      when: groups['nodes'] | difference(hostvars['localhost']['power_off_targets']) | length == 0
+
+    - name: Power off the target nodes
+      ansible.builtin.raw: tpi power off -n {{ hostvars[item]['turingpi_slot'] }}
+      loop: "{{ hostvars['localhost']['power_off_targets'] }}"
+      loop_control:
+        label: "{{ item }} (slot {{ hostvars[item]['turingpi_slot'] }})"
+      changed_when: true
+      when: groups['nodes'] | difference(hostvars['localhost']['power_off_targets']) | length > 0
+
+    - name: Query power status
+      ansible.builtin.raw: tpi power status
+      register: tpi_status
+      changed_when: false
+
+    - name: Show power status
+      ansible.builtin.debug:
+        msg: "{{ tpi_status.stdout_lines }}"

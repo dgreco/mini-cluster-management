@@ -1,0 +1,36 @@
+---
+# Restore the CloudNativePG clusters (keycloak-db, iceberg-catalog,
+# metacatalog-db) from their Barman Cloud backups,
+# s3://<backup bucket>/cnpg/<cluster>/<cluster>/ (roles/dataplatform_pg_restore).
+#
+#   make dataplatform-pg-restore-check [ARGS="-e pg_cluster=keycloak-db"]
+#     restores each cluster's backups into a scratch cluster
+#     <cluster>-restore-check, compares it with the live database and deletes
+#     it: changes nothing, the drill to run now and then
+#   make dataplatform-pg-restore ARGS="-e pg_cluster=<cluster> -e restore_confirm=yes"
+#     REPLACES the cluster by its backups: deleted and recreated, same name and
+#     spec; minutes of downtime for what uses it, writes of the last seconds
+#     lost. A failed run resumes when started again (backups/pg-restore/).
+# Both take -e pg_target_time="2026-10-03 13:30:00+00" (a point in time; by
+# default every archived WAL is replayed) and -e pg_target_tli=<n> (by default
+# the timeline the live primary is on).
+- name: Restore PostgreSQL clusters from their backups
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  vars:
+    dataplatform_pg_restore_mode: "{{ pg_restore_mode | default('check') }}"
+    dataplatform_pg_restore_cluster_input: "{{ pg_cluster | default('all') }}"
+    dataplatform_pg_restore_target_time: "{{ pg_target_time | default('') }}"
+    dataplatform_pg_restore_target_tli: "{{ pg_target_tli | default('') }}"
+  tasks:
+    - name: Replacing needs -e restore_confirm=yes
+      ansible.builtin.assert:
+        that: dataplatform_pg_restore_mode != 'replace' or (restore_confirm | default('')) == 'yes'
+        fail_msg: >-
+          This deletes {{ dataplatform_pg_restore_cluster_input }} and recreates it from its backups.
+          Run: make dataplatform-pg-restore ARGS="-e pg_cluster=<cluster> -e restore_confirm=yes"
+        quiet: true
+
+    - name: Restore
+      ansible.builtin.include_role:
+        name: dataplatform_pg_restore

@@ -1,0 +1,5 @@
+---
+# Alias: the S3 part of the Ceph install (RGW daemons, ingress, STS, admin user).
+#   make ceph-s3
+- name: RGW (S3), STS, ingress
+  ansible.builtin.import_playbook: rgw.yml

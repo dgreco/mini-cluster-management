@@ -1,0 +1,120 @@
+---
+# Back up what a rebuilt cluster cannot regenerate, from the admin host to
+# backups/ceph/<timestamp>/ on the control node (git-ignored, root-only):
+#   make ceph-backup
+# - the monitor config-key store (cephadm's SSH key, the ingress certificate),
+#   every auth entity and key, the orchestrator service specs, the config
+#   database, the mon and OSD maps;
+# - /etc/ceph (admin keyring, ceph.conf, the spec files) and the Let's Encrypt
+#   account of the S3 certificate (/etc/ceph/acme; a rebuild that makes a new
+#   account runs into Let's Encrypt's rate limits);
+# - the RGW users with their keys, the STS roles with their policies, the
+#   zonegroup.
+# Data (S3 objects, CephFS, k3s volumes) is not included: it stays on the OSDs.
+# Restoring is manual (cephadm bootstrap, then `ceph auth import`,
+# `ceph orch apply -i`, `ceph config assimilate-conf`, `radosgw-admin user
+# create` from the JSON); the files are the record.
+- name: Back up the Ceph cluster's state
+  hosts: ceph_mons[0]
+  gather_facts: false
+  vars:
+    ceph_backup_remote: /var/tmp/ceph-backup
+  tasks:
+    # fixed once: a lookup in a play var is evaluated again at every use
+    - name: Name of this backup
+      ansible.builtin.set_fact:
+        ceph_backup_dir: "{{ playbook_dir }}/../../backups/ceph/{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+    - name: Directory on the control node
+      ansible.builtin.file:
+        path: "{{ ceph_backup_dir }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Directory on the admin host
+      ansible.builtin.file:
+        path: "{{ ceph_backup_remote }}"
+        state: directory
+        mode: "0700"
+
+    - name: Cluster state
+      ansible.builtin.shell: |
+        set -o pipefail
+        cd {{ ceph_backup_remote }}
+        umask 077
+        c() { cephadm shell -- "$@" 2>/dev/null; }
+        c ceph config-key dump > config-key.json
+        c ceph auth export > auth.keyring
+        c ceph orch ls --export > orch-services.yaml
+        c ceph config dump --format json > config.json
+        c ceph mon dump --format json > mon-map.json
+        c ceph osd dump --format json > osd-map.json
+        c ceph osd tree --format json > osd-tree.json
+        c ceph fs dump --format json > fs-map.json
+        c ceph -s --format json > status.json
+        if {{ 'true' if ceph_rgw_enabled | bool else 'false' }}; then
+          c radosgw-admin zonegroup get > rgw-zonegroup.json
+          c radosgw-admin user list --format json > rgw-users.json
+          mkdir -p rgw-user rgw-role
+          for u in $(python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)))' < rgw-users.json); do
+            c radosgw-admin user info --uid="$u" > "rgw-user/$u.json"
+          done
+          c radosgw-admin role list --format json > rgw-roles.json
+          for r in $(python3 -c 'import json,sys; print(" ".join(x["RoleName"] for x in json.load(sys.stdin)))' < rgw-roles.json); do
+            c radosgw-admin role get --role-name="$r" > "rgw-role/$r.json"
+            c radosgw-admin role-policy list --role-name="$r" --format json > "rgw-role/$r.policies.json"
+            for p in $(python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)))' < "rgw-role/$r.policies.json"); do
+              c radosgw-admin role-policy get --role-name="$r" --policy-name="$p" > "rgw-role/$r.policy.$p.json"
+            done
+          done
+        fi
+        tar -czf etc-ceph.tgz -C / etc/ceph
+        ls -1
+      args:
+        executable: /bin/bash
+      register: ceph_backup_files
+      changed_when: true
+
+    - name: Fetch to the control node
+      ansible.builtin.fetch:
+        src: "{{ ceph_backup_remote }}/{{ item }}"
+        dest: "{{ ceph_backup_dir }}/"
+        flat: true
+      loop: "{{ ceph_backup_files.stdout_lines | reject('in', ['rgw-user', 'rgw-role']) | list }}"
+
+    - name: Fetch the RGW users and roles
+      ansible.builtin.shell: |
+        set -o pipefail
+        cd {{ ceph_backup_remote }} && tar -czf rgw-users-roles.tgz rgw-user rgw-role 2>/dev/null || true
+        ls rgw-users-roles.tgz 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: ceph_backup_rgw_tar
+      changed_when: false
+      when: ceph_rgw_enabled | bool
+
+    - name: Fetch the RGW archive
+      ansible.builtin.fetch:
+        src: "{{ ceph_backup_remote }}/rgw-users-roles.tgz"
+        dest: "{{ ceph_backup_dir }}/"
+        flat: true
+      when: ceph_rgw_enabled | bool and ceph_backup_rgw_tar.stdout | length > 0
+
+    - name: Remove the copy on the admin host
+      ansible.builtin.file:
+        path: "{{ ceph_backup_remote }}"
+        state: absent
+
+    - name: Root-only on the control node
+      ansible.builtin.file:
+        path: "{{ ceph_backup_dir }}"
+        mode: "u=rwX,go="
+        recurse: true
+      delegate_to: localhost
+      become: false
+
+    - name: Backup
+      ansible.builtin.debug:
+        msg: "{{ ceph_backup_dir | realpath }}: {{ ceph_backup_files.stdout_lines | join(', ') }}"

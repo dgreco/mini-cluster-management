@@ -1,0 +1,13 @@
+---
+# Where the platform is reachable: k3s servicelb on the dataplatform_gateway
+# nodes only, and public DNS <domain>, *.<domain> -> those nodes.
+- name: Facts of the gateway nodes
+  hosts: dataplatform_gateway
+  gather_facts: true
+  tasks: []
+
+- name: Gateway nodes and public DNS
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  roles:
+    - dataplatform_edge

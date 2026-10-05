@@ -1,0 +1,53 @@
+# Barman Cloud plugin v0.15.1 (chart 0.8.1) of CloudNativePG: WAL archiving,
+# base backups and restores of every PostgreSQL cluster, to the ObjectStore
+# each cluster names (governance/*-objectstore.yaml). It replaces the
+# operator's own barmanObjectStore, which CloudNativePG 1.31 removes. It must
+# run in the operator's namespace, where the operator finds it by its
+# Service; its certificates come from cert-manager.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cnpg-barman-cloud-plugin
+  namespace: argocd
+  annotations:
+    # after the operator (-4) and cert-manager (-5)
+    argocd.argoproj.io/sync-wave: "-3"
+spec:
+  project: dataplatform
+  sources:
+    - repoURL: https://cloudnative-pg.github.io/charts
+      chart: plugin-barman-cloud
+      targetRevision: "0.8.1"
+      helm:
+        releaseName: plugin-barman-cloud
+        valueFiles:
+          - $values/subsystems/dataplatform/gitops/helm-values/plugin-barman-cloud-values.yaml
+    - repoURL: <%= dataplatform_git_repo %>
+      targetRevision: <%= dataplatform_git_revision %>
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: operators
+  ignoreDifferences:
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+      jqPathExpressions:
+        - .status
+        - .metadata.labels
+        - .metadata.annotations
+  syncPolicy:
+    # No finalizer and no prune: deleting this Application must not delete the
+    # ObjectStore CRD, and with it every ObjectStore
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+      - SkipDryRunOnMissingResource=true
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        maxDuration: 5m
+        factor: 2

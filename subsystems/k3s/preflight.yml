@@ -1,0 +1,22 @@
+---
+- name: Prepare the k3s nodes
+  hosts: k3s
+  tasks:
+    - name: Reported hostname must be the inventory name, short or fully qualified
+      ansible.builtin.assert:
+        that: ansible_facts['nodename'] in [inventory_hostname, inventory_hostname ~ '.' ~ cluster_domain]
+        fail_msg: "{{ inventory_hostname }} reports {{ ansible_facts['nodename'] }}"
+
+    # rbd is built into the boards' kernel; the CephFS client is a module.
+    - name: Load the CephFS kernel client at boot (ceph-csi cephfs)
+      ansible.builtin.copy:
+        content: "ceph\n"
+        dest: /etc/modules-load.d/ceph.conf
+        mode: "0644"
+      when: k3s_ceph_storage_enabled | bool
+
+    - name: Load it now
+      community.general.modprobe:
+        name: ceph
+        state: present
+      when: k3s_ceph_storage_enabled | bool

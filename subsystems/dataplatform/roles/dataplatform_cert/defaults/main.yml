@@ -1,0 +1,11 @@
+---
+dataplatform_cert_file: "{{ dataplatform_acme_dir }}/certificates/{{ dataplatform_domain }}.crt"   # with the chain
+dataplatform_cert_key_file: "{{ dataplatform_acme_dir }}/certificates/{{ dataplatform_domain }}.key"
+# Where the Gateway's ExternalSecret reads it (under secret/)
+dataplatform_cert_openbao_path: dataplatform/core/gateway-tls
+# Token of the renewal job on the host: may only write that path. Periodic, so
+# it never expires while the daily timer renews it.
+dataplatform_cert_token_file: /etc/dataplatform/openbao-cert.token
+dataplatform_cert_token_period: 768h
+# -e dataplatform_cert_force=true: renew now even when not due
+dataplatform_cert_force: false

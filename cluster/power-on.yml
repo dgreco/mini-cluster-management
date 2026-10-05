@@ -1,0 +1,111 @@
+---
+# Power the whole cluster, or some nodes (-e target=<node>, any inventory
+# pattern), on through the BMC, wait for SSH, then let the subsystems recover.
+#
+# Whole cluster, or some nodes while others are still down: the post-startup
+# hooks (they undo pre-shutdown: Ceph flags, services, waits for every node).
+# Some nodes while the rest of the cluster is up: each node is put back into
+# service one at a time as after a rolling reboot (node-exit hooks: out of
+# Ceph maintenance, k3s uncordon, data platform healthy).
+
+- name: Scope of the power-on
+  hosts: localhost
+  gather_facts: false
+  become: false  # wait_for runs on the control node
+  tasks:
+    - name: Resolve the target
+      ansible.builtin.set_fact:
+        power_on_targets: "{{ query('inventory_hostnames', target | default('nodes')) | select('in', groups['nodes']) | list }}"
+
+    - name: The target names nodes of the inventory
+      ansible.builtin.assert:
+        that: power_on_targets | length > 0
+        fail_msg: "-e target={{ target | default('') }} matches no node; use one of {{ groups['nodes'] | join(', ') }}"
+        quiet: true
+
+    - name: Are the other nodes up?
+      ansible.builtin.wait_for:
+        host: "{{ hostvars[item]['ansible_host'] }}"
+        port: 22
+        timeout: 5
+      loop: "{{ groups['nodes'] | difference(power_on_targets) }}"
+      register: power_on_others
+      failed_when: false
+
+    # The per-node path needs a serving cluster to return the node to.
+    - name: Whole cluster, or some nodes of a running cluster?
+      ansible.builtin.set_fact:
+        power_on_whole: >-
+          {{ groups['nodes'] | difference(power_on_targets) | length == 0
+             or power_on_others.results | rejectattr('state', 'defined') | list | length > 0 }}
+
+    - name: Scope
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Powering on ' ~ (power_on_targets | join(', ')) ~ '; the subsystems recover afterwards (post-startup hooks).'
+             if power_on_whole else
+             'Powering on ' ~ (power_on_targets | join(', ')) ~ ' and putting each back into the running cluster.' }}
+
+- name: Power on via Turing Pi BMC
+  hosts: bmc
+  gather_facts: false
+  tasks:
+    - name: Power on all nodes
+      ansible.builtin.raw: tpi power on
+      changed_when: true
+      when: groups['nodes'] | difference(hostvars['localhost']['power_on_targets']) | length == 0
+
+    - name: Power on the target nodes
+      ansible.builtin.raw: tpi power on -n {{ hostvars[item]['turingpi_slot'] }}
+      loop: "{{ hostvars['localhost']['power_on_targets'] }}"
+      loop_control:
+        label: "{{ item }} (slot {{ hostvars[item]['turingpi_slot'] }})"
+      changed_when: true
+      when: groups['nodes'] | difference(hostvars['localhost']['power_on_targets']) | length > 0
+
+    - name: Query power status
+      ansible.builtin.raw: tpi power status
+      register: tpi_status
+      changed_when: false
+
+    - name: Show power status
+      ansible.builtin.debug:
+        msg: "{{ tpi_status.stdout_lines }}"
+
+- name: Wait for nodes to boot
+  hosts: "{{ hostvars['localhost']['power_on_targets'] | default([]) }}"
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        delay: 15
+        timeout: "{{ node_boot_timeout }}"
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    - name: Node is up
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} is up ({{ ansible_facts['default_ipv4']['address'] | default('no ip') }})"
+
+# ---- whole cluster: subsystem post-startup hooks (add one line per subsystem) ----
+# Each hook does nothing unless the localhost fact power_on_whole is true.
+- name: Ceph post-startup hook
+  ansible.builtin.import_playbook: ../subsystems/ceph/post-startup.yml
+- name: The k3s post-startup hook
+  ansible.builtin.import_playbook: ../subsystems/k3s/post-startup.yml
+- name: Data platform post-startup
+  ansible.builtin.import_playbook: ../subsystems/dataplatform/post-startup.yml
+
+# ---- some nodes: back into service one at a time (the node-exit hooks) ----
+- name: Put the nodes back into service
+  hosts: "{{ hostvars['localhost']['power_on_targets'] | default([]) }}"
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Whole cluster, recovered above
+      ansible.builtin.meta: end_host
+      when: hostvars['localhost']['power_on_whole']
+
+    - name: Put the node back into service
+      ansible.builtin.include_tasks: tasks/node-exit.yml

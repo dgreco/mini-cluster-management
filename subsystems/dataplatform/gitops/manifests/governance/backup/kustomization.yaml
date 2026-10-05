@@ -1,0 +1,7 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: governance
+# the backup key only: the databases (wave 0) need it before they start. The
+# OpenBao snapshot job is manifests/governance/openbao-snapshot (last wave).
+resources:
+  - backup-secrets.yaml

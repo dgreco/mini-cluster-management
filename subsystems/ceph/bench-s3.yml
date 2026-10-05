@@ -1,0 +1,146 @@
+---
+# S3 benchmark with MinIO warp in distributed mode: `warp client` on every load
+# host, the first one coordinates. Each op in ceph_bench_s3_ops runs for
+# ceph_bench_duration against every RGW daemon directly (ceph_bench_s3_target=rgw)
+# or through the ingress VIP (=ingress). Uses a dedicated S3 user; warp empties
+# its bucket after every op.
+#   make ceph-bench-s3 [ARGS="-e bench_hosts=node4:node3 -e ceph_bench_s3_target=ingress"]
+- name: Benchmark S3 user and endpoints
+  hosts: ceph_mons[0]
+  gather_facts: false
+  vars_files: [vars/bench.yml]
+  tasks:
+    - name: S3 must be enabled
+      ansible.builtin.assert:
+        that: ceph_rgw_enabled | bool
+        fail_msg: "set ceph_rgw_enabled=true in inventory/group_vars/ceph/ and run make ceph-s3"
+
+    - name: Benchmark user
+      ansible.builtin.include_role:
+        name: ceph_rgw
+        tasks_from: rgw_user
+      vars:
+        ceph_rgw_user_uid: "{{ _bench.s3_uid }}"
+        ceph_rgw_user_display_name: "S3 benchmark"
+        ceph_rgw_user_caps: ""
+
+    - name: Endpoints and credentials
+      ansible.builtin.set_fact:
+        bench_s3_tls: "{{ _bench.s3_target == 'ingress' and ceph_rgw_ingress_ssl | bool }}"
+        bench_s3_hosts: >-
+          {{ [ceph_rgw_vip ~ ':' ~ ceph_rgw_ingress_port] if _bench.s3_target == 'ingress'
+             else groups['ceph_rgws'] | map('extract', hostvars, 'ansible_host') | map('regex_replace', '$', ':' ~ ceph_rgw_port) | list }}
+        bench_s3_access_key: "{{ ceph_rgw_user_info['keys'][0].access_key }}"
+        bench_s3_secret_key: "{{ ceph_rgw_user_info['keys'][0].secret_key }}"
+      no_log: true
+
+- name: S3 benchmark (warp)
+  hosts: "{{ bench_hosts | default('ceph') }}"
+  vars_files: [vars/bench.yml]
+  vars:
+    _s3: "{{ hostvars[_admin] }}"
+  tasks:
+    - name: Run id
+      ansible.builtin.set_fact:
+        bench_run: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}-s3"
+      run_once: true
+
+    - name: Install warp
+      ansible.builtin.include_role:
+        name: ceph_bench
+        tasks_from: install_warp
+
+    - name: Stop a leftover warp client
+      ansible.builtin.systemd:
+        name: warp-client
+        state: stopped
+      changed_when: false
+      failed_when: false
+
+    - name: Start warp client
+      ansible.builtin.command: systemd-run --unit=warp-client --collect /usr/local/bin/warp client --no-color
+      changed_when: true
+
+    - name: Wait for warp client
+      ansible.builtin.wait_for:
+        port: 7761
+        timeout: 30
+
+    # --disable-sha256-payload: over plain HTTP minio-go signs uploads with SigV4
+    # streaming (aws-chunked), which RGW answers with 403 for most requests.
+    # warp only counts those as errors, so any error fails the run.
+    - name: Benchmark
+      block:
+        - name: Run warp - {{ _bench.s3_ops | join(', ') ~ ' (' ~ ansible_play_hosts | length ~ ' clients, ' ~ _bench.duration ~ ' s each)' }}
+          ansible.builtin.command: >-
+            /usr/local/bin/warp {{ item }} --no-color --disable-sha256-payload
+            --warp-client {{ ansible_play_hosts | map('extract', hostvars, 'ansible_host') | join(',') }}
+            --host {{ _s3.bench_s3_hosts | join(',') }}
+            {{ '--tls --insecure' if _s3.bench_s3_tls | bool else '' }}
+            --bucket warp-bench --obj.size {{ _bench.s3_obj_size }}
+            --concurrent {{ _bench.s3_concurrent }} --duration {{ _bench.duration }}s
+            {{ ('--objects ' ~ _bench.s3_objects) if item in ['get', 'mixed'] else '' }}
+            --benchdata /tmp/{{ bench_run }}-{{ item }}
+          environment:
+            WARP_ACCESS_KEY: "{{ _s3.bench_s3_access_key }}"
+            WARP_SECRET_KEY: "{{ _s3.bench_s3_secret_key }}"
+          loop: "{{ _bench.s3_ops }}"
+          register: warp_out
+          failed_when: >-
+            warp_out.rc != 0 or warp_out.stdout is search('Errors: [1-9]')
+          run_once: true
+          changed_when: true
+      always:
+        - name: Stop warp client
+          ansible.builtin.systemd:
+            name: warp-client
+            state: stopped
+          changed_when: false
+          failed_when: false
+
+    - name: Keep results
+      ansible.builtin.set_fact:
+        s3_results: "{{ dict(warp_out.results | map(attribute='item') | zip(warp_out.results | map(attribute='stdout'))) }}"
+      run_once: true
+
+    - name: Results directory
+      ansible.builtin.file:
+        path: "{{ _bench.results_dir }}/{{ bench_run }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Full warp output per op
+      ansible.builtin.copy:
+        content: "{{ s3_results[item] }}\n"
+        dest: "{{ _bench.results_dir }}/{{ bench_run }}/warp-{{ item }}.txt"
+        mode: "0644"
+      loop: "{{ _bench.s3_ops }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    # Replay later with: warp analyze <file>
+    - name: Remove the warp benchmark data
+      ansible.builtin.fetch:
+        src: "/tmp/{{ bench_run }}-{{ item }}.json.zst"
+        dest: "{{ _bench.results_dir }}/{{ bench_run }}/"
+        flat: true
+      loop: "{{ _bench.s3_ops }}"
+      run_once: true
+
+    # Every warp client writes its own copy next to the coordinator's.
+    - name: Remove benchmark data from the load hosts
+      ansible.builtin.file:
+        path: "/tmp/{{ bench_run }}-{{ item }}.json.zst"
+        state: absent
+      loop: "{{ _bench.s3_ops }}"
+
+    - name: Report
+      ansible.builtin.include_role:
+        name: ceph_bench
+        tasks_from: report
+      vars:
+        ceph_bench_report: s3

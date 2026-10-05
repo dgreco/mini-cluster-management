@@ -1,0 +1,6 @@
+# Barman Cloud plugin of CloudNativePG (in operators, next to the operator).
+# One replica: while it is down no WAL is archived (PostgreSQL keeps the
+# files until it is back) and no database pod can be (re)created.
+resources:
+  requests: {cpu: 10m, memory: 64Mi}
+  limits: {memory: 256Mi}

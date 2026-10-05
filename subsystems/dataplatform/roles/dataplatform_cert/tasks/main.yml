@@ -1,0 +1,141 @@
+---
+# Let's Encrypt wildcard certificate of the data platform (<domain> and
+# *.<domain>), on the first k3s server: lego with the GoDaddy DNS-01 program
+# (the pattern of subsystems/ceph ceph_acme), a daily renewal timer, and a
+# deploy hook that stores the certificate in OpenBao. The Gateway's
+# ExternalSecret (gitops/manifests/core/gateway) takes it from there.
+- name: Let's Encrypt settings and the GoDaddy token are in place
+  ansible.builtin.assert:
+    that:
+      - dataplatform_domain.endswith('.' ~ dataplatform_dns_zone)
+      - dataplatform_acme_email is search('^[^@ ]+@[^@ ]+$')
+      - dataplatform_godaddy_pat | length > 0
+    fail_msg: >-
+      Needs dataplatform_domain inside dataplatform_dns_zone, dataplatform_acme_email
+      (inventory/group_vars/dataplatform.yml), and a GoDaddy personal access token with the
+      domains.dns:update scope in {{ secrets_dir }}/godaddy.env as GODADDY_PAT=<token>.
+    quiet: true
+
+# ---------------------------------------------------------------- deploy hook ----
+- name: Deploy hook (stores the certificate in OpenBao)
+  ansible.builtin.template:
+    src: dataplatform-cert-deploy.py.j2
+    dest: /usr/local/sbin/dataplatform-cert-deploy
+    mode: "0755"
+
+# ---------------------------------------------------------------- OpenBao access ----
+- name: OpenBao client
+  ansible.builtin.include_role:
+    name: dataplatform_openbao
+    tasks_from: client
+
+- name: Policy of the renewal job
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/sys/policies/acl/gateway-tls-writer"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    status_code: [200, 404]
+  register: dataplatform_cert_policy
+  no_log: true
+
+- name: The renewal job may write the certificate, nothing else
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/sys/policies/acl/gateway-tls-writer"
+    method: PUT
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    body_format: json
+    body: {policy: "{{ _policy }}"}
+    status_code: [200, 204]
+  vars:
+    _policy: |
+      path "secret/data/{{ dataplatform_cert_openbao_path }}" {
+        capabilities = ["create", "update", "read"]
+      }
+  when: dataplatform_cert_policy.status != 200 or dataplatform_cert_policy.json.data.policy != _policy
+  changed_when: true
+  no_log: true
+
+- name: Token of the renewal job
+  ansible.builtin.slurp:
+    src: "{{ dataplatform_cert_token_file }}"
+  register: dataplatform_cert_token
+  failed_when: false
+  no_log: true
+
+- name: Is the token still valid?
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/auth/token/lookup-self"
+    headers: {X-Vault-Token: "{{ dataplatform_cert_token.content | default('') | b64decode | trim }}"}
+    status_code: [200, 400, 403]
+  register: dataplatform_cert_token_check
+  when: dataplatform_cert_token.content is defined
+  no_log: true
+
+- name: New periodic token for the renewal job
+  when: dataplatform_cert_token_check.status | default(0) != 200
+  block:
+    - name: Create an orphan periodic token with the writer policy
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/auth/token/create-orphan"
+        method: POST
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+        body_format: json
+        body:
+          policies: [gateway-tls-writer]
+          period: "{{ dataplatform_cert_token_period }}"
+          display_name: dataplatform-cert-{{ inventory_hostname }}
+          no_default_policy: false
+      register: dataplatform_cert_new_token
+      changed_when: true
+      no_log: true
+
+    - name: Directory of the token
+      ansible.builtin.file:
+        path: "{{ dataplatform_cert_token_file | dirname }}"
+        state: directory
+        mode: "0700"
+
+    - name: Save the token
+      ansible.builtin.copy:
+        content: "{{ dataplatform_cert_new_token.json.auth.client_token }}\n"
+        dest: "{{ dataplatform_cert_token_file }}"
+        mode: "0600"
+      no_log: true
+
+# ---------------------------------------------------------------- lego ----
+# The renewal of the certificate must not wait for OpenBao: a down OpenBao (or
+# a token expired after a long outage) only costs the upload, which the deploy
+# after lego (also when nothing was renewed: OpenBao may have been
+# reinstalled) retries at the next run.
+- name: Lego, the renewal program and timer, the certificate
+  ansible.builtin.include_role:
+    name: acme_lego
+  vars:
+    acme_lego_version: "{{ dataplatform_acme_lego_version }}"
+    acme_lego_dir: "{{ dataplatform_acme_dir }}"
+    acme_lego_domains: ["{{ dataplatform_domain }}", "*.{{ dataplatform_domain }}"]
+    acme_lego_email: "{{ dataplatform_acme_email }}"
+    acme_lego_staging: "{{ dataplatform_acme_staging }}"
+    acme_lego_zone: "{{ dataplatform_dns_zone }}"
+    acme_lego_godaddy_api: "{{ dataplatform_godaddy_api }}"
+    acme_lego_godaddy_pat: "{{ dataplatform_godaddy_pat }}"
+    acme_lego_wrapper: /usr/local/sbin/dataplatform-cert
+    acme_lego_deploy_hook: /usr/local/sbin/dataplatform-cert-deploy
+    acme_lego_wrapper_pre: >-
+      /usr/local/sbin/dataplatform-cert-deploy --renew-token
+      || echo "warning: could not renew the OpenBao token; renewing the certificate anyway" >&2
+    acme_lego_wrapper_post: exec /usr/local/sbin/dataplatform-cert-deploy
+    acme_lego_unit: dataplatform-cert
+    acme_lego_unit_description: "Renew the Let's Encrypt wildcard certificate of the data platform (*.{{ dataplatform_domain }})"
+    acme_lego_unit_after: k3s.service
+    acme_lego_timer_calendar: "*-*-* 05:00:00"
+    acme_lego_force: "{{ dataplatform_cert_force }}"
+
+- name: The certificate
+  ansible.builtin.command: >-
+    openssl x509 -in {{ dataplatform_cert_file }} -noout -subject -issuer -enddate -ext subjectAltName
+  register: dataplatform_cert_show
+  changed_when: false
+
+- name: Certificate of *.{{ dataplatform_domain }}
+  ansible.builtin.debug:
+    msg: "{{ dataplatform_cert_show.stdout_lines | map('trim') | reject('equalto', '') | list }}"

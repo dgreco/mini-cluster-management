@@ -1,0 +1,19 @@
+# CephFS (fio) — {{ bench_run }}
+
+{{ ansible_play_hosts | length }} load hosts ({{ ansible_play_hosts | join(', ') }}), kernel client on
+`{{ _bench.mount_point }}`, libaio + O_DIRECT, {{ _bench.fio_size }} per job file, {{ _bench.duration }} s per job.
+Raw fio results per host in `cephfs.json`.
+
+| job | host | MiB/s | IOPS | avg latency ms |
+|---|---|---:|---:|---:|
+{% for job in _bench.fio_jobs %}
+{% set ns = namespace(bw=0, iops=0) %}
+{% for h in ansible_play_hosts %}
+{% set r = hostvars[h].ceph_bench_cephfs_results[job.name] %}
+{% set d = r.read if job.rw in ['read', 'randread'] else r.write %}
+{% set ns.bw = ns.bw + d.bw | float / 1024 %}
+{% set ns.iops = ns.iops + d.iops | float %}
+| {{ job.name }} | {{ h }} | {{ (d.bw | float / 1024) | round(1) }} | {{ d.iops | float | round(0) | int }} | {{ (d.lat_ns.mean | float / 1000000) | round(2) }} |
+{% endfor %}
+| **{{ job.name }}** | **total** | **{{ ns.bw | round(1) }}** | **{{ ns.iops | round(0) | int }}** | |
+{% endfor %}

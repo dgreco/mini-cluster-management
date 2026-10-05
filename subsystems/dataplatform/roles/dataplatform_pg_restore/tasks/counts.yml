@@ -1,0 +1,32 @@
+---
+# Rows per table of a cluster's application database, read on one of its pods:
+# sets dataplatform_pg_restore_counts ({"schema.table": "count"}).
+# In: dataplatform_pg_restore_count_pod, dataplatform_pg_restore_count_db
+- name: Rows per table on {{ dataplatform_pg_restore_count_pod }}
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - -n
+      - "{{ dataplatform_pg_restore_namespace }}"
+      - exec
+      - "{{ dataplatform_pg_restore_count_pod }}"
+      - -c
+      - postgres
+      - --
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ dataplatform_pg_restore_count_db }}"
+      - -At
+      - -F
+      - "|"
+      - -c
+      - "{{ dataplatform_pg_restore_count_sql }}"
+  register: dataplatform_pg_restore_count_out
+  changed_when: false
+
+- name: As a dictionary
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_counts: "{{ dict(dataplatform_pg_restore_count_out.stdout_lines | map('split', '|')) }}"

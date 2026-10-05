@@ -1,0 +1,56 @@
+# https://vmui.data.example.org -> oauth2-proxy -> VictoriaMetrics (/vmui/)
+# and VictoriaLogs (/select/vmui/, shortcut /logs).
+# Read-only: only the paths the two UIs call get through (metrics: queries,
+# labels, series, the status pages, export, the query helpers; logs: the
+# LogsQL queries, the tenant list) and oauth2-proxy's own /oauth2/*; any other
+# path (writes, imports, /insert, /delete, admin, snapshots) matches no rule
+# and gets 404 from the Gateway. PathPrefix matches whole
+# segments (/api/v1/query does not cover /api/v1/query_range): leaves are
+# Exact, trees are PathPrefix.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: vmui
+spec:
+  parentRefs:
+    - name: main-gateway
+      namespace: core
+      sectionName: vmui-https
+  hostnames:
+    - vmui.data.example.org
+  rules:
+    - matches:
+        - path: {type: Exact, value: /}
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            path: {type: ReplaceFullPath, replaceFullPath: /vmui/}
+            statusCode: 302
+    - matches:
+        - path: {type: Exact, value: /logs}
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            path: {type: ReplaceFullPath, replaceFullPath: /select/vmui/}
+            statusCode: 302
+    - matches:
+        - path: {type: PathPrefix, value: /oauth2}
+        - path: {type: PathPrefix, value: /vmui}
+        - path: {type: Exact, value: /api/v1/query}
+        - path: {type: Exact, value: /api/v1/query_range}
+        - path: {type: Exact, value: /api/v1/labels}
+        - path: {type: PathPrefix, value: /api/v1/label}
+        - path: {type: Exact, value: /api/v1/series}
+        - path: {type: PathPrefix, value: /api/v1/status}
+        - path: {type: PathPrefix, value: /api/v1/export}
+        - path: {type: Exact, value: /expand-with-exprs}
+        - path: {type: Exact, value: /prettify-query}
+        - path: {type: Exact, value: /metric-relabel-debug}
+        # VictoriaLogs (the tenant is the UI's AccountID/ProjectID headers)
+        - path: {type: PathPrefix, value: /select/vmui}
+        - path: {type: PathPrefix, value: /select/logsql}
+        - path: {type: Exact, value: /select/tenant_ids}
+        - path: {type: Exact, value: /select/buildinfo}
+      backendRefs:
+        - name: vmui-proxy
+          port: 80

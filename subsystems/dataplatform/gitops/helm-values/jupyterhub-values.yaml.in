@@ -1,0 +1,112 @@
+# JupyterHub (namespace tools): one notebook server per user, on <%= dataplatform_storage_class %>.
+# Login with Keycloak (client jupyterhub, realm <%= dataplatform_keycloak_realm %>): every realm
+# user may log in (accounts are made in the Keycloak console);
+# <%= site_admin_group %> are the hub's admins; the Keycloak groups become the hub's
+# groups. Data access from a notebook is the same as anywhere else: a Keycloak
+# token exchanged at Ceph STS for the group's role, or Trino.
+fullnameOverride: ""
+
+hub:
+  # the client secret, the cookie secret and the auth-state key come from
+  # OpenBao (ExternalSecret jupyterhub-hub, manifests/tools/jupyterhub)
+  existingSecret: jupyterhub-hub
+  config:
+    JupyterHub:
+      authenticator_class: generic-oauth
+      admin_access: false
+      authenticate_prometheus: false     # /hub/metrics for the OTel collector
+    GenericOAuthenticator:
+      client_id: jupyterhub
+      oauth_callback_url: https://jupyter.<%= dataplatform_domain %>/hub/oauth_callback
+      authorize_url: https://keycloak.<%= dataplatform_domain %>/realms/<%= dataplatform_keycloak_realm %>/protocol/openid-connect/auth
+      token_url: https://keycloak.<%= dataplatform_domain %>/realms/<%= dataplatform_keycloak_realm %>/protocol/openid-connect/token
+      userdata_url: https://keycloak.<%= dataplatform_domain %>/realms/<%= dataplatform_keycloak_realm %>/protocol/openid-connect/userinfo
+      logout_redirect_url: https://keycloak.<%= dataplatform_domain %>/realms/<%= dataplatform_keycloak_realm %>/protocol/openid-connect/logout?post_logout_redirect_uri=https%3A%2F%2Fjupyter.<%= dataplatform_domain %>%2Fhub%2Flogin&client_id=jupyterhub
+      login_service: Keycloak
+      username_claim: preferred_username
+      scope: [openid, profile, email]
+      allow_all: true
+      admin_groups: [<%= site_admin_group %>]
+      manage_groups: true
+      auth_state_groups_key: oauth_user.groups
+      enable_auth_state: true
+      refresh_pre_spawn: true      # a fresh token at every server start
+  # The hub keeps each login's Keycloak tokens (auth state, encrypted with the
+  # CryptKeeper key); the access token goes to the user's server as
+  # KEYCLOAK_TOKEN, so a notebook talks to Trino (bearer JWT, audience trino)
+  # and to Ceph STS (web identity) as the user, with no further login.
+  extraConfig:
+    keycloak-token: |
+      async def keycloak_token(spawner, auth_state):
+          if auth_state and auth_state.get("access_token"):
+              spawner.environment["KEYCLOAK_TOKEN"] = auth_state["access_token"]
+      c.KubeSpawner.auth_state_hook = keycloak_token
+  db:
+    type: sqlite-pvc
+    pvc:
+      storageClassName: <%= dataplatform_storage_class %>
+      storage: 1Gi
+  # the hub's metrics (:8081/hub/metrics), scraped by the OTel cluster collector
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8081"
+    prometheus.io/path: /hub/metrics
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+    limits: {memory: 1Gi}
+
+proxy:
+  service:
+    type: ClusterIP          # the Gateway routes to it (HTTPRoute jupyterhub)
+  chp:
+    resources:
+      requests: {cpu: 20m, memory: 64Mi}
+      limits: {memory: 256Mi}
+
+singleuser:
+  image:
+    name: quay.io/jupyter/scipy-notebook
+    # the image's jupyterhub must match the hub's major version (5.x for chart
+    # 4.x): tags from 2026-09 ship JupyterHub 6 and the server refuses to start
+    tag: "2026-08-31"
+    pullPolicy: IfNotPresent
+  defaultUrl: /lab
+  startTimeout: 900          # the image is large and the boards pull it once each
+  storage:
+    capacity: 5Gi
+    dynamic:
+      storageClass: <%= dataplatform_storage_class %>
+  cpu: {guarantee: 0.2, limit: 2}
+  memory: {guarantee: 512M, limit: 2G}
+  extraEnv:
+    AWS_ENDPOINT_URL: https://<%= site_s3_host %>
+    AWS_DEFAULT_REGION: <%= dataplatform_s3_region %>
+    TRINO_URL: https://trino.<%= dataplatform_domain %>
+    KEYCLOAK_ISSUER: https://keycloak.<%= dataplatform_domain %>/realms/<%= dataplatform_keycloak_realm %>
+    # the site's values the notebooks use (files/notebooks)
+    S3_BUCKET: <%= dataplatform_bucket %>
+    RGW_ACCOUNT_ID: <%= dataplatform_rgw_account_id %>
+    ADMIN_GROUP: <%= site_admin_group %>
+    ENGINEER_GROUP: <%= site_engineer_group %>
+    ANALYST_GROUP: <%= site_analyst_group %>
+  networkPolicy:
+    egressAllowRules:
+      privateIPs: true       # S3, Trino and Keycloak are on private addresses
+  # no cloud metadata server here, and its iptables init container is
+  # privileged, which Pod Security "baseline" in tools refuses
+  cloudMetadata:
+    blockWithIptables: false
+
+# no image pre-pulling (a hook Job and a DaemonSet Argo CD would fight with),
+# no user scheduler or placeholders on four boards
+prePuller:
+  hook: {enabled: false}
+  continuous: {enabled: false}
+scheduling:
+  userScheduler: {enabled: false}
+  userPlaceholder: {enabled: false}
+  podPriority: {enabled: false}
+cull:
+  enabled: true
+  timeout: 3600
+  every: 600

@@ -1,0 +1,53 @@
+---
+# Register an OpenID Connect identity provider with RGW's IAM API so that
+# tokens from it can be exchanged with AssumeRoleWithWebIdentity. An existing
+# provider gets the given client IDs and thumbprints.
+# Runs the boto3 helper on the control node (Ansible's own Python) with the
+# s3admin credentials.
+#
+#   make ceph-sts-oidc-provider ARGS="-e oidc_url=https://keycloak.example/realms/lab -e oidc_client_id=my-app"
+# Optional: -e oidc_client_id=app1,app2   (RGW accepts a token whose aud, client_id or azp is listed)
+#           -e oidc_thumbprint=<sha1 hex> (default: the signing certificates in the IdP's JWKS,
+#                                          which is what RGW checks)
+#           -e oidc_verify_tls=false      (skip verification of the RGW endpoint cert)
+- name: OIDC provider
+  hosts: ceph_mons[0]
+  gather_facts: false
+  vars:
+    # off only for the self-signed ingress certificate; a Let's Encrypt one is verified
+    oidc_verify_tls: "{{ not (ceph_rgw_ingress_ssl | bool and not ceph_rgw_acme_active | bool) }}"
+    _creds: "{{ lookup('file', secrets_dir ~ '/s3-' ~ ceph_rgw_admin_uid ~ '.json') | from_json }}"
+  tasks:
+    - name: S3 must be enabled
+      ansible.builtin.assert:
+        that: ceph_rgw_enabled | bool
+        fail_msg: "set ceph_rgw_enabled=true in inventory/group_vars/ceph/ and run make ceph-s3"
+
+    - name: Validate input
+      ansible.builtin.assert:
+        that:
+          - oidc_url is defined
+          - oidc_client_id is defined
+        fail_msg: "pass -e oidc_url=<issuer url> -e oidc_client_id=<client id>"
+
+    - name: Create provider (idempotent)
+      ansible.builtin.command: >-
+        {{ ansible_playbook_python }} {{ playbook_dir }}/files/oidc_provider.py
+        --endpoint {{ ceph_rgw_endpoint }}
+        --region {{ ceph_rgw_region }}
+        --url {{ oidc_url }}
+        {% for c in oidc_client_id.split(',') %}--client-id {{ c | trim }} {% endfor %}
+        {{ ('--thumbprint ' ~ oidc_thumbprint) if oidc_thumbprint is defined else '' }}
+        {{ '' if oidc_verify_tls | bool else '--no-verify' }}
+      environment:   # the keys stay off the command line (visible in ps)
+        AWS_ACCESS_KEY_ID: "{{ _creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ _creds.secret_key }}"
+      delegate_to: localhost
+      become: false
+      register: oidc_result
+      changed_when: (oidc_result.stdout | from_json).changed
+      no_log: true
+
+    - name: Result
+      ansible.builtin.debug:
+        msg: "{{ oidc_result.stdout | from_json }}"

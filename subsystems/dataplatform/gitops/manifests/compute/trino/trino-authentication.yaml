@@ -1,0 +1,35 @@
+# Users log in to Trino with Keycloak (realm data-platform): the web UI, and the
+# CLI's and JDBC's external authentication (DBeaver), through the OAuth2 code
+# flow (client trino); or with a bearer access token whose audience includes
+# trino (clients data-cli, jupyterhub). The Trino user name is the token's
+# preferred_username.
+apiVersion: authentication.stackable.tech/v1alpha1
+kind: AuthenticationClass
+metadata:
+  name: keycloak
+spec:
+  provider:
+    oidc:
+      hostname: keycloak.data.example.org
+      port: 443
+      rootPath: /realms/data-platform/
+      scopes: [openid, profile, email]
+      principalClaim: preferred_username
+      providerHint: Keycloak
+      tls:
+        verification:
+          server:
+            caCert:
+              webPki: {}
+---
+# CA of the secret-operator's tls SecretClass (Trino's internal certificate),
+# for the Gateway's BackendTLSPolicy (key ca.crt).
+apiVersion: secrets.stackable.tech/v1alpha1
+kind: TrustStore
+metadata:
+  name: stackable-tls-ca
+  namespace: compute
+spec:
+  secretClassName: tls
+  format: tls-pem
+  targetKind: ConfigMap

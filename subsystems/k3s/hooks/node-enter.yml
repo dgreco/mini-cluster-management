@@ -1,0 +1,102 @@
+---
+# Task-file hook included by cluster/rolling-reboot.yml for each node (serial)
+# before it reboots: check that the node can go, cordon and drain it, check
+# that no Ceph volume is left in use. kubectl runs on another server, so the API
+# stays reachable while a server reboots. Runs before the Ceph hook: pods must
+# release their RBD/CephFS volumes while Ceph still serves.
+# Fails when k3s is installed here but no other server answers: the node must
+# not go down undrained.
+- name: Find a k3s server that answers
+  ansible.builtin.include_tasks: pick-server.yml
+
+- name: Drain the node
+  when: k3s_maint_member
+  block:
+    # etcd keeps its quorum only while the other servers are up.
+    - name: Every k3s server is Ready
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl wait node --for=condition=Ready --timeout={{ k3s_ready_timeout }}s
+        -l node-role.kubernetes.io/control-plane
+      delegate_to: "{{ k3s_maint_server }}"
+      changed_when: false
+      when: inventory_hostname in groups['k3s_servers']
+
+    - name: Drain {{ ansible_facts['nodename'] }}
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl drain {{ ansible_facts['nodename'] }}
+        --ignore-daemonsets --delete-emptydir-data --timeout={{ reboot_drain_timeout }}
+        {{ '--force' if reboot_force_drain | bool else '' }}
+      delegate_to: "{{ k3s_maint_server }}"
+      register: k3s_maint_drain
+      changed_when: k3s_maint_drain.rc == 0
+      failed_when: false
+
+    - name: Drain failed, leave the node as it was and stop
+      when: k3s_maint_drain.rc != 0
+      block:
+        - name: Pods still on {{ ansible_facts['nodename'] }}
+          ansible.builtin.command: >-
+            /usr/local/bin/k3s kubectl get pods -A -o wide
+            --field-selector spec.nodeName={{ ansible_facts['nodename'] }}
+          delegate_to: "{{ k3s_maint_server }}"
+          register: k3s_maint_pods
+          changed_when: false
+
+        - name: Uncordon {{ ansible_facts['nodename'] }}
+          ansible.builtin.command: /usr/local/bin/k3s kubectl uncordon {{ ansible_facts['nodename'] }}
+          delegate_to: "{{ k3s_maint_server }}"
+          changed_when: true
+
+        - name: Report the failed drain
+          ansible.builtin.fail:
+            msg:
+              - "Could not drain {{ ansible_facts['nodename'] }}; it is uncordoned again and was not rebooted."
+              - "Usual causes: a PodDisruptionBudget allowing no disruption, a pod without a controller"
+              - "(-e reboot_force_drain=true deletes those), or a pod slow to stop (-e reboot_drain_timeout=600s)."
+              - "kubectl drain said:"
+              - "{{ k3s_maint_drain.stderr_lines[-5:] }}"
+              - "Pods still on the node:"
+              - "{{ k3s_maint_pods.stdout_lines }}"
+
+    # Only DaemonSet pods are left; none of them holds a Ceph volume here.
+    - name: No Ceph volume left in use by pods
+      ansible.builtin.shell: |
+        set -o pipefail
+        for i in $(seq 12); do
+          rbd=$(ls /sys/bus/rbd/devices 2>/dev/null | tr '\n' ' ')
+          mnt=$(findmnt -rn -t ceph -o TARGET | grep '^/var/lib/kubelet/' | tr '\n' ' ' || true)
+          [ -z "$rbd$mnt" ] && exit 0
+          sleep 5
+        done
+        echo "rbd devices mapped: ${rbd:-none}; CephFS pod mounts: ${mnt:-none}"
+      args:
+        executable: /bin/bash
+      register: k3s_maint_volumes
+      changed_when: false
+
+    # A mapped RBD image at shutdown is the classic hang (the network goes
+    # before the unmap), which burns node_reboot_timeout: release what the
+    # drain left behind, as pre-shutdown.yml does, and refuse if it stays.
+    - name: Release the Ceph volumes the drain left behind
+      ansible.builtin.shell: |
+        set -o pipefail
+        findmnt -rn -t ceph -o TARGET | grep '^/var/lib/kubelet/' | while read -r m; do
+          umount -l "$m" && echo "unmounted $m"
+        done || true
+        for d in /sys/bus/rbd/devices/*; do
+          [ -e "$d" ] || continue
+          for m in $(findmnt -rn -S "/dev/rbd$(basename "$d")" -o TARGET); do umount -l "$m" && echo "unmounted $m"; done
+          echo "$(basename "$d")" > /sys/bus/rbd/remove && echo "unmapped rbd$(basename "$d")"
+        done
+        left="$(ls /sys/bus/rbd/devices 2>/dev/null | tr '\n' ' ')$(findmnt -rn -t ceph -o TARGET | grep '^/var/lib/kubelet/' | tr '\n' ' ')"
+        [ -z "$left" ] || { echo "still in use: $left" >&2; exit 1; }
+      args:
+        executable: /bin/bash
+      register: k3s_maint_release
+      changed_when: k3s_maint_release.stdout | length > 0
+      when: k3s_maint_volumes.stdout | length > 0
+
+    - name: Ceph volumes released
+      ansible.builtin.debug:
+        msg: "{{ k3s_maint_volumes.stdout }} -> {{ k3s_maint_release.stdout_lines | join(', ') }}"
+      when: k3s_maint_volumes.stdout | length > 0

@@ -1,0 +1,86 @@
+# oauth2-proxy in front of VictoriaMetrics and VictoriaLogs: a Keycloak login
+# (client vmui), members of platform-admins only (the groups claim, checked at
+# login), then /select/* goes to victoria-logs:9428 (its UI and LogsQL API)
+# and everything else to victoria-metrics:8428. Neither has a login of its
+# own and both take writes on the same port: the HTTPRoute lets through only
+# the paths their UIs read (vmui-httproute.yaml).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vmui-proxy
+  labels:
+    app.kubernetes.io/name: vmui-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vmui-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vmui-proxy
+      annotations:
+        # its metrics go through the OTel cluster collector like everything else
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "44180"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.4
+          args:
+            - --provider=keycloak-oidc
+            - --oidc-issuer-url=https://keycloak.data.example.org/realms/data-platform
+            - --client-id=vmui
+            - --code-challenge-method=S256
+            - --scope=openid profile email
+            - --allowed-group=platform-admins
+            - --email-domain=*
+            - --redirect-url=https://vmui.data.example.org/oauth2/callback
+            - --upstream=http://victoria-metrics.observability.svc:8428/
+            # the longest matching path wins: /select/... is VictoriaLogs
+            - --upstream=http://victoria-logs.observability.svc:9428/select/
+            - --upstream-timeout=120s
+            - --http-address=0.0.0.0:4180
+            - --metrics-address=0.0.0.0:44180
+            - --reverse-proxy=true
+            - --skip-provider-button=true
+            - --cookie-name=_vmui
+            - --cookie-secure=true
+            - --cookie-expire=8h                  # Keycloak's idle session
+            # no tokens in the cookie (VictoriaMetrics needs none): with them the
+            # session takes over 4 KB of Set-Cookie headers and the Gateway's
+            # nginx refuses the callback's answer (502, "upstream sent too big
+            # header")
+            - --session-cookie-minimal=true
+            - --silence-ping-logging=true
+          envFrom:
+            - secretRef:
+                name: vmui-proxy
+          ports:
+            - {name: http, containerPort: 4180}
+            - {name: metrics, containerPort: 44180}
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+          livenessProbe:
+            httpGet: {path: /ping, port: http}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vmui-proxy
+spec:
+  selector:
+    app.kubernetes.io/name: vmui-proxy
+  ports:
+    - {name: http, port: 80, targetPort: http}

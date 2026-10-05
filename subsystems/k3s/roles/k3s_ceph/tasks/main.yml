@@ -1,0 +1,144 @@
+---
+# Ceph side of the k3s storage, on the Ceph admin host: RBD pool, CephFS
+# subvolume group, one CephX user per CSI driver. Publishes k3s_ceph_* facts
+# (fsid, monitors, keys) for the play that renders the ceph-csi charts.
+- name: Ceph must be reachable
+  ansible.builtin.command: cephadm shell -- ceph fsid
+  register: k3s_ceph_fsid
+  changed_when: false
+
+- name: Monitor map
+  ansible.builtin.command: cephadm shell -- ceph mon dump --format json
+  register: k3s_ceph_mon_dump
+  changed_when: false
+
+# ---------------------------------------------------------------- rbd pool ----
+- name: Pools
+  ansible.builtin.command: cephadm shell -- ceph osd pool ls detail --format json
+  register: k3s_ceph_pools
+  changed_when: false
+
+- name: Current RBD pool
+  ansible.builtin.set_fact:
+    k3s_ceph_pool: >-
+      {{ k3s_ceph_pools.stdout | from_json | selectattr('pool_name', 'equalto', k3s_ceph_rbd_pool) | first | default({}) }}
+
+- name: Create the RBD pool
+  ansible.builtin.command: >-
+    cephadm shell -- ceph osd pool create {{ k3s_ceph_rbd_pool }}
+    {{ k3s_ceph_rbd_pool_pg_num }} {{ k3s_ceph_rbd_pool_pg_num }}
+  when: k3s_ceph_pool | length == 0
+  changed_when: true
+
+# Same reason as the small RGW pools: without pg_num_min the autoscaler pushes
+# a new pool to 32 PGs, which the 4 OSDs' PG budget cannot spare.
+- name: Set pg_num_min of the RBD pool
+  ansible.builtin.command: cephadm shell -- ceph osd pool set {{ k3s_ceph_rbd_pool }} pg_num_min {{ k3s_ceph_rbd_pool_pg_num }}
+  when: (k3s_ceph_pool.options.pg_num_min | default(0) | int) != (k3s_ceph_rbd_pool_pg_num | int)
+  changed_when: true
+
+- name: Initialise the pool for RBD
+  ansible.builtin.command: cephadm shell -- rbd pool init {{ k3s_ceph_rbd_pool }}
+  when: "'rbd' not in (k3s_ceph_pool.application_metadata | default({}))"
+  changed_when: true
+
+# ---------------------------------------------------------------- cephfs ----
+- name: CephFS subvolume groups
+  ansible.builtin.command: cephadm shell -- ceph fs subvolumegroup ls {{ ceph_cephfs_name }} --format json
+  register: k3s_ceph_svgs
+  changed_when: false
+
+- name: Create the CSI subvolume group
+  ansible.builtin.command: cephadm shell -- ceph fs subvolumegroup create {{ ceph_cephfs_name }} {{ k3s_ceph_cephfs_subvolumegroup }}
+  when: k3s_ceph_cephfs_subvolumegroup not in (k3s_ceph_svgs.stdout | from_json | map(attribute='name') | list)
+  changed_when: true
+
+# ---------------------------------------------------------------- users ----
+# Caps as documented by ceph-csi. The node plugins map RBD images and mount
+# CephFS with the kernel clients, which on the boards' 5.10 kernel need legacy
+# AES-128 keys (ceph_cephfs_client_key_type, enabled by subsystems/ceph).
+- name: Wanted CSI users
+  ansible.builtin.set_fact:
+    k3s_ceph_users:
+      - name: "{{ k3s_ceph_rbd_user }}"
+        caps:
+          mon: profile rbd
+          osd: "profile rbd pool={{ k3s_ceph_rbd_pool }}"
+          mgr: "profile rbd pool={{ k3s_ceph_rbd_pool }}"
+      - name: "{{ k3s_ceph_cephfs_user }}"
+        caps:
+          mon: "allow r fsname={{ ceph_cephfs_name }}"
+          mgr: allow rw
+          osd: "allow rw tag cephfs metadata={{ ceph_cephfs_name }}, allow rw tag cephfs data={{ ceph_cephfs_name }}"
+          mds: >-
+            allow r fsname={{ ceph_cephfs_name }} path=/volumes,
+            allow rws fsname={{ ceph_cephfs_name }} path=/volumes/{{ k3s_ceph_cephfs_subvolumegroup }}
+
+- name: Current CSI users
+  ansible.builtin.command: cephadm shell -- ceph auth get client.{{ item.name }} --format json
+  loop: "{{ k3s_ceph_users }}"
+  loop_control:
+    label: "client.{{ item.name }}"
+  register: k3s_ceph_auth
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Drop a key of the wrong type
+  ansible.builtin.command: cephadm shell -- ceph auth rm client.{{ item.item.name }}
+  loop: "{{ k3s_ceph_auth.results }}"
+  loop_control:
+    label: "client.{{ item.item.name }}"
+  when:
+    - item.rc == 0
+    - ceph_cephfs_client_key_type == 'aes'
+    - not ((item.stdout | from_json)[0].key is match('^AQ.{38}$'))
+  register: k3s_ceph_auth_rm
+  changed_when: true
+
+- name: Create CSI users
+  ansible.builtin.command: >-
+    cephadm shell -- ceph auth get-or-create client.{{ item.item.name }}
+    {% for k, v in item.item.caps.items() %}{{ k }} {{ v | quote }} {% endfor %}
+    --key_type {{ ceph_cephfs_client_key_type }}
+  loop: "{{ k3s_ceph_auth.results }}"
+  loop_control:
+    label: "client.{{ item.item.name }}"
+  when: >-
+    item.rc != 0
+    or (k3s_ceph_auth_rm.results | selectattr('item.item.name', 'equalto', item.item.name) | selectattr('changed') | list | length > 0)
+  no_log: true
+  changed_when: true
+
+- name: Keep caps in sync
+  ansible.builtin.command: >-
+    cephadm shell -- ceph auth caps client.{{ item.item.name }}
+    {% for k, v in item.item.caps.items() %}{{ k }} {{ v | quote }} {% endfor %}
+  loop: "{{ k3s_ceph_auth.results }}"
+  loop_control:
+    label: "client.{{ item.item.name }}"
+  when:
+    - item.rc == 0
+    - (item.stdout | from_json)[0].caps != item.item.caps
+  changed_when: true
+
+- name: Read the CSI keys
+  ansible.builtin.command: cephadm shell -- ceph auth get-key client.{{ item.name }}
+  loop: "{{ k3s_ceph_users }}"
+  loop_control:
+    label: "client.{{ item.name }}"
+  register: k3s_ceph_keys
+  changed_when: false
+  no_log: true
+
+# Kernel clients on 5.10 speak msgr v1 only: hand the CSI drivers the v1 addresses.
+- name: Publish connection facts
+  ansible.builtin.set_fact:
+    k3s_ceph_fsid: "{{ k3s_ceph_fsid.stdout | trim }}"
+    k3s_ceph_monitors: >-
+      {{ (k3s_ceph_mon_dump.stdout | from_json).mons
+         | map(attribute='public_addrs') | map(attribute='addrvec') | flatten
+         | selectattr('type', 'equalto', 'v1') | map(attribute='addr') | list }}
+    k3s_ceph_rbd_key: "{{ k3s_ceph_keys.results[0].stdout | trim }}"
+    k3s_ceph_cephfs_key: "{{ k3s_ceph_keys.results[1].stdout | trim }}"
+  no_log: true

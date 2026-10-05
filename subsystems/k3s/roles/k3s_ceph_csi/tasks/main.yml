@@ -1,0 +1,63 @@
+---
+# ceph-csi drivers and StorageClasses, on the first k3s server. The HelmChart
+# manifests go to the k3s auto-deploy directory; the k3s Helm controller
+# installs and upgrades the charts. Facts come from the k3s_ceph role (_ceph).
+- name: Chart manifests (contain the CephX keys)
+  ansible.builtin.template:
+    src: "{{ item }}.yaml.j2"
+    dest: "/var/lib/rancher/k3s/server/manifests/{{ item }}.yaml"
+    mode: "0600"
+  loop: [ceph-csi-rbd, ceph-csi-cephfs]
+  no_log: true
+
+# The Helm controller installs/upgrades asynchronously: wait until each driver
+# runs the configured version, not just until the current pods are ready.
+- name: Wait for the drivers at {{ k3s_ceph_csi_version }}
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    /usr/local/bin/k3s kubectl -n {{ item.ns }} get {{ item.obj }}
+    -o 'jsonpath={.spec.template.spec.containers[*].image}' | grep -q 'cephcsi:v{{ k3s_ceph_csi_version }}'
+    && /usr/local/bin/k3s kubectl -n {{ item.ns }} rollout status {{ item.obj }} --timeout=30s
+  args:
+    executable: /bin/bash
+  loop:
+    - { ns: ceph-csi-rbd, obj: deployment/ceph-csi-rbd-provisioner }
+    - { ns: ceph-csi-rbd, obj: daemonset/ceph-csi-rbd-nodeplugin }
+    - { ns: ceph-csi-cephfs, obj: deployment/ceph-csi-cephfs-provisioner }
+    - { ns: ceph-csi-cephfs, obj: daemonset/ceph-csi-cephfs-nodeplugin }
+  loop_control:
+    label: "{{ item.ns }}/{{ item.obj }}"
+  register: k3s_ceph_csi_rollout
+  changed_when: false
+  retries: 30
+  delay: 10
+  until: k3s_ceph_csi_rollout.rc == 0
+
+# k3s's own local-path class is default out of the box. k3s only re-applies its
+# manifest when that changes (e.g. on an upgrade), so this is re-checked on
+# every run.
+- name: StorageClasses
+  ansible.builtin.command: /usr/local/bin/k3s kubectl get storageclass -o json
+  register: k3s_ceph_csi_storageclasses
+  changed_when: false
+
+- name: Mark the only default StorageClass - {{ k3s_default_storage_class }}
+  ansible.builtin.command: >-
+    /usr/local/bin/k3s kubectl annotate storageclass {{ item.metadata.name }} --overwrite
+    storageclass.kubernetes.io/is-default-class={{ (item.metadata.name == k3s_default_storage_class) | lower }}
+  loop: "{{ (k3s_ceph_csi_storageclasses.stdout | from_json)['items'] }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    (item.metadata.annotations | default({})).get('storageclass.kubernetes.io/is-default-class', 'false')
+    != ((item.metadata.name == k3s_default_storage_class) | lower)
+  changed_when: true
+
+- name: Storage classes
+  ansible.builtin.command: /usr/local/bin/k3s kubectl get storageclass
+  register: k3s_ceph_csi_sc_list
+  changed_when: false
+
+- name: Show storage classes
+  ansible.builtin.debug:
+    msg: "{{ k3s_ceph_csi_sc_list.stdout_lines }}"

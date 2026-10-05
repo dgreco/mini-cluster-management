@@ -1,0 +1,65 @@
+---
+# Cluster hook: called by cluster/power-on.yml after the Ceph post-startup hook,
+# for a whole-cluster power-on. k3s starts at boot on its own; wait until every
+# node is Ready, then uncordon nodes a single-node shutdown left cordoned. Pods
+# whose volumes could not attach before Ceph was back retry by themselves.
+- name: The k3s post-startup hook
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  ignore_unreachable: true
+  tasks:
+    - name: Only for a whole-cluster power-on
+      ansible.builtin.meta: end_host
+      when: not hostvars['localhost']['power_on_whole'] | default(true)
+
+    - name: Skip a node that is off
+      ansible.builtin.include_tasks: ../../cluster/tasks/ssh-probe.yml
+
+    - name: Is k3s installed?
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: k3s_bin
+
+    - name: Wait for every node to be Ready
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl get nodes
+        -o 'jsonpath={range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+      register: k3s_nodes_ready
+      changed_when: false
+      failed_when: false
+      retries: 40
+      delay: 15
+      until: >-
+        k3s_nodes_ready.rc == 0
+        and (k3s_nodes_ready.stdout_lines | select('equalto', 'True') | list | length) == groups['k3s'] | length
+      when: k3s_bin.stat.exists
+
+    # A single-node shutdown (cluster/shutdown.yml -e target=...) followed by a
+    # whole-cluster power-on: the node is still cordoned.
+    - name: Nodes left cordoned
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl get nodes
+        -o 'jsonpath={range .items[?(@.spec.unschedulable==true)]}{.metadata.name}{"\n"}{end}'
+      register: k3s_cordoned
+      changed_when: false
+      failed_when: false
+      when: k3s_bin.stat.exists
+
+    - name: Uncordon the nodes left cordoned
+      ansible.builtin.command: /usr/local/bin/k3s kubectl uncordon {{ item }}
+      loop: "{{ k3s_cordoned.stdout_lines | default([]) }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: true
+      when: k3s_bin.stat.exists
+
+    - name: Nodes
+      ansible.builtin.command: /usr/local/bin/k3s kubectl get nodes
+      register: k3s_nodes
+      changed_when: false
+      failed_when: false
+      when: k3s_bin.stat.exists
+
+    - name: Show nodes
+      ansible.builtin.debug:
+        msg: "{{ k3s_nodes.stdout_lines | default(['k3s not installed']) }}"

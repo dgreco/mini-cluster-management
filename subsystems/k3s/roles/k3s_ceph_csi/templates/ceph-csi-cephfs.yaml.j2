@@ -1,0 +1,33 @@
+# Managed by Ansible (subsystems/k3s/roles/k3s_ceph_csi). Installed by the k3s
+# Helm controller; edit group_vars/k3s.yml and re-run make k3s-storage instead.
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: ceph-csi-cephfs
+  namespace: kube-system
+spec:
+  repo: {{ k3s_ceph_csi_chart_repo }}
+  chart: ceph-csi-cephfs
+  version: {{ k3s_ceph_csi_version }}
+  targetNamespace: ceph-csi-cephfs
+  createNamespace: true
+  valuesContent: |-
+    csiConfig:
+      - clusterID: "{{ _ceph.k3s_ceph_fsid }}"
+        monitors: {{ _ceph.k3s_ceph_monitors | to_json }}
+        cephFS:
+          subvolumeGroup: {{ k3s_ceph_cephfs_subvolumegroup }}
+    secret:
+      create: true
+      name: csi-cephfs-secret
+      userID: {{ k3s_ceph_cephfs_user }}
+      userKey: {{ _ceph.k3s_ceph_cephfs_key }}
+    storageClass:
+      create: true
+      name: {{ k3s_cephfs_storage_class }}
+      annotations:
+        storageclass.kubernetes.io/is-default-class: "{{ (k3s_default_storage_class == k3s_cephfs_storage_class) | lower }}"
+      clusterID: "{{ _ceph.k3s_ceph_fsid }}"
+      fsName: {{ ceph_cephfs_name }}
+      reclaimPolicy: Delete
+      allowVolumeExpansion: true

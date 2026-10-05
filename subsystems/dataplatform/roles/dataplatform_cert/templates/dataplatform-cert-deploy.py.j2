@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+# Managed by Ansible (dataplatform_cert). Store the wildcard certificate of the
+# data platform in OpenBao, where the Gateway's ExternalSecret reads it:
+#   dataplatform-cert-deploy                 write it when OpenBao's copy differs (lego deploy hook)
+#   dataplatform-cert-deploy --renew-token   renew this host's periodic OpenBao token
+# OpenBao is reached at its Service address, not through the Gateway whose
+# certificate this is.
+import json
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+TOKEN_FILE = "{{ dataplatform_cert_token_file }}"
+CERT_FILE = "{{ dataplatform_cert_file }}"
+KEY_FILE = "{{ dataplatform_cert_key_file }}"
+KV_PATH = "secret/data/{{ dataplatform_cert_openbao_path }}"
+
+
+def openbao_addr() -> str:
+    ip = subprocess.check_output(
+        ["/usr/local/bin/k3s", "kubectl", "-n", "{{ dataplatform_openbao_namespace }}", "get", "service",
+         "openbao-active", "-o", "jsonpath={.spec.clusterIP}"], text=True).strip()
+    return f"http://{ip}:8200"
+
+
+def call(addr, token, method, path, body=None):
+    req = urllib.request.Request(f"{addr}/v1/{path}", method=method,
+                                 data=None if body is None else json.dumps(body).encode(),
+                                 headers={"X-Vault-Token": token, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read()
+            return r.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return 404, {}
+        sys.exit(f"OpenBao {method} {path}: HTTP {e.code} {e.read().decode(errors='replace')[:300]}")
+
+
+def main() -> None:
+    with open(TOKEN_FILE) as f:
+        token = f.read().strip()
+    addr = openbao_addr()
+    if sys.argv[1:] == ["--renew-token"]:
+        call(addr, token, "POST", "auth/token/renew-self", {})
+        return
+    with open(CERT_FILE) as f:
+        cert = f.read()
+    with open(KEY_FILE) as f:
+        key = f.read()
+    status, cur = call(addr, token, "GET", KV_PATH)
+    if status == 200 and cur["data"]["data"] == {"tls.crt": cert, "tls.key": key}:
+        return
+    call(addr, token, "POST", KV_PATH, {"data": {"tls.crt": cert, "tls.key": key}})
+    print(f"stored the certificate in OpenBao ({KV_PATH})")
+
+
+if __name__ == "__main__":
+    main()

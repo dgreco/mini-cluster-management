@@ -1,0 +1,290 @@
+---
+# Converge the running realm with realm-import.yaml, the file the Keycloak
+# operator created it from: realm settings, clients (with their protocol
+# mappers and secrets), the roles of service-account users, groups (only
+# created: groups made in the console stay) and their client roles (only
+# added). Users, memberships and key providers are never touched: people
+# are managed in the Keycloak console. The admin API is called inside the
+# cluster (keycloak_admin_base.yml); only the discovery document is read at
+# the public URL, as a check that Keycloak serves the realm.
+- name: Keycloak serves the realm - {{ dataplatform_keycloak_issuer }}
+  ansible.builtin.uri:
+    url: "{{ dataplatform_keycloak_issuer }}/.well-known/openid-configuration"
+  delegate_to: localhost
+  become: false
+  register: dataplatform_iam_discovery
+  retries: "{{ (dataplatform_iam_keycloak_timeout / 15) | int }}"
+  delay: 15
+  until: dataplatform_iam_discovery.status | default(0) == 200
+
+# ---------------------------------------------------------------- desired realm ----
+# Placeholders ${NAME} in the realm take their values from OpenBao, through the
+# same mapping as in Git: CR placeholder -> key of keycloak-realm-secrets ->
+# ExternalSecret remoteRef (path, property).
+- name: Where the realm's placeholders come from
+  ansible.builtin.set_fact:
+    dataplatform_iam_realm_cr: "{{ lookup('ansible.builtin.file', dataplatform_iam_realm_file) | from_yaml }}"
+    dataplatform_iam_realm_refs: >-
+      {{ dict((lookup('ansible.builtin.file', dataplatform_iam_realm_file | dirname ~ '/realm-secrets.yaml') | from_yaml).spec.data
+              | map(attribute='secretKey')
+              | zip((lookup('ansible.builtin.file', dataplatform_iam_realm_file | dirname ~ '/realm-secrets.yaml') | from_yaml).spec.data
+                    | map(attribute='remoteRef'))) }}
+
+- name: OpenBao client
+  ansible.builtin.include_role:
+    name: dataplatform_openbao
+    tasks_from: client
+
+- name: Read the placeholder values and the Keycloak admin from OpenBao
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/secret/data/{{ item }}"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+  loop: >-
+    {{ (dataplatform_iam_realm_refs.values() | map(attribute='key') | list + ['dataplatform/governance/keycloak-admin']) | unique }}
+  delegate_to: "{{ groups['k3s_servers'][0] }}"
+  register: dataplatform_iam_kv
+  no_log: true
+
+- name: The realm as it should be
+  ansible.builtin.set_fact:
+    dataplatform_iam_kc_admin: "{{ _kv['dataplatform/governance/keycloak-admin'] }}"
+    dataplatform_iam_kc_client_secret: "{{ _kv['dataplatform/governance/keycloak-clients'][dataplatform_iam_kc_client] | default('') }}"
+    dataplatform_iam_realm: >-
+      {%- set ns = namespace(s=(dataplatform_iam_realm_cr.spec.realm | to_json)) -%}
+      {%- for name, ref in dataplatform_iam_realm_cr.spec.placeholders.items() -%}
+      {%- set r = dataplatform_iam_realm_refs[ref.secret.key] -%}
+      {%- set ns.s = ns.s | replace('${' ~ name ~ '}', _kv[r.key][r.property]) -%}
+      {%- endfor -%}
+      {{ ns.s | from_json }}
+  vars:
+    _kv: >-
+      {{ dict(dataplatform_iam_kv.results | map(attribute='item')
+              | zip(dataplatform_iam_kv.results | map(attribute='json') | map(attribute='data') | map(attribute='data'))) }}
+  no_log: true
+
+- name: Admin API base
+  ansible.builtin.include_tasks: keycloak_admin_base.yml
+
+- name: Admin API of the realm
+  ansible.builtin.set_fact:
+    dataplatform_iam_kc_api: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_iam_realm.realm }}"
+
+# The master realm's admin tokens live 60 s: one per block below.
+- name: Admin token
+  ansible.builtin.include_tasks: keycloak_token.yml
+
+- name: Ansible's own client in the master realm
+  ansible.builtin.include_tasks: keycloak_master.yml
+
+# ---------------------------------------------------------------- realm settings ----
+- name: Current realm settings
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_realm_current
+  no_log: true
+
+- name: Realm settings (scalar fields of realm-import.yaml)
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}"
+    method: PUT
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: "{{ _wanted }}"
+    status_code: [204]
+  vars:
+    _wanted: >-
+      {%- set out = {} -%}
+      {%- for k, v in dataplatform_iam_realm.items() if v is not mapping and (v is string or v is not iterable) -%}
+      {%- set _ = out.update({k: v}) -%}
+      {%- endfor -%}
+      {{ out }}
+    _current: "{{ dataplatform_iam_realm_current.json | dict2items | selectattr('key', 'in', _wanted.keys()) | items2dict }}"
+  when: _current != _wanted
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+  no_log: true
+
+# ---------------------------------------------------------------- groups ----
+- name: Groups
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/groups?briefRepresentation=true&max=1000"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_groups_current
+
+- name: Create the groups of realm-import.yaml that are missing
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/groups"
+    method: POST
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: {name: "{{ item }}"}
+    status_code: [201]
+  loop: >-
+    {{ dataplatform_iam_realm.groups | map(attribute='name')
+       | difference(dataplatform_iam_groups_current.json | map(attribute='name')) }}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+
+- name: Admin token
+  ansible.builtin.include_tasks: keycloak_token.yml
+
+- name: Client roles of the groups
+  ansible.builtin.include_tasks: keycloak_group_roles.yml
+  loop: "{{ dataplatform_iam_realm.groups | selectattr('clientRoles', 'defined') }}"
+  loop_control:
+    loop_var: dataplatform_iam_group
+    label: "{{ dataplatform_iam_group.name }}"
+
+# ---------------------------------------------------------------- clients ----
+- name: Admin token
+  ansible.builtin.include_tasks: keycloak_token.yml
+
+- name: Look up the clients
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/clients?clientId={{ item.clientId | urlencode }}&search=false"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  loop: "{{ dataplatform_iam_realm.clients }}"
+  loop_control:
+    label: "{{ item.clientId }}"
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_clients_lookup
+  no_log: true
+
+- name: Create the missing clients (with their protocol mappers)
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/clients"
+    method: POST
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: "{{ item.item }}"
+    status_code: [201]
+  loop: "{{ dataplatform_iam_clients_lookup.results }}"
+  loop_control:
+    label: "{{ item.item.clientId }}"
+  when: item.json | length == 0
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+  no_log: true
+
+- name: Read the clients
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/clients?clientId={{ item.clientId | urlencode }}&search=false"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  loop: "{{ dataplatform_iam_realm.clients }}"
+  loop_control:
+    label: "{{ item.clientId }}"
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_clients
+  no_log: true
+
+# Fields of the file win; fields it does not set keep their value. Attributes
+# are merged the same way.
+- name: Update the clients that differ from realm-import.yaml
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/clients/{{ _current.id }}"
+    method: PUT
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: "{{ _current | combine(_wanted) | combine({'attributes': _current.attributes | default({}) | combine(_wanted.attributes | default({}))}) }}"
+    status_code: [204]
+  loop: "{{ dataplatform_iam_clients.results }}"
+  loop_control:
+    label: "{{ item.item.clientId }}"
+  vars:
+    _current: "{{ item.json[0] }}"
+    # an empty attribute in the file means unset: Keycloak keeps no such key
+    _wanted: >-
+      {{ item.item | dict2items | rejectattr('key', 'equalto', 'protocolMappers') | items2dict
+         | combine({'attributes': item.item.attributes | default({}) | dict2items | rejectattr('value', 'equalto', '') | items2dict}) }}
+    # Lists (redirect URIs, web origins) are sets in Keycloak: compared sorted.
+    _differs: >-
+      {%- set ns = namespace(d=false) -%}
+      {%- for k, v in _wanted.items() if k != 'attributes' -%}
+      {%- set c = _current.get(k) -%}
+      {%- if v is not string and v is iterable and v is not mapping -%}
+      {%- if (c | default([], true) | sort) != (v | sort) -%}{%- set ns.d = true -%}{%- endif -%}
+      {%- elif c != v -%}{%- set ns.d = true -%}{%- endif -%}
+      {%- endfor -%}
+      {{ ns.d or ((_current.attributes | default({})) | combine(_wanted.attributes | default({})) != (_current.attributes | default({}))) }}
+  when: _differs | bool
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+  no_log: true
+
+- name: Protocol mappers of the clients
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/clients/{{ item.json[0].id }}/protocol-mappers/models"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  loop: "{{ dataplatform_iam_clients.results }}"
+  loop_control:
+    label: "{{ item.item.clientId }}"
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_mappers
+
+# One entry per mapper of the file: {client: uuid, wanted: mapper, current: mapper or none}
+- name: Mappers to create or update
+  ansible.builtin.set_fact:
+    dataplatform_iam_mapper_work: >-
+      {%- set out = [] -%}
+      {%- for r in dataplatform_iam_mappers.results -%}
+      {%- for m in r.item.item.protocolMappers | default([]) -%}
+      {%- set cur = r.json | selectattr('name', 'equalto', m.name) | list -%}
+      {%- set _ = out.append({'client': r.item.json[0].id, 'clientId': r.item.item.clientId, 'wanted': m,
+                              'current': cur[0] if cur else none}) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: Create the missing protocol mappers
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/clients/{{ item.client }}/protocol-mappers/models"
+    method: POST
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: "{{ item.wanted }}"
+    status_code: [201]
+  loop: "{{ dataplatform_iam_mapper_work | selectattr('current', 'none') }}"
+  loop_control:
+    label: "{{ item.clientId }}: {{ item.wanted.name }}"
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+
+- name: Update the protocol mappers that differ
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/clients/{{ item.client }}/protocol-mappers/models/{{ item.current.id }}"
+    method: PUT
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: "{{ item.wanted | combine({'id': item.current.id}) }}"
+    status_code: [204]
+  loop: "{{ dataplatform_iam_mapper_work | rejectattr('current', 'none') }}"
+  loop_control:
+    label: "{{ item.clientId }}: {{ item.wanted.name }}"
+  # Keycloak adds defaults to a mapper's config: only the keys of the file count.
+  when: >-
+    item.current.protocolMapper != item.wanted.protocolMapper
+    or (item.current.config | default({})) | combine(item.wanted.config | default({})) != item.current.config | default({})
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+
+# ---------------------------------------------------------------- service accounts ----
+- name: Admin token
+  ansible.builtin.include_tasks: keycloak_token.yml
+
+- name: Roles of the service-account users
+  ansible.builtin.include_tasks: keycloak_service_account.yml
+  loop: "{{ dataplatform_iam_realm.users | default([]) | selectattr('serviceAccountClientId', 'defined') }}"
+  loop_control:
+    loop_var: dataplatform_iam_sa
+    label: "{{ dataplatform_iam_sa.serviceAccountClientId }}"
+
+# ---------------------------------------------------------------- the groups now ----
+- name: Groups of the realm (for the IAM roles)
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/groups?briefRepresentation=true&max=1000"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_groups

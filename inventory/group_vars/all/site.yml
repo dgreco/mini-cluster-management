@@ -1,0 +1,57 @@
+---
+# AN EXAMPLE SITE: replace every value below with your installation's (the
+# GitHub host keys are GitHub's own, published at api.github.com/meta).
+#
+# The site: every value that belongs to this installation rather than to the
+# software, in one place. Everything else derives from these: the inventory's
+# other settings, the roles, and the gitops tree, whose files carrying a site
+# value are rendered from their *.in templates by make configure (commit the
+# result and push: Argo CD deploys what is in Git). The nodes themselves are
+# inventory/hosts.ini's.
+#
+# Plain YAML, no Jinja: plain Python tools read this file too.
+# (install-time) marks a value that cannot simply change on a running
+# platform: changing it is a migration (data, trust, ARNs), not a re-run.
+
+# ---------------------------------------------------------------- cluster ----
+site_cluster_name: homelab               # (install-time) kubeconfig cluster and context, the metrics' cluster label
+site_lan_domain: home.arpa               # the nodes' DNS domain (hosts.ini names them <node>.<it>)
+site_lan_network: 192.168.1.0/24         # the boards' LAN: Ceph's public and cluster network, trusted by the platform's network policies
+site_s3_vip: 192.168.1.200/24            # the S3 ingress' virtual IP: a free address of the LAN
+site_k3s_api_vip: ""                     # a free LAN address for the Kubernetes API (kube-vip); '' = off
+site_k3s_cluster_cidr: 10.42.0.0/16      # (install-time) k3s' pod network, its default (not passed to k3s): a /16, one /24 per node
+
+# ---------------------------------------------------------------- public names ----
+site_dns_zone: example.org               # the GoDaddy DNS zone holding the names below
+site_platform_domain: data.example.org   # (install-time) every web UI is https://<name>.<it>; also the prefix of the platform's label keys
+site_s3_host: s3.example.org             # the S3 endpoint's name (Let's Encrypt certificate for it and *.<it>)
+site_acme_email: admin@example.org       # Let's Encrypt account; expiry warnings go there
+
+# ---------------------------------------------------------------- git ----
+site_git_repo: git@github.com:your-account/mini-cluster-management.git       # Argo CD pulls the gitops tree from it
+site_git_revision: main                  # the branch Argo CD follows
+# The Git server's SSH host keys (ssh-keyscan <host>): Argo CD refuses a server
+# that does not present them
+# yamllint disable rule:line-length
+site_git_host_keys:
+  - github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+  - github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+  - github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+# yamllint enable rule:line-length
+
+# ---------------------------------------------------------------- identity ----
+site_keycloak_realm: data-platform       # (install-time) Ceph trusts the realm's keys; the roles trust its tokens
+site_admin_group: platform-admins        # every permission on the bucket; the only group that may authorize in Meta Catalog
+site_engineer_group: data-engineers      # the example lakehouses' and the smoke test's teams
+site_analyst_group: data-analysts
+
+# ---------------------------------------------------------------- object storage ----
+site_s3_region: us-east-1                # RGW does not check the SigV4 region; clients just need one
+site_bucket: dataplatform                # (install-time) the one bucket of the platform's data
+site_backup_bucket: platform-backups     # etcd snapshots, PostgreSQL and OpenBao backups, the record of grants
+site_rgw_account_id: RGW00000000000000001   # (install-time) the platform's RGW IAM account: every role ARN names it
+site_rgw_account_name: dataplatform
+
+# ---------------------------------------------------------------- storage classes ----
+site_rbd_storage_class: ceph-rbd         # ReadWriteOnce block volumes (the default)
+site_cephfs_storage_class: ceph-cephfs   # ReadWriteMany shared filesystem

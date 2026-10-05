@@ -1,0 +1,19 @@
+---
+# Full installation of the data platform, idempotent end to end. Each step is
+# also runnable alone (make dataplatform-<step>).
+- name: Preflight
+  ansible.builtin.import_playbook: preflight.yml
+- name: Gateway nodes and public DNS
+  ansible.builtin.import_playbook: edge.yml
+- name: Argo CD and the root application
+  ansible.builtin.import_playbook: argocd.yml
+- name: OpenBao
+  ansible.builtin.import_playbook: openbao.yml
+- name: Wildcard certificate
+  ansible.builtin.import_playbook: cert.yml
+- name: S3 users and buckets
+  ansible.builtin.import_playbook: ceph.yml
+- name: Identity and access (Keycloak realm, STS roles, OpenBao logins)
+  ansible.builtin.import_playbook: iam.yml
+- name: Wait until everything is Synced and Healthy
+  ansible.builtin.import_playbook: sync.yml

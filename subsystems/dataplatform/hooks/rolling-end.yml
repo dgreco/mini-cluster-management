@@ -1,0 +1,19 @@
+---
+# Task-file hook included once by cluster/rolling-reboot.yml after the last
+# node: show the data platform's state.
+- name: Data platform applications
+  ansible.builtin.shell: |
+    set -o pipefail
+    /usr/local/bin/k3s kubectl -n argocd get applications \
+      -o 'jsonpath={range .items[*]}{.status.health.status}{"\n"}{end}' | sort | uniq -c
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ groups['k3s_servers'][0] }}"
+  register: dataplatform_rolling_end
+  changed_when: false
+  failed_when: false
+
+- name: Show the data platform
+  ansible.builtin.debug:
+    msg: "Argo CD applications by health: {{ dataplatform_rolling_end.stdout_lines | map('trim') | join(', ') }}"
+  when: dataplatform_rolling_end.rc == 0

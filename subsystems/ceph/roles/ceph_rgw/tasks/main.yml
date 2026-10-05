@@ -1,0 +1,282 @@
+---
+# RGW (S3) + STS + HA ingress + administrative S3 user. Runs on the admin host.
+- name: Spec directory
+  ansible.builtin.file:
+    path: /etc/ceph/specs
+    state: directory
+    mode: "0750"
+
+- name: Render RGW spec
+  ansible.builtin.template:
+    src: rgw.yml.j2
+    dest: /etc/ceph/specs/rgw.yml
+    mode: "0640"
+  register: ceph_rgw_spec
+
+- name: Apply RGW spec
+  ansible.builtin.command: cephadm shell --mount /etc/ceph/specs -- ceph orch apply -i /mnt/specs/rgw.yml
+  when: ceph_rgw_spec.changed or (ceph_force_apply | default(false) | bool)
+  changed_when: true
+
+- name: Wait for all RGW daemons to run
+  ansible.builtin.command: cephadm shell -- ceph orch ps --service_name rgw.{{ ceph_rgw_service_id }} --format json
+  register: ceph_rgw_ps
+  changed_when: false
+  retries: 40
+  delay: 15
+  until: >-
+    (ceph_rgw_ps.stdout | from_json | length) >= (groups['ceph_rgws'] | length)
+    and (ceph_rgw_ps.stdout | from_json | rejectattr('status_desc', 'equalto', 'running') | list | length) == 0
+
+# ---------------------------------------------------------------- pools ----
+# The autoscaler keeps every non-bulk pool at >= 32 PGs unless the pool has its
+# own pg_num_min. With 4 OSDs the five small RGW pools at 32 each use up the
+# mon_max_pg_per_osd budget and the bulk data pool can never grow. pg_num is set
+# first (fresh pools start at 1, and the mon refuses pg_num_min > pg_num), then
+# pg_num_min keeps the autoscaler from pushing them back to 32.
+- name: Read pool details
+  ansible.builtin.command: cephadm shell -- ceph osd pool ls detail --format json
+  register: ceph_rgw_pools
+  changed_when: false
+
+- name: Small RGW pools
+  ansible.builtin.set_fact:
+    ceph_rgw_small_pools: >-
+      {{ ceph_rgw_pools.stdout | from_json
+         | selectattr('application_metadata.rgw', 'defined')
+         | rejectattr('flags_names', 'search', 'bulk')
+         | rejectattr('pool_name', 'search', '\\.buckets\\.data$')
+         | list }}
+
+- name: Set the PG count of the small RGW pools to {{ ceph_rgw_small_pool_pg_num }}
+  ansible.builtin.command: cephadm shell -- ceph osd pool set {{ item.pool_name }} pg_num {{ ceph_rgw_small_pool_pg_num }}
+  loop: "{{ ceph_rgw_small_pools }}"
+  loop_control:
+    label: "{{ item.pool_name }} ({{ item.pg_num_target }} -> {{ ceph_rgw_small_pool_pg_num }})"
+  when: (item.pg_num_target | int) != (ceph_rgw_small_pool_pg_num | int)
+  changed_when: true
+
+- name: Set pg_num_min of the small RGW pools to {{ ceph_rgw_small_pool_pg_num }}
+  ansible.builtin.command: cephadm shell -- ceph osd pool set {{ item.pool_name }} pg_num_min {{ ceph_rgw_small_pool_pg_num }}
+  loop: "{{ ceph_rgw_small_pools }}"
+  loop_control:
+    label: "{{ item.pool_name }}"
+  when: (item.options.pg_num_min | default(0) | int) != (ceph_rgw_small_pool_pg_num | int)
+  changed_when: true
+
+# ---------------------------------------------------------------- config / STS ----
+- name: RGW configuration (STS)
+  ansible.builtin.include_role:
+    name: ceph_config
+  vars:
+    ceph_config_no_log: true
+    ceph_config_entries: >-
+      {{ [
+           {'who': ceph_rgw_config_section, 'name': 'rgw_s3_auth_use_sts', 'value': 'true'},
+           {'who': ceph_rgw_config_section, 'name': 'rgw_sts_key', 'value': ceph_rgw_sts_key, 'secret': true},
+           {'who': ceph_rgw_config_section, 'name': 'rgw_sts_max_session_duration', 'value': ceph_rgw_sts_max_session_duration}
+         ] if ceph_rgw_sts_enabled | bool else [] }}
+
+# The S3 DNS name goes into the zonegroup's `hostnames`, not `rgw_dns_name`: the
+# dashboard connects to `rgw_dns_name:<daemon port>` when that option is set,
+# which does not resolve (and the VIP only listens on the ingress port).
+- name: Drop legacy rgw_dns_name option
+  ansible.builtin.command: cephadm shell -- ceph config rm {{ ceph_rgw_config_section }} rgw_dns_name
+  when: >-
+    ceph_config_dump.stdout | from_json
+    | selectattr('section', 'equalto', ceph_rgw_config_section)
+    | selectattr('name', 'equalto', 'rgw_dns_name') | list | length > 0
+  register: ceph_rgw_dns_name_rm
+  changed_when: true
+
+- name: Read zonegroup
+  ansible.builtin.command: cephadm shell -- radosgw-admin zonegroup get --format json
+  register: ceph_rgw_zonegroup
+  changed_when: false
+
+# Once `hostnames` is set, RGW treats any other Host header as a bucket name
+# (custom-domain buckets), so http://<node>.<cluster_domain>:7480/ would address a
+# bucket called "<node>.<cluster_domain>". List the RGW hosts' own names too (IP
+# addresses such as the VIP are never taken as bucket names).
+- name: Wanted zonegroup hostnames
+  ansible.builtin.set_fact:
+    ceph_rgw_zonegroup_hostnames_missing: >-
+      {{ ([ceph_rgw_dns_name]
+          + groups['ceph_rgws']
+          + (groups['ceph_rgws'] | map('extract', hostvars, 'ansible_host') | list))
+         | unique | difference((ceph_rgw_zonegroup.stdout | from_json).hostnames) }}
+
+- name: Add missing zonegroup hostnames
+  when: ceph_rgw_zonegroup_hostnames_missing | length > 0
+  block:
+    - name: Write updated zonegroup
+      ansible.builtin.copy:
+        content: >-
+          {{ ceph_rgw_zonegroup.stdout | from_json
+             | combine({'hostnames': (ceph_rgw_zonegroup.stdout | from_json).hostnames + ceph_rgw_zonegroup_hostnames_missing})
+             | to_nice_json }}
+        dest: /etc/ceph/specs/zonegroup.json
+        mode: "0640"
+
+    - name: Apply updated zonegroup
+      ansible.builtin.command: cephadm shell --mount /etc/ceph/specs -- radosgw-admin zonegroup set --infile /mnt/specs/zonegroup.json
+      register: ceph_rgw_zonegroup_set
+      changed_when: true
+
+    - name: Commit period (only when a realm exists)
+      ansible.builtin.command: cephadm shell -- radosgw-admin period update --commit
+      when: (ceph_rgw_zonegroup.stdout | from_json).realm_id | length > 0
+      changed_when: true
+
+- name: Restart RGW daemons to pick up configuration changes
+  ansible.builtin.command: cephadm shell -- ceph orch restart rgw.{{ ceph_rgw_service_id }}
+  when: ceph_config_changed | bool or ceph_rgw_dns_name_rm is changed or ceph_rgw_zonegroup_set is changed
+  register: ceph_rgw_restart
+  changed_when: true
+
+- name: Wait for RGW daemons after restart
+  ansible.builtin.command: cephadm shell -- ceph orch ps --service_name rgw.{{ ceph_rgw_service_id }} --format json
+  register: ceph_rgw_ps
+  changed_when: false
+  retries: 40
+  delay: 15
+  until: (ceph_rgw_ps.stdout | from_json | rejectattr('status_desc', 'equalto', 'running') | list | length) == 0
+  when: ceph_rgw_restart is changed  # noqa: no-handler (the ingress below needs RGW running)
+
+# ---------------------------------------------------------------- ingress ----
+- name: Ingress container images (multi-arch replacements for cephadm defaults)
+  ansible.builtin.include_role:
+    name: ceph_config
+  vars:
+    ceph_config_entries:
+      - { who: mgr, name: mgr/cephadm/container_image_haproxy, value: "{{ ceph_ingress_haproxy_image }}" }
+      - { who: mgr, name: mgr/cephadm/container_image_keepalived, value: "{{ ceph_ingress_keepalived_image }}" }
+  when: ceph_rgw_ingress_enabled | bool
+
+# The certificate is self-signed, or Let's Encrypt's when ceph_rgw_acme_enabled
+# (issued and renewed by the ceph_acme role, which runs before this one).
+- name: Self-signed certificate for the ingress endpoint
+  ansible.builtin.shell: >-
+    umask 077 &&
+    openssl req -x509 -nodes -newkey rsa:2048 -days {{ ceph_rgw_ingress_cert_days }}
+    -keyout /etc/ceph/specs/rgw-ingress.key -out /etc/ceph/specs/rgw-ingress.crt
+    -subj "/CN={{ ceph_rgw_dns_name }}"
+    -addext "subjectAltName=DNS:{{ ceph_rgw_dns_name }},DNS:*.{{ ceph_rgw_dns_name }},IP:{{ ceph_rgw_vip }}"
+  args:
+    creates: /etc/ceph/specs/rgw-ingress.crt
+  when: ceph_rgw_ingress_enabled | bool and ceph_rgw_ingress_ssl | bool and not ceph_rgw_acme_active | bool
+
+- name: Read the self-signed certificate
+  ansible.builtin.slurp:
+    src: /etc/ceph/specs/rgw-ingress.crt
+  register: ceph_rgw_ingress_pem
+  when: ceph_rgw_ingress_enabled | bool and ceph_rgw_ingress_ssl | bool and not ceph_rgw_acme_active | bool
+
+- name: Save the ingress certificate on the control node (for AWS_CA_BUNDLE)
+  ansible.builtin.copy:
+    content: "{{ ceph_rgw_ingress_pem.content | b64decode | trim }}\n"
+    dest: "{{ secrets_dir }}/rgw-ingress.crt"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  when: ceph_rgw_ingress_enabled | bool and ceph_rgw_ingress_ssl | bool and not ceph_rgw_acme_active | bool
+
+- name: No self-signed certificate to trust with Let's Encrypt
+  ansible.builtin.file:
+    path: "{{ secrets_dir }}/rgw-ingress.crt"
+    state: absent
+  delegate_to: localhost
+  become: false
+  when: ceph_rgw_acme_active | bool
+
+- name: Render the ingress base spec
+  ansible.builtin.template:
+    src: ingress-base.yml.j2
+    dest: /etc/ceph/specs/ingress-base.yml
+    mode: "0600"
+  when: ceph_rgw_ingress_enabled | bool
+
+- name: Install ceph-ingress-apply
+  ansible.builtin.template:
+    src: ceph-ingress-apply.sh.j2
+    dest: /usr/local/sbin/ceph-ingress-apply
+    mode: "0755"
+  when: ceph_rgw_ingress_enabled | bool
+
+- name: Apply the ingress spec with its certificate
+  ansible.builtin.command: >-
+    /usr/local/sbin/ceph-ingress-apply
+    {{ '--force' if ceph_config_changed | bool or (ceph_force_apply | default(false) | bool) else '' }}
+    {{ ceph_rgw_ingress_cert_files | join(' ') }}
+  vars:
+    ceph_rgw_ingress_cert_files: >-
+      {{ [] if not ceph_rgw_ingress_ssl | bool else
+         [ceph_acme_cert_file, ceph_acme_key_file] if ceph_rgw_acme_active | bool else
+         ['/etc/ceph/specs/rgw-ingress.crt', '/etc/ceph/specs/rgw-ingress.key'] }}
+  register: ceph_rgw_ingress_apply
+  changed_when: ceph_rgw_ingress_apply.stdout == 'applied'
+  when: ceph_rgw_ingress_enabled | bool
+
+- name: Wait for the ingress daemons - {{ 'haproxy + keepalived on ' ~ ceph_rgw_ingress_count ~ ' hosts' }}
+  ansible.builtin.command: cephadm shell -- ceph orch ps --service_name ingress.rgw.{{ ceph_rgw_service_id }} --format json
+  register: ceph_rgw_ingress_ps
+  changed_when: false
+  retries: 40
+  delay: 15
+  until: >-
+    (ceph_rgw_ingress_ps.stdout | from_json | length) >= (2 * ceph_rgw_ingress_count | int)
+    and (ceph_rgw_ingress_ps.stdout | from_json | rejectattr('status_desc', 'equalto', 'running') | list | length) == 0
+  when: ceph_rgw_ingress_enabled | bool
+
+- name: Remove ingress service when disabled
+  ansible.builtin.command: cephadm shell -- ceph orch rm ingress.rgw.{{ ceph_rgw_service_id }}
+  register: ceph_rgw_ingress_rm
+  changed_when: "'Removed' in ceph_rgw_ingress_rm.stdout"
+  failed_when: false
+  when: not ceph_rgw_ingress_enabled | bool
+
+# ---------------------------------------------------------------- admin user ----
+- name: Administrative S3 user
+  ansible.builtin.include_tasks: rgw_user.yml
+  vars:
+    ceph_rgw_user_uid: "{{ ceph_rgw_admin_uid }}"
+    ceph_rgw_user_display_name: "{{ ceph_rgw_admin_display_name }}"
+    ceph_rgw_user_caps: "{{ ceph_rgw_admin_caps }}"
+
+# ---------------------------------------------------------------- backups ----
+- name: Backup S3 user
+  ansible.builtin.include_tasks: rgw_user.yml
+  vars:
+    ceph_rgw_user_uid: "{{ ceph_rgw_backup_uid }}"
+    ceph_rgw_user_display_name: Backups (etcd snapshots, PostgreSQL backups, OpenBao snapshots)
+    ceph_rgw_user_max_buckets: 1
+  when: ceph_rgw_backup_enabled | bool
+
+# Through the S3 API as the owner (radosgw-admin cannot create buckets).
+- name: Backup bucket, owned by that user
+  amazon.aws.s3_bucket:
+    name: "{{ ceph_rgw_backup_bucket }}"
+    state: present
+    ceph: true
+    endpoint_url: "{{ ceph_rgw_endpoint }}"
+    region: "{{ ceph_rgw_region }}"
+    access_key: "{{ ceph_rgw_user_info['keys'][0].access_key }}"
+    secret_key: "{{ ceph_rgw_user_info['keys'][0].secret_key }}"
+    validate_certs: "{{ ceph_rgw_acme_active | bool }}"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  no_log: true
+  when: ceph_rgw_backup_enabled | bool
+
+- name: Endpoint summary
+  ansible.builtin.debug:
+    msg:
+      - "S3/STS endpoint : {{ ceph_rgw_endpoint }}"
+      - "Admin user      : {{ ceph_rgw_admin_uid }} (keys in {{ secrets_dir }}/s3-{{ ceph_rgw_admin_uid }}.json)"
+      - >-
+        Backups         : {{ ('s3://' ~ ceph_rgw_backup_bucket ~ ' as ' ~ ceph_rgw_backup_uid
+                              ~ ' (keys in ' ~ secrets_dir ~ '/s3-' ~ ceph_rgw_backup_uid ~ '.json)')
+                             if ceph_rgw_backup_enabled | bool else 'off' }}
+      - "Per-host RGW    : http://<rgw-host>:{{ ceph_rgw_port }}"

@@ -1,0 +1,149 @@
+# The Acme Retail lakehouse: one aggregate, three layers, eight tables, and the
+# access policy for all of them (medallion-model.yaml). Load, build and grant:
+#
+#   make dataplatform-medallion ARGS="load subsystems/dataplatform/metacatalog/lakehouses/acme_retail.yaml"
+#   make dataplatform-medallion ARGS="provision acme_retail"     # Iceberg schemas and tables (Trino)
+#   make dataplatform-medallion ARGS="authorize acme_retail"     # the grants below -> an MR for Ceph
+#
+# `dependsOn` is lineage: it names the `ref` of whatever a node is built from,
+# anywhere in the document. The layers depend on each other in a line; the
+# tables depend on whatever they read.
+#
+# Principals are Keycloak groups (GROUP) and users (USER); a SERVICE is a
+# Keycloak client's service account (service-account-<id>). Permissions:
+# READ (read and list the files) and WRITE (also write and delete them).
+# Creating, altering and dropping tables is Meta Catalog's alone.
+entityType: "LakehouseType"
+values:
+  name: "acme_retail"
+  owner: "data-engineers"
+  storageRoot: "s3://dataplatform/lakehouse/acme_retail"
+
+  # Who may touch what, said once for the whole lakehouse. A grant without
+  # `resources` reaches every schema and table; `values: {layer: ...}` selects
+  # by the layer the mappings stamp on each of them.
+  principals:
+    - { id: "platform-admins", type: "GROUP", description: "Operate the platform" }
+    - { id: "data-engineers", type: "GROUP", description: "Land raw data and build silver and gold" }
+    - { id: "data-analysts", type: "GROUP", description: "Dashboards and reporting" }
+  permissions:
+    - { name: "READ", description: "Query the tables" }
+    - { name: "WRITE", description: "Load and change the tables" }
+  grants:
+    - principals: ["platform-admins", "data-engineers"]
+      permissions: ["READ", "WRITE"]
+    - principals: ["data-analysts"]
+      permissions: ["READ"]
+      resources:
+        values: { layer: "gold" }
+
+parts:
+
+  # ---------------------------------------------------------------- bronze: as it arrived
+  - ref: "bronze"
+    entityType: "BronzeLayerType"
+    values: { name: "bronze", retentionDays: 30 }
+    parts:
+      - ref: "orders_raw"
+        entityType: "BronzeTableType"
+        values:
+          name: "orders_raw"
+          description: "Order events exactly as the web shop emits them"
+          sourceSystem: "webshop"
+          ingestion: "streaming"
+          columns:
+            - { name: "payload", type: "string" }
+            - { name: "received_at", type: "timestamptz" }
+      - ref: "customers_raw"
+        entityType: "BronzeTableType"
+        values:
+          name: "customers_raw"
+          description: "Nightly CRM export"
+          sourceSystem: "crm"
+          ingestion: "batch"
+          columns:
+            - { name: "line", type: "string", pii: true }
+            - { name: "file_name", type: "string" }
+      - ref: "payments_raw"
+        entityType: "BronzeTableType"
+        values:
+          name: "payments_raw"
+          description: "Change data capture from the payments database"
+          sourceSystem: "payments"
+          ingestion: "cdc"
+          columns:
+            - { name: "op", type: "string" }
+            - { name: "after", type: "string" }
+            - { name: "ts_ms", type: "long" }
+
+  # ---------------------------------------------------------------- silver: cleaned and conformed
+  - ref: "silver"
+    entityType: "SilverLayerType"
+    values: { name: "silver", retentionDays: 365 }
+    dependsOn: ["bronze"]
+    parts:
+      - ref: "orders"
+        entityType: "SilverTableType"
+        dependsOn: ["orders_raw"]
+        values:
+          name: "orders"
+          primaryKey: ["order_id"]
+          expectations: ["order_id IS NOT NULL", "total >= 0"]
+          columns:
+            - { name: "order_id", type: "long" }
+            - { name: "customer_id", type: "long" }
+            - { name: "total", type: "decimal(10,2)" }
+            - { name: "ordered_at", type: "timestamptz" }
+      - ref: "customers"
+        entityType: "SilverTableType"
+        dependsOn: ["customers_raw"]
+        values:
+          name: "customers"
+          primaryKey: ["customer_id"]
+          expectations: ["email LIKE '%@%'"]
+          columns:
+            - { name: "customer_id", type: "long" }
+            - { name: "full_name", type: "string", pii: true }
+            - { name: "email", type: "string", pii: true }
+            - { name: "country", type: "string" }
+      - ref: "payments"
+        entityType: "SilverTableType"
+        dependsOn: ["payments_raw"]
+        values:
+          name: "payments"
+          primaryKey: ["payment_id"]
+          expectations: ["amount > 0"]
+          columns:
+            - { name: "payment_id", type: "long" }
+            - { name: "order_id", type: "long" }
+            - { name: "amount", type: "decimal(10,2)" }
+            - { name: "paid_at", type: "timestamptz" }
+
+  # ---------------------------------------------------------------- gold: ready for the business
+  - ref: "gold"
+    entityType: "GoldLayerType"
+    values: { name: "gold", retentionDays: 1825 }
+    dependsOn: ["silver"]
+    parts:
+      - ref: "daily_revenue"
+        entityType: "GoldTableType"
+        dependsOn: ["orders", "payments"]
+        values:
+          name: "daily_revenue"
+          businessOwner: "finance"
+          refresh: "daily at 06:00"
+          columns:
+            - { name: "day", type: "date" }
+            - { name: "revenue", type: "decimal(12,2)" }
+            - { name: "orders", type: "long" }
+      - ref: "customer_lifetime_value"
+        entityType: "GoldTableType"
+        dependsOn: ["orders", "customers"]
+        values:
+          name: "customer_lifetime_value"
+          businessOwner: "marketing"
+          refresh: "weekly"
+          columns:
+            - { name: "customer_id", type: "long" }
+            - { name: "country", type: "string" }
+            - { name: "lifetime_value", type: "decimal(12,2)" }

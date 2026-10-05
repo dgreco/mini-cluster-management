@@ -1,0 +1,35 @@
+---
+# The realm, as the Keycloak operator imports it (single definition)
+dataplatform_iam_realm_file: "{{ dataplatform_gitops_dir }}/manifests/governance/keycloak-realm/realm-import.yaml"
+# The issuer without its scheme: RGW's name for the provider and the prefix of
+# its condition keys (<idp>:groups, <idp>:sub, ...).
+dataplatform_iam_idp: "{{ dataplatform_keycloak_issuer | regex_replace('^https?://', '') }}"
+dataplatform_iam_provider_arn: "arn:aws:iam::{{ dataplatform_rgw_account_id }}:oidc-provider/{{ dataplatform_iam_idp }}"
+# RGW IAM calls go through the S3 administrator created by subsystems/ceph
+dataplatform_iam_s3admin: "{{ lookup('ansible.builtin.file', secrets_dir ~ '/s3-' ~ ceph_rgw_admin_uid ~ '.json') | from_json }}"
+# Keycloak groups become RGW roles and buckets only if their name is usable in both
+dataplatform_iam_group_pattern: '^[a-z0-9][a-z0-9-]{0,40}[a-z0-9]$'
+# The master realm: Ansible's own confidential client (service account with
+# the realm role admin), made with the bootstrap admin the first time; that
+# temporary admin is then deleted (Keycloak nags about it until it is)
+dataplatform_iam_kc_client: ansible
+dataplatform_iam_delete_temp_admin: true
+# Keycloak's Service, for the admin API calls made inside the cluster
+dataplatform_iam_keycloak_namespace: governance
+dataplatform_iam_keycloak_service: keycloak-service
+# How long to wait for Keycloak to serve the realm (s)
+dataplatform_iam_keycloak_timeout: 1200
+# -e dataplatform_iam_prune=true: delete the RGW role, the empty bucket and
+# the catalog role of a group that no longer exists in Keycloak
+dataplatform_iam_prune: false
+# OpenBao: the Keycloak group whose members get its admin policy
+dataplatform_iam_openbao_admin_group: "{{ dataplatform_iam_admin_groups | first }}"
+# The Iceberg catalog database (CloudNativePG) and its row-level security
+dataplatform_iam_catalog_namespace: governance
+dataplatform_iam_catalog_cluster: iceberg-catalog
+dataplatform_iam_catalog_database: iceberg
+dataplatform_iam_catalog_sql: "{{ dataplatform_gitops_dir }}/manifests/governance/iceberg-catalog/catalog-security.sql"
+# OpenBao path (under secret/dataplatform/) with one key per group: the password of its catalog role
+# OpenBao paths of the catalog logins whose password make dataplatform-iam
+# sets (made by make dataplatform-openbao): the Spark jobs'
+dataplatform_iam_catalog_logins: [governance/iceberg-catalog-spark]

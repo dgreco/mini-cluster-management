@@ -1,0 +1,24 @@
+# VictoriaLogs single node, two tenants, over OTLP from the OpenTelemetry
+# collectors. Tenant 1 (AccountID header): the Stackable products' logs (Vector
+# -> OTel cluster collector) and Spark submit pods (OTel agent). Tenant 0: every
+# other pod's log (OTel agent), Kubernetes events and other OTLP logs (OTel
+# cluster collector). Service victoria-logs:9428.
+server:
+  fullnameOverride: victoria-logs
+  retentionPeriod: 14d
+  # its own metrics, scraped by the OTel cluster collector
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9428"
+  persistentVolume:
+    enabled: true
+    storageClassName: ceph-rbd
+    size: 20Gi
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+    limits: {memory: 1Gi}
+  extraArgs:
+    # the oldest data goes before the 20Gi volume fills, retention or not
+    retention.maxDiskSpaceUsageBytes: 18GiB
+vector:
+  enabled: false

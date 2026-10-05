@@ -1,0 +1,131 @@
+---
+# Graceful shutdown of the whole cluster, or of some nodes (-e target=<node>,
+# any inventory pattern), then BMC power off.
+#
+# Whole cluster: the subsystems are quiesced first (pre-shutdown hooks: k3s
+# stopped, Ceph flags set), then every node halts.
+# Some nodes: each is taken out of service one at a time as in a rolling
+# reboot (node-enter hooks: Spark jobs finish, k3s drain, Ceph maintenance
+# mode); the rest of the cluster keeps serving. `make cluster-power-on
+# ARGS="-e target=<node>"` puts the node back.
+
+- name: Scope of the shutdown
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Resolve the target
+      ansible.builtin.set_fact:
+        shutdown_targets: "{{ query('inventory_hostnames', target | default('nodes')) | select('in', groups['nodes']) | list }}"
+
+    - name: The target names nodes of the inventory
+      ansible.builtin.assert:
+        that: shutdown_targets | length > 0
+        fail_msg: "-e target={{ target | default('') }} matches no node; use one of {{ groups['nodes'] | join(', ') }}"
+        quiet: true
+
+    - name: Whole cluster, or some nodes?
+      ansible.builtin.set_fact:
+        shutdown_whole: "{{ groups['nodes'] | difference(shutdown_targets) | length == 0 }}"
+
+    - name: Scope
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Shutting down the whole cluster: the subsystems are quiesced first.' if shutdown_whole
+             else 'Shutting down ' ~ (shutdown_targets | join(', ')) ~ ' one at a time; the rest of the cluster keeps serving.' }}
+
+# ---- whole cluster: subsystem pre-shutdown hooks (add one line per subsystem) ----
+# k3s first: its pods must release their Ceph volumes while Ceph still serves.
+# Each hook does nothing unless the localhost fact shutdown_whole is true.
+- name: The k3s pre-shutdown hook
+  ansible.builtin.import_playbook: ../subsystems/k3s/pre-shutdown.yml
+- name: Ceph pre-shutdown hook
+  ansible.builtin.import_playbook: ../subsystems/ceph/pre-shutdown.yml
+
+# ---- some nodes: out of service one at a time (the node-enter hooks) ----
+- name: Take the nodes out of service
+  hosts: "{{ hostvars['localhost']['shutdown_targets'] | default([]) }}"
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Whole cluster, quiesced above
+      ansible.builtin.meta: end_host
+      when: hostvars['localhost']['shutdown_whole']
+
+    - name: Skip a node that is off
+      ansible.builtin.include_tasks: tasks/ssh-probe.yml
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    - name: Out of service - {{ inventory_hostname }}
+      block:
+        - name: Take the node out of service
+          ansible.builtin.include_tasks: tasks/node-enter.yml
+      rescue:
+        # Undo the enter hooks (the exit hooks are safe on a node that did
+        # not go down), so the node serves again.
+        - name: Put the node back into service
+          ansible.builtin.include_tasks: tasks/node-exit.yml
+
+        - name: Stop the shutdown
+          ansible.builtin.fail:
+            msg: >-
+              Stopped at {{ inventory_hostname }}, step "{{ ansible_failed_task.name | default('?') }}" (the
+              error is shown above). The node was not halted and is back in service. Nodes after it were
+              not touched.
+
+- name: Halt the operating system
+  hosts: "{{ hostvars['localhost']['shutdown_targets'] | default([]) }}"
+  gather_facts: false
+  ignore_unreachable: true
+  tasks:
+    - name: Skip a node that is off
+      ansible.builtin.include_tasks: tasks/ssh-probe.yml
+
+    # async is the job's time limit, not a delay: it must outlast the sleep,
+    # or the async wrapper kills the job before shutdown runs.
+    - name: Issue shutdown
+      ansible.builtin.shell: sleep 2 && shutdown -h now
+      async: 30
+      poll: 0
+      changed_when: true
+
+    - name: Wait for SSH to go away
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        state: stopped
+        timeout: "{{ node_halt_timeout }}"
+      delegate_to: localhost
+      become: false
+
+- name: Power off via Turing Pi BMC
+  hosts: bmc
+  gather_facts: false
+  tasks:
+    - name: Let the boards finish halting
+      ansible.builtin.pause:
+        seconds: "{{ node_power_settle }}"
+
+    - name: Power off all nodes
+      ansible.builtin.raw: tpi power off
+      changed_when: true
+      when: hostvars['localhost']['shutdown_whole']
+
+    - name: Power off the target nodes
+      ansible.builtin.raw: tpi power off -n {{ hostvars[item]['turingpi_slot'] }}
+      loop: "{{ hostvars['localhost']['shutdown_targets'] }}"
+      loop_control:
+        label: "{{ item }} (slot {{ hostvars[item]['turingpi_slot'] }})"
+      changed_when: true
+      when: not hostvars['localhost']['shutdown_whole']
+
+    - name: Query power status
+      ansible.builtin.raw: tpi power status
+      register: tpi_status
+      changed_when: false
+
+    - name: Show power status
+      ansible.builtin.debug:
+        msg: "{{ tpi_status.stdout_lines }}"

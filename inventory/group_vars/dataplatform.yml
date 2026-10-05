@@ -1,0 +1,245 @@
+---
+# Data platform subsystem (subsystems/dataplatform). Applies to every host in
+# the `dataplatform` group (the k3s nodes); its plays run on the first k3s server.
+#
+# Argo CD installs the platform from subsystems/dataplatform/gitops at
+# dataplatform_git_revision. The manifests there that carry a site value
+# (group_vars/all/site.yml) are rendered from their *.in templates by
+# make configure, with the variables of this file: change a value there, run
+# make configure, commit, push.
+#
+# Ansible bootstraps what Argo CD cannot own: Argo CD itself, OpenBao's
+# initialisation and the secrets in it, the wildcard certificate, public DNS,
+# and everything on the Ceph side (S3 users, buckets, STS roles).
+
+# ---------------------------------------------------------------- git ----
+dataplatform_git_repo: "{{ site_git_repo }}"
+dataplatform_git_host: "{{ dataplatform_git_repo | regex_replace('^[^@]+@([^:/]+).*$', '\\1') }}"
+dataplatform_git_revision: "{{ site_git_revision }}"   # branch Argo CD follows; every gitops/apps/*.yaml names it
+# The Argo CD side of the subsystem (bigdata-k8s-stack layout) on the control node
+dataplatform_gitops_dir: "{{ inventory_dir }}/../subsystems/dataplatform/gitops"
+# Private key Argo CD pulls with (stored in the argocd namespace). Your own key
+# works but opens your whole GitLab account to whoever can read Secrets there:
+# prefer a read-only deploy key of this project, e.g.
+#   ssh-keygen -t ed25519 -N '' -f .secrets/argocd-git   (add .secrets/argocd-git.pub in GitLab)
+dataplatform_git_ssh_key_file: "{{ lookup('env', 'HOME') }}/.ssh/id_rsa"
+
+# ---------------------------------------------------------------- names ----
+# Every web UI is https://<name>.<domain> through the Gateway on the
+# dataplatform_gateway nodes (inventory), with a Let's Encrypt wildcard
+# certificate proven over GoDaddy DNS (the token make ceph-s3-cert uses).
+dataplatform_domain: "{{ site_platform_domain }}"
+dataplatform_dns_zone: "{{ site_dns_zone }}"  # the GoDaddy DNS zone that holds it
+dataplatform_public_dns: true                 # keep public A records <domain> and *.<domain> -> the gateway nodes
+dataplatform_acme_email: "{{ site_acme_email }}"   # Let's Encrypt account; expiry warnings go there
+dataplatform_acme_staging: false              # true: staging CA (untrusted certificates, for tests)
+dataplatform_acme_lego_version: "{{ lego_version }}"
+dataplatform_acme_dir: /etc/dataplatform/acme
+dataplatform_godaddy_api: https://api.godaddy.com/v1/domains
+dataplatform_godaddy_pat: >-
+  {{ (lookup('ansible.builtin.file', secrets_dir ~ '/godaddy.env', errors='ignore') | default('', true)
+      | regex_findall('(?m)^GODADDY_PAT=(\S+)') + [''])[0] }}
+
+# ---------------------------------------------------------------- keycloak ----
+dataplatform_keycloak_realm: "{{ site_keycloak_realm }}"
+dataplatform_keycloak_url: https://keycloak.{{ dataplatform_domain }}
+dataplatform_keycloak_issuer: "{{ dataplatform_keycloak_url }}/realms/{{ dataplatform_keycloak_realm }}"
+
+# ---------------------------------------------------------------- storage ----
+dataplatform_storage_class: "{{ site_rbd_storage_class }}"
+
+# ---------------------------------------------------------------- s3 ----
+# The object store: today Ceph RGW (subsystems/ceph), which also serves STS at
+# the same URL (preflight.yml asserts it is ceph_rgw_endpoint). What is Ceph-specific
+# beyond the address (radosgw-admin roles and users, the OIDC provider, the
+# IAM account and its role ARNs, AssumeRole by the RGW user trino) is in the roles
+# dataplatform_ceph and dataplatform_iam: another provider needs its own
+# implementation of those, not a value change.
+dataplatform_s3_endpoint: "https://{{ site_s3_host }}"
+dataplatform_s3_region: "{{ site_s3_region }}"
+# The one bucket of the platform's data: every project, every table, is a
+# directory in it, and gitops/iam/access.yaml says who may use which
+# Created by make dataplatform-ceph, owned by the platform's RGW account.
+dataplatform_bucket: "{{ site_bucket }}"
+# Spark event logs (jobs write them, the history server reads them): a
+# directory of the bucket that no grant reaches, only the RGW user spark
+dataplatform_spark_events_prefix: system/spark-events/
+# Every RGW identity of the platform (service users, the STS roles, the OIDC
+# provider) lives in this RGW IAM account (Squid): roles are
+# arn:aws:iam::<account>:role/<name>. The id is fixed here so that every file
+# that names a role can carry it (Meta Catalog's IAM settings, the scripts, iam-sync).
+dataplatform_rgw_account_id: "{{ site_rgw_account_id }}"
+dataplatform_rgw_account_name: "{{ site_rgw_account_name }}"
+# The account's root user (owns the bucket; only Ansible uses it) and the RGW
+# user Trino assumes the roles with: dataplatform_s3_users below
+dataplatform_account_root_uid: dataplatform
+dataplatform_trino_uid: trino
+# Backups (PostgreSQL, OpenBao snapshots) go to the bucket of subsystems/ceph's
+# backup user (ceph_rgw_backup_*); make dataplatform-ceph puts its key here.
+dataplatform_backup_kv_path: governance/backup-s3
+# Service users of the platform, all in the account. Their keys go to OpenBao
+# (these paths under secret/dataplatform/), never to .secrets, except for the
+# users with secrets_file, whose key goes to .secrets/<secrets_file>.{json,env}
+# (the .env headed by the lines of secrets_note; none at present).
+#   dataplatform:   the account's root: owns the bucket; only Ansible uses it
+#   trino:          no permission but sts:AssumeRole: the roles trust it to
+#                   act on behalf of an authenticated user
+#   spark:          the event logs (dataplatform_spark_events_prefix), nothing
+#                   else: its key is in every job and in the history server
+#   metacatalog-iam: Meta Catalog's authorize, reject and iam-reconcile: the
+#                   roles of the approved grants (usr-*, grp-*), never the
+#                   platform's own
+# account_root: true makes the user the account's administrator; policy: the
+# IAM user policy of the others (what they may do in the account).
+dataplatform_s3_users:
+  - uid: "{{ dataplatform_account_root_uid }}"
+    display_name: "{{ dataplatform_account_root_uid }}"
+    max_buckets: 10
+    account_root: true
+    openbao: [governance/s3-owner]
+  - uid: "{{ dataplatform_trino_uid }}"
+    display_name: "{{ dataplatform_trino_uid }}"
+    max_buckets: -1                 # may not create buckets
+    policy:
+      - {Effect: Allow, Action: ["sts:AssumeRole"], Resource: ["*"]}
+    openbao: [compute/trino-s3]
+  - uid: spark
+    display_name: spark
+    max_buckets: -1
+    policy:
+      - Effect: Allow
+        Action: ["s3:ListBucket"]
+        Resource: ["arn:aws:s3:::{{ dataplatform_bucket }}"]
+        Condition:
+          StringLike:
+            "s3:prefix":
+              - "{{ dataplatform_spark_events_prefix | regex_replace('/$', '') }}"
+              - "{{ dataplatform_spark_events_prefix }}*"
+      - Effect: Allow
+        Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"]
+        Resource: ["arn:aws:s3:::{{ dataplatform_bucket }}/{{ dataplatform_spark_events_prefix }}*"]
+    openbao: [compute/spark-s3]
+  # Meta Catalog's authorize and reject, and iam-reconcile
+  # (gitops/manifests/governance/metacatalog/provisioning/lib-iam.sh): the STS
+  # roles of the approved grants, usr-* and grp-*, nothing else of the
+  # account, and never the platform's own (make dataplatform-iam keeps those)
+  - uid: metacatalog-iam
+    display_name: metacatalog-iam
+    max_buckets: -1
+    # listing the account's roles needs it (RGW ignores the policy for that)
+    caps: roles=read
+    policy:
+      - Sid: TheRolesOfTheGrants
+        Effect: Allow
+        # RGW's name for UpdateAssumeRolePolicy is iam:ModifyRoleTrustPolicy
+        Action: [iam:GetRole, iam:CreateRole, iam:DeleteRole, iam:ModifyRoleTrustPolicy,
+                 iam:GetRolePolicy, iam:PutRolePolicy, iam:DeleteRolePolicy, iam:ListRolePolicies]
+        Resource:
+          - "arn:aws:iam::{{ dataplatform_rgw_account_id }}:role/{{ dataplatform_iam_user_role_prefix }}*"
+          - "arn:aws:iam::{{ dataplatform_rgw_account_id }}:role/{{ dataplatform_iam_group_role_prefix }}*"
+      - Sid: NeverThePlatformRoles
+        Effect: Deny
+        Action: ["iam:*"]
+        Resource: "{{ dataplatform_iam_platform_roles | map('regex_replace', '^', 'arn:aws:iam::' ~ dataplatform_rgw_account_id ~ ':role/') | list }}"
+    openbao: [governance/metacatalog-iam]
+# Service users that are gone: make dataplatform-ceph deletes them from RGW
+# (their objects stay the bucket's) and their key files from .secrets/.
+#   dataplatform-rw: the permanent read-write key for desktop tools, removed
+#                    on 2026-10-04: every data grant comes from Meta Catalog
+#                    (desktop tools take STS keys: make dataplatform-s3-login)
+#   iam-terraform:   the account root the OpenTofu pipeline applied the grants
+#                    with, removed on 2026-10-05: Meta Catalog applies them
+#                    (user metacatalog-iam)
+dataplatform_s3_users_removed:
+  - {uid: dataplatform-rw, secrets_file: s3-dataplatform-rw}
+  - {uid: iam-terraform, secrets_file: s3-iam-terraform}
+
+# ---------------------------------------------------------------- iam ----
+# Who may use which directory of the bucket is decided in Meta Catalog: a
+# member of the admin group authorizes a lakehouse, its grants go into the
+# record governance/metacatalog-grants, and every user (usr-<user>) and group
+# (grp-<group>) they name gets an STS role in the account with those
+# directories (make dataplatform-grants shows them). Members assume their role
+# with their Keycloak token (AssumeRoleWithWebIdentity); Trino assumes it for
+# them (AssumeRole as the RGW user trino). gitops/iam/access.yaml keeps the
+# platform's part; make dataplatform-iam keeps the rest: the Keycloak realm,
+# the OIDC provider RGW trusts, the platform's own roles, the catalog,
+# OpenBao's login.
+dataplatform_iam_user_role_prefix: usr-
+dataplatform_iam_group_role_prefix: grp-
+# Keycloak clients whose tokens RGW accepts for AssumeRoleWithWebIdentity
+# (smoke-test: the confidential client of make dataplatform-smoke-test;
+# jupyterhub: the hub hands its login token to the notebook servers)
+dataplatform_iam_client_ids: [data-cli, spark, smoke-test, jupyterhub, s3browser]
+# Longest STS session any role grants (s); RGW's own limit is ceph_rgw_sts_max_session_duration
+dataplatform_sts_max_session_duration: 43200
+# Groups with every permission on the bucket (access.yaml's admins.groups
+# carries the same list: make dataplatform-iam checks it); only they may
+# authorize and reject in Meta Catalog.
+dataplatform_iam_admin_groups: ["{{ site_admin_group }}"]
+# The Keycloak user that creates every schema and table (access.yaml's
+# metacatalog.provisioner, likewise): rw on the prefix, DDL in Trino.
+dataplatform_metacatalog_provisioner: service-account-metacatalog-provisioner
+# The roles make dataplatform-iam keeps and Meta Catalog may not touch (the
+# ConfigMap governance/metacatalog-iam lists the same, IAM_PLATFORM_ROLES)
+dataplatform_iam_platform_roles: >-
+  {{ (dataplatform_iam_admin_groups | map('regex_replace', '^', dataplatform_iam_group_role_prefix) | list)
+     + [dataplatform_iam_user_role_prefix ~ dataplatform_metacatalog_provisioner] }}
+# The S3 browser (gitops/manifests/tools/s3browser): the admin role reads
+# every bucket on Ceph (make dataplatform-ceph adds a read statement for it to
+# the policy of each bucket outside the account) and the browser lists them
+# from this index, which make dataplatform-ceph writes into the bucket.
+dataplatform_s3browser_index_key: system/admin-browser/buckets.json
+
+# ---------------------------------------------------------------- lifecycle ----
+# Rolling reboot (cluster/rolling-reboot.yml hooks) and power-on (s)
+dataplatform_drain_spark_timeout: 1800   # wait for Spark drivers on a node before its drain
+dataplatform_recover_timeout: 1200      # after a node's reboot, until the platform is whole again
+
+# ---------------------------------------------------------------- argo cd ----
+dataplatform_argocd_chart_repo: https://argoproj.github.io/argo-helm
+dataplatform_argocd_chart_version: 10.9.2    # Argo CD v3.5.3
+
+# ---------------------------------------------------------------- openbao ----
+dataplatform_openbao_namespace: governance
+# Static seal: OpenBao unseals itself at every start with this key, kept in
+# .secrets and in the Secret <namespace>/openbao-seal. Recovery keys and the
+# root token of the one-time initialisation go to .secrets/openbao-init.json.
+dataplatform_openbao_seal_key: "{{ lookup('password', secrets_dir ~ '/openbao-seal.key chars=hexdigits length=64') | lower }}"
+dataplatform_openbao_init_file: "{{ secrets_dir }}/openbao-init.json"
+# The token Ansible works with (policy `ansible`: the secrets, policies, auth
+# methods and identity, not root); made once after the initialisation, renewed
+# on every run. The root token stays in openbao-init.json for emergencies.
+dataplatform_openbao_ansible_token_file: "{{ secrets_dir }}/openbao-ansible.token"
+dataplatform_openbao_ansible_token_period: 768h   # 32 days: a run within that keeps it alive
+# Namespaces with a SecretStore: each reads secret/dataplatform/<namespace>/*
+# only, as its service account external-secrets-store (Kubernetes auth role
+# <namespace>).
+dataplatform_openbao_store_namespaces: [argocd, core, governance, compute, observability, tools]
+# Values Ansible generates once (null = 32 random letters and digits) and never
+# overwrites; a key added here later is added to the secret. Paths are under
+# secret/dataplatform/.
+dataplatform_openbao_generated:
+  governance/keycloak-db: {username: keycloak, password: null}
+  governance/keycloak-admin: {username: temp-admin, password: null}      # master realm bootstrap admin
+  governance/keycloak-clients: {argocd: null, grafana: null, openbao: null, trino: null, jupyterhub: null, iam-sync: null, smoke-test: null, ansible: null,
+                                s3browser: null, vmui: null, metacatalog: null, metacatalog-provisioner: null}
+  governance/platform-admin: {username: admin, password: null}           # first user of the realm (in the admin group)
+  governance/iceberg-catalog-db: {username: iceberg, password: null}
+  governance/iceberg-catalog-spark: {username: spark_writer, password: null}   # the Spark jobs' catalog login (no DDL)
+  governance/metacatalog-db: {username: metacatalog, password: null}  # owner of Meta Catalog's database
+  governance/metacatalog-proxy: {cookie-secret: null}         # oauth2-proxy's cookie key in front of Meta Catalog
+  observability/grafana-admin: {admin-user: admin, admin-password: null}
+  observability/vmui-proxy: {cookie-secret: null}              # oauth2-proxy's cookie key in front of VMUI (32 bytes)
+  tools/jupyterhub: {cookie-secret: null, crypt-key: null}     # JupyterHub's cookie and auth-state keys (hashed to hex by its ExternalSecret)
+# Copies kept equal to their source on every run: <path>: {<key>: <source path>#<key>}
+dataplatform_openbao_copies:
+  argocd/argocd-oidc: {client-secret: "governance/keycloak-clients#argocd"}
+  observability/grafana-oidc: {client-secret: "governance/keycloak-clients#grafana"}
+  compute/trino-oidc: {client-secret: "governance/keycloak-clients#trino"}
+  tools/jupyterhub-oidc: {client-secret: "governance/keycloak-clients#jupyterhub"}
+  tools/s3browser-oidc: {client-secret: "governance/keycloak-clients#s3browser"}
+  observability/vmui-oidc: {client-secret: "governance/keycloak-clients#vmui"}
+  compute/iceberg-catalog: {username: "governance/iceberg-catalog-db#username", password: "governance/iceberg-catalog-db#password"}
+  compute/iceberg-catalog-spark: {username: "governance/iceberg-catalog-spark#username", password: "governance/iceberg-catalog-spark#password"}
+  governance/iam-sync: {client-secret: "governance/keycloak-clients#iam-sync"}

@@ -1,0 +1,14 @@
+# Managed by Ansible (subsystems/ceph/roles/ceph_services). Placement is label based;
+# labels come from inventory group membership (ceph_host_labels).
+---
+service_type: mon
+placement:
+  label: mon
+---
+service_type: mgr
+placement:
+  label: mgr
+---
+service_type: crash
+placement:
+  host_pattern: '*'

@@ -1,0 +1,22 @@
+---
+# Restores CloudNativePG clusters from their Barman Cloud backups (the
+# cluster's ObjectStore). check.yml restores into a scratch cluster and
+# compares; replace.yml deletes the cluster and recreates it from the backups.
+- name: Valid input
+  ansible.builtin.assert:
+    that:
+      - dataplatform_pg_restore_mode in ['check', 'replace']
+      - dataplatform_pg_restore_cluster_input == 'all' or dataplatform_pg_restore_cluster_input in dataplatform_pg_restore_clusters
+      - dataplatform_pg_restore_target_tli | string is match('^([0-9]+)?$')
+    fail_msg: >-
+      pg_cluster must be all or one of {{ dataplatform_pg_restore_clusters | join(', ') }};
+      pg_target_tli a timeline number
+    quiet: true
+
+- name: One cluster at a time
+  ansible.builtin.include_tasks: "{{ dataplatform_pg_restore_mode }}.yml"
+  loop: >-
+    {{ dataplatform_pg_restore_clusters if dataplatform_pg_restore_cluster_input == 'all'
+       else [dataplatform_pg_restore_cluster_input] }}
+  loop_control:
+    loop_var: dataplatform_pg_restore_cluster

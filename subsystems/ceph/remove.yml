@@ -1,0 +1,216 @@
+---
+# DESTROYS the Ceph cluster on every host (daemons, /etc/ceph, /var/lib/ceph, OSD data).
+#   make ceph-remove ARGS="-e remove_confirm=yes"
+# Add -e remove_zap_osds=false to keep OSD device contents. Only the LVs in
+# ceph_osd_devices are zapped (contents only); the LVs and the PV are kept.
+# The Let's Encrypt account (/etc/ceph/acme) is kept unless -e remove_acme=true.
+- name: Safety check
+  hosts: ceph
+  gather_facts: false
+  tasks:
+    - name: Require explicit confirmation
+      ansible.builtin.assert:
+        that: remove_confirm | default('no') == 'yes'
+        fail_msg: "refusing to destroy the cluster without -e remove_confirm=yes"
+      run_once: true
+
+# Unmount before the monitors go away: a kernel client left behind keeps
+# retrying dead monitors and hangs anything touching the mount, reboots included.
+- name: Remove the CephFS client mount
+  hosts: ceph
+  gather_facts: false
+  ignore_unreachable: true
+  vars:
+    _admin: "{{ groups['ceph_mons'][0] }}"
+    _mount_point: "{{ hostvars[_admin]['ceph_cephfs_mount_point'] }}"
+    _client: "{{ hostvars[_admin]['ceph_cephfs_client_name'] }}"
+  tasks:
+    - name: Automount unit name
+      ansible.builtin.command: systemd-escape -p --suffix=automount {{ _mount_point }}
+      register: automount_unit
+      changed_when: false
+
+    - name: Stop the automount unit
+      ansible.builtin.systemd:
+        name: "{{ automount_unit.stdout }}"
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Is CephFS mounted?
+      ansible.builtin.command: findmnt -rn -t ceph {{ _mount_point }}
+      register: cephfs_mounted
+      changed_when: false
+      failed_when: false
+
+    - name: Unmount
+      ansible.builtin.command: umount -f -l {{ _mount_point }}
+      when: cephfs_mounted.rc == 0
+      changed_when: true
+
+    - name: The fstab entry
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: "^\\S+\\s+{{ _mount_point }}\\s+ceph\\s"
+        state: absent
+      register: fstab
+
+    - name: Reload systemd units generated from fstab
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: fstab.changed  # noqa: no-handler (the mount units must be current for the next tasks)
+
+    - name: Secret file
+      ansible.builtin.file:
+        path: "/etc/ceph/{{ _client }}.secret"
+        state: absent
+
+- name: Remove Ceph from every host
+  hosts: ceph
+  gather_facts: false
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+  vars:
+    remove_zap_osds: true
+  tasks:
+    # `cephadm ls` only reports clusters that still have a data dir; systemd
+    # units and containers of earlier, half-removed clusters are found by name.
+    - name: Find cluster fsids on this host (cephadm)
+      ansible.builtin.command: cephadm ls
+      register: ceph_bootstrap_cephadm_ls
+      changed_when: false
+      failed_when: false
+
+    - name: Find cluster fsids on this host (systemd units)
+      ansible.builtin.find:
+        paths: /etc/systemd/system
+        patterns: "ceph-*.target"
+        file_type: any
+      register: ceph_targets
+
+    - name: Collect fsids
+      ansible.builtin.set_fact:
+        ceph_fsids: >-
+          {{ ((ceph_bootstrap_cephadm_ls.stdout if ceph_bootstrap_cephadm_ls.rc == 0 else '[]') | from_json | map(attribute='fsid') | list)
+             + (ceph_targets.files | map(attribute='path') | map('basename')
+                | map('regex_replace', '^ceph-', '') | map('regex_replace', '[.]target$', '') | list)
+             | unique }}
+
+    # No --zap-osds: cephadm would run `lvm zap --destroy` on the whole physical
+    # device, taking lv_var/lv_home with it. Zapping is done per LV below.
+    - name: /var/lib/ceph must exist for rm-cluster
+      ansible.builtin.file:
+        path: /var/lib/ceph
+        state: directory
+        mode: "0755"
+      when: ceph_fsids | length > 0
+
+    - name: Remove the clusters
+      ansible.builtin.command: cephadm rm-cluster --force --fsid {{ item }}
+      loop: "{{ ceph_fsids }}"
+      changed_when: true
+
+    - name: Classify OSD volumes
+      ansible.builtin.shell: |
+        set -o pipefail
+        dev="{{ item }}"
+        if ! lvs --noheadings -o lv_name "$dev" >/dev/null 2>&1; then echo not-lv; exit 0; fi
+        if findmnt -rn -S "$(readlink -f "$dev")" >/dev/null 2>&1; then echo mounted; exit 0; fi
+        if [ -n "$(wipefs -n "$dev" 2>/dev/null)" ] || lvs --noheadings -o lv_tags "$dev" | grep -q ceph; then echo dirty; exit 0; fi
+        echo clean
+      args:
+        executable: /bin/bash
+      loop: "{{ ceph_osd_devices }}"
+      register: osd_volumes
+      changed_when: false
+      when: remove_zap_osds | bool
+
+    # Same command as the ceph_osds role: wipes contents and LVM tags, keeps the LV.
+    - name: Zap OSD volumes (contents only, the LV is kept)
+      ansible.builtin.command: cephadm --image {{ ceph_image }} ceph-volume -- lvm zap {{ item.item }}
+      loop: "{{ osd_volumes.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - remove_zap_osds | bool
+        - item.stdout | default('') == 'dirty'
+      changed_when: true
+
+    # rm-cluster leaves containers that never started (state "Created") and
+    # failed units in systemd's memory, typically from earlier clusters.
+    - name: Remove leftover daemon containers and failed units
+      ansible.builtin.shell: |
+        set -o pipefail
+        rt=$(command -v podman || command -v docker || true)
+        if [ -n "$rt" ]; then
+          for c in $($rt ps -a --format '{% raw %}{{.Names}}{% endraw %}' | grep -E '^ceph-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}-' || true); do
+            $rt rm -f "$c" >/dev/null && echo "removed container $c"
+          done
+        fi
+        if systemctl list-units --all --state=failed --no-legend 'ceph-*' | grep -q .; then
+          systemctl reset-failed 'ceph-*' && echo "reset failed units"
+        fi
+      args:
+        executable: /bin/bash
+      register: leftover_cleanup
+      changed_when: leftover_cleanup.stdout | length > 0
+
+    - name: Stop the certificate renewal timer
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop: [ceph-s3-cert.timer, ceph-s3-cert.service]
+      failed_when: false
+
+    - name: Disable the clock wait at boot
+      ansible.builtin.systemd:
+        name: chrony-wait.service
+        enabled: false
+      failed_when: false
+
+    # Everything the roles put outside /etc/ceph and /var/lib/ceph: the helper
+    # programs, the systemd units and drop-in, logrotate, sysctl, the build
+    # context and image of the ingress, the cephadm binary.
+    - name: Remove the helper programs, units and settings
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/ceph-s3-cert.service
+        - /etc/systemd/system/ceph-s3-cert.timer
+        - /etc/systemd/system/ceph-.service.d
+        - /etc/systemd/system/chrony-wait.service
+        - /usr/local/sbin/ceph-s3-cert
+        - /usr/local/sbin/ceph-s3-cert-deploy
+        - /usr/local/sbin/ceph-ingress-apply
+        - /usr/local/sbin/ceph-wait-network
+        - /etc/logrotate.d/cephadm
+        - /etc/sysctl.d/90-ceph-ingress.conf
+        - /usr/local/bin/cephadm
+      notify: Reload systemd
+
+    - name: Remove the locally built keepalived image
+      ansible.builtin.command: podman rmi --force {{ ceph_ingress_keepalived_image }}
+      register: ceph_remove_image
+      failed_when: false
+      changed_when: ceph_remove_image.rc == 0
+
+    # /etc/ceph/acme (the Let's Encrypt account and certificate of the S3 name)
+    # survives unless -e remove_acme=true: an account made anew at every
+    # rebuild runs into Let's Encrypt's rate limits.
+    - name: Remove leftovers
+      ansible.builtin.shell: |
+        if [ -d /etc/ceph/acme ] && ! {{ 'true' if remove_acme | default(false) | bool else 'false' }}; then
+          find /etc/ceph -mindepth 1 -maxdepth 1 ! -name acme -exec rm -rf {} +
+          echo "kept /etc/ceph/acme"
+        else
+          rm -rf /etc/ceph
+        fi
+        rm -rf /var/lib/ceph /var/log/ceph
+      args:
+        executable: /bin/bash
+      register: ceph_remove_leftovers
+      changed_when: true

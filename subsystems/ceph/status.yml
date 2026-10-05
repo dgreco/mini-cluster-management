@@ -1,0 +1,57 @@
+---
+- name: Ceph status
+  hosts: ceph_mons[0]
+  gather_facts: false
+  tasks:
+    - name: Collect
+      ansible.builtin.command: cephadm shell -- {{ item }}
+      loop:
+        - ceph -s
+        - ceph health detail
+        - ceph orch host ls
+        - ceph orch ls
+        - ceph orch ps
+        - ceph osd tree
+        - ceph df
+        - ceph fs status
+        - radosgw-admin user list
+        - ceph mgr services
+        - ceph dashboard get-grafana-api-url
+        - ceph dashboard get-prometheus-api-host
+        - ceph dashboard get-alertmanager-api-host
+      loop_control:
+        label: "{{ item }}"
+      register: status_out
+      changed_when: false
+      failed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ ['$ ' ~ item.item] + item.stdout_lines + item.stderr_lines }}"
+      loop: "{{ status_out.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Let's Encrypt certificate and renewal timer
+      ansible.builtin.shell: |
+        set -o pipefail
+        openssl x509 -in {{ ceph_acme_cert_file }} -noout -subject -issuer -enddate
+        systemctl list-timers ceph-s3-cert.timer --no-pager | head -2
+      args:
+        executable: /bin/bash
+      register: status_cert
+      changed_when: false
+      failed_when: false
+      when: ceph_rgw_enabled | bool and ceph_rgw_acme_active | bool
+
+    - name: S3 certificate
+      ansible.builtin.debug:
+        msg: "{{ status_cert.stdout_lines + status_cert.stderr_lines }}"
+      when: status_cert is not skipped
+
+    - name: Endpoints
+      ansible.builtin.debug:
+        msg:
+          - "S3/STS endpoint : {{ ceph_rgw_endpoint if ceph_rgw_enabled | bool else 'disabled (ceph_rgw_enabled=false)' }}"
+          - "Dashboard       : see 'ceph mgr services' above (user {{ ceph_dashboard_user }}, password in {{ secrets_dir }}/ceph-dashboard.pw)"
+          - "Grafana         : see 'ceph dashboard get-grafana-api-url' above (user admin, password in {{ secrets_dir }}/ceph-grafana.pw)"

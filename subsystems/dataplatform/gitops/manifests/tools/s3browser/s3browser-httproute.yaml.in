@@ -1,0 +1,16 @@
+# https://s3browser.<%= dataplatform_domain %> -> the S3 browser
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: s3browser
+spec:
+  parentRefs:
+    - name: main-gateway
+      namespace: core
+      sectionName: s3browser-https
+  hostnames:
+    - s3browser.<%= dataplatform_domain %>
+  rules:
+    - backendRefs:
+        - name: s3browser
+          port: 80

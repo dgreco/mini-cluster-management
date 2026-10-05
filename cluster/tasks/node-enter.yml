@@ -1,0 +1,17 @@
+---
+# Takes one node out of service: the subsystems' node-enter hooks in order.
+# The data platform first (Spark jobs on the node finish), then k3s (pods
+# release their Ceph volumes while Ceph still serves), Ceph last (maintenance
+# mode). Included per node by cluster/rolling-reboot.yml and cluster/shutdown.yml.
+# Add one include per subsystem here, and its opposite in node-exit.yml.
+- name: Let the data platform's Spark jobs on the node finish
+  ansible.builtin.include_tasks: ../../subsystems/dataplatform/hooks/node-enter.yml
+  when: inventory_hostname in groups['dataplatform'] | default([])
+
+- name: Drain the node in k3s
+  ansible.builtin.include_tasks: ../../subsystems/k3s/hooks/node-enter.yml
+  when: inventory_hostname in groups['k3s'] | default([])
+
+- name: Put the node into Ceph maintenance
+  ansible.builtin.include_tasks: ../../subsystems/ceph/hooks/node-enter.yml
+  when: inventory_hostname in groups['ceph'] | default([])

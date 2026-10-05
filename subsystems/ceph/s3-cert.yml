@@ -1,0 +1,68 @@
+---
+# Let's Encrypt certificate of the S3 endpoint (ceph_rgw_acme_* in
+# group_vars/ceph/): public DNS records, obtain or renew when due, serve it,
+# check it from here. ceph-s3-cert.timer renews it on its own; run this after
+# changing the settings, or to check.   -e ceph_acme_force=true: renew now
+- name: S3 endpoint certificate
+  hosts: ceph_mons[0]
+  roles:
+    - role: ceph_acme
+  tasks:
+    - name: Serve it on the ingress
+      ansible.builtin.command: /usr/local/sbin/ceph-ingress-apply {{ ceph_acme_cert_file }} {{ ceph_acme_key_file }}
+      register: ceph_s3_cert_apply
+      changed_when: ceph_s3_cert_apply.stdout == 'applied'
+
+    # Any HTTP answer will do: RGW answers 404 for the new name until
+    # `make ceph-s3` has added it to the zonegroup hostnames.
+    - name: Wait until the endpoint serves it with a valid chain - {{ ceph_rgw_endpoint }}
+      ansible.builtin.uri:
+        url: "{{ ceph_rgw_endpoint }}"
+        validate_certs: "{{ not ceph_rgw_acme_staging | bool }}"
+        status_code: [200, 403, 404]
+        timeout: 10
+      delegate_to: localhost
+      become: false
+      register: ceph_s3_cert_check
+      failed_when: false
+      retries: 8
+      delay: 15
+      until: ceph_s3_cert_check.status in [200, 403, 404]
+
+    - name: The endpoint answers with the new certificate
+      ansible.builtin.assert:
+        that: ceph_s3_cert_check.status in [200, 403, 404]
+        fail_msg: >-
+          {{ ceph_rgw_endpoint }} does not answer from this machine: {{ ceph_s3_cert_check.msg | default('') }}.
+          If the name does not resolve (nodename nor servname / Name or service not known), the local DNS
+          server drops public answers pointing to a private address (DNS-rebinding protection, e.g. on a
+          FRITZ!Box): allow {{ ceph_rgw_acme_zone }} there. The certificate itself is in place on the cluster.
+        quiet: true
+
+    # Their .env/.json files carry the endpoint and, with the self-signed
+    # certificate, AWS_CA_BUNDLE: rewrite them for users that still exist.
+    - name: S3 users on the cluster
+      ansible.builtin.command: cephadm shell -- radosgw-admin user list
+      register: ceph_s3_cert_users
+      changed_when: false
+
+    - name: Refresh the local credential files of S3 users
+      ansible.builtin.include_role:
+        name: ceph_rgw
+        tasks_from: rgw_user
+      vars:
+        ceph_rgw_user_uid: "{{ item }}"
+      loop: >-
+        {{ query('ansible.builtin.fileglob', secrets_dir ~ '/s3-*.json')
+           | map('basename') | map('regex_replace', '^s3-(.*)\\.json$', '\\1')
+           | select('in', ceph_s3_cert_users.stdout | from_json) | list }}
+
+    - name: Renewal timer
+      # a read-only query the systemd module cannot do
+      ansible.builtin.command: systemctl list-timers ceph-s3-cert.timer --no-pager  # noqa: command-instead-of-module
+      register: ceph_s3_cert_timer
+      changed_when: false
+
+    - name: Next renewal check
+      ansible.builtin.debug:
+        msg: "{{ ceph_s3_cert_timer.stdout_lines[:2] }}"

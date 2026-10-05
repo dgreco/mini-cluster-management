@@ -1,0 +1,67 @@
+---
+# Remove an S3 user and its local credential files.
+#   make ceph-s3-user-remove ARGS="-e uid=alice"
+#   make ceph-s3-user-remove ARGS="-e uid=alice -e purge_data=true"   # also delete the user's buckets and objects
+# The administrative user (ceph_rgw_admin_uid) is refused unless -e force=true.
+- name: Remove S3 user
+  hosts: ceph_mons[0]
+  gather_facts: false
+  vars:
+    purge_data: false
+    force: false
+  tasks:
+    - name: Validate input
+      ansible.builtin.assert:
+        that:
+          - ceph_rgw_enabled | bool
+          - uid is defined
+          - uid != ceph_rgw_admin_uid or force | bool
+        fail_msg: "pass -e uid=<name>; removing the admin user '{{ ceph_rgw_admin_uid }}' needs -e force=true"
+
+    - name: Look up user {{ uid }}
+      ansible.builtin.command: cephadm shell -- radosgw-admin user info --uid={{ uid }}
+      register: user_lookup
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: User does not exist
+      ansible.builtin.debug:
+        msg: "S3 user '{{ uid }}' does not exist; nothing to remove on the cluster"
+      when: user_lookup.rc != 0
+
+    - name: Buckets owned by {{ uid }}
+      ansible.builtin.command: cephadm shell -- radosgw-admin bucket list --uid={{ uid }}
+      register: user_buckets
+      changed_when: false
+      when: user_lookup.rc == 0
+
+    - name: Refuse to remove a user that still owns buckets
+      ansible.builtin.fail:
+        msg: >-
+          '{{ uid }}' owns {{ user_buckets.stdout | from_json | length }} bucket(s):
+          {{ user_buckets.stdout | from_json | join(', ') }}.
+          Delete them first, or re-run with -e purge_data=true to destroy the buckets and all their objects.
+      when:
+        - user_lookup.rc == 0
+        - user_buckets.stdout | from_json | length > 0
+        - not purge_data | bool
+
+    - name: Remove the user - {{ uid ~ (' and purge its data' if purge_data | bool else '') }}
+      ansible.builtin.command: cephadm shell -- radosgw-admin user rm --uid={{ uid }} {{ '--purge-data' if purge_data | bool else '' }}
+      when: user_lookup.rc == 0
+      changed_when: true
+
+    - name: Remove local credential files
+      ansible.builtin.file:
+        path: "{{ secrets_dir }}/s3-{{ uid }}.{{ item }}"
+        state: absent
+      loop: [json, env]
+      delegate_to: localhost
+      become: false
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          S3 user '{{ uid }}' removed{{ ' (buckets and objects purged)' if purge_data | bool and user_lookup.rc == 0 else '' }};
+          local files .secrets/s3-{{ uid }}.{json,env} deleted

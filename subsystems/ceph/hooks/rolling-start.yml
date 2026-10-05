@@ -1,0 +1,80 @@
+---
+# Task-file hook included once by cluster/rolling-reboot.yml before the first
+# node. Refuses to start unless Ceph is HEALTH_OK with every PG active+clean and
+# no host in maintenance. Asks for the S3 virtual IP holder and the host of the
+# active manager to be rebooted last (fewer failovers).
+- name: Is Ceph deployed?
+  ansible.builtin.stat:
+    path: /etc/ceph/ceph.conf
+  delegate_to: "{{ ceph_admin_host }}"
+  register: ceph_rolling_conf
+
+- name: Check Ceph and choose the hosts to reboot last
+  when: ceph_rolling_conf.stat.exists
+  block:
+    # A crash report keeps RECENT_CRASH for 14 days; it is benign for a reboot
+    # but archived here so the health is clean afterwards.
+    - name: Archive crash reports
+      ansible.builtin.command: cephadm shell -- ceph crash archive-all
+      delegate_to: "{{ ceph_admin_host }}"
+      changed_when: false
+
+    - name: Read the health checks
+      ansible.builtin.command: cephadm shell -- ceph health --format json
+      delegate_to: "{{ ceph_admin_host }}"
+      register: ceph_rolling_health_raw
+      changed_when: false
+
+    - name: Read PGs and hosts
+      ansible.builtin.command: cephadm shell -- sh -c 'ceph pg stat; ceph orch host ls'
+      delegate_to: "{{ ceph_admin_host }}"
+      register: ceph_rolling_state
+      changed_when: false
+
+    # Healthy: HEALTH_OK, or HEALTH_WARN made only of ceph_rolling_benign_health
+    # (a muted check does not count).
+    - name: Ceph is healthy
+      ansible.builtin.assert:
+        that:
+          - ceph_rolling_health.status == 'HEALTH_OK' or (ceph_rolling_health.status == 'HEALTH_WARN' and ceph_rolling_bad | length == 0)
+          - ceph_rolling_state.stdout is search(ceph_rolling_clean_re, multiline=True)
+          - ceph_rolling_state.stdout is not search('[Mm]aintenance')
+        fail_msg: >-
+          Ceph is not healthy, not starting. Want HEALTH_OK (or only {{ ceph_rolling_benign_health | join(', ') }}),
+          every PG active+clean and no host in maintenance. Found: {{ ceph_rolling_health.status }}
+          {{ ceph_rolling_bad | join(', ') }} | {{ (ceph_rolling_state.stdout_lines[0:1]
+          + (ceph_rolling_state.stdout_lines | select('search', '[Mm]aintenance') | list)) | join(' | ') }}
+          (details: make ceph-status)
+        quiet: true
+      vars:
+        ceph_rolling_clean_re: '^([0-9]+) pgs: \1 active\+clean;'   # every PG active+clean
+        ceph_rolling_health: "{{ ceph_rolling_health_raw.stdout | from_json }}"
+        ceph_rolling_bad: >-
+          {{ ceph_rolling_health.checks | dict2items | rejectattr('value.muted', 'defined') | map(attribute='key') | list
+             + (ceph_rolling_health.checks | dict2items | selectattr('value.muted', 'defined') | rejectattr('value.muted')
+                | map(attribute='key') | list)
+             | reject('in', ceph_rolling_benign_health) | list }}
+
+    - name: Read the active manager
+      ansible.builtin.command: cephadm shell -- ceph mgr stat --format json
+      delegate_to: "{{ ceph_admin_host }}"
+      register: ceph_rolling_mgr
+      changed_when: false
+
+    - name: Find the host holding the S3 virtual IP
+      ansible.builtin.command: ip -4 -o addr show
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['ceph_ingress'] }}"
+      register: ceph_rolling_addrs
+      changed_when: false
+      when: ceph_rgw_enabled | bool and ceph_rgw_ingress_enabled | bool
+
+    - name: Reboot the S3 virtual IP holder and the active manager last
+      ansible.builtin.set_fact:
+        rolling_last: >-
+          {{ hostvars['localhost']['rolling_last'] | default([])
+             + (ceph_rolling_addrs.results | default([]) | selectattr('stdout', 'defined')
+                | selectattr('stdout', 'search', ' ' ~ ceph_rgw_vip ~ '/') | map(attribute='item') | list)
+             + ([(ceph_rolling_mgr.stdout | from_json).active_name.split('.')[0]] | select('in', groups['ceph']) | list) }}
+      delegate_to: localhost
+      delegate_facts: true

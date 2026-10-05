@@ -1,0 +1,9 @@
+---
+- name: Restart keepalived
+  ansible.builtin.shell: |
+    set -o pipefail
+    units=$(systemctl list-units --plain --no-legend 'ceph-*@keepalived.*' | awk '{print $1}')
+    [ -z "$units" ] || systemctl restart $units
+  args:
+    executable: /bin/bash
+  changed_when: true

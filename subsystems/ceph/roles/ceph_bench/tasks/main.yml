@@ -1,0 +1,6 @@
+---
+# Nothing runs by default; the bench-*.yml playbooks call the task files below
+# (include_role tasks_from) so that every step runs on all load hosts in lockstep.
+- name: Use tasks_from
+  ansible.builtin.debug:
+    msg: "ceph_bench is used through tasks_from: install_fio, install_warp, rados_mode, fio_job"

@@ -1,0 +1,9 @@
+# Managed by Ansible (acme_lego)
+[Unit]
+Description={{ acme_lego_unit_description }}
+Wants=network-online.target
+After=network-online.target {{ acme_lego_unit_after }}
+
+[Service]
+Type=oneshot
+ExecStart={{ acme_lego_wrapper }}

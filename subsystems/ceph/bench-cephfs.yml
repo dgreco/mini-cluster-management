@@ -1,0 +1,75 @@
+---
+# CephFS benchmark with fio through the kernel client: every load host runs each
+# job in ceph_bench_fio_jobs at the same time, in its own directory under
+# <mount point>/bench/, with O_DIRECT. The directories are removed afterwards.
+# Load hosts need the CephFS mount (cephfs-mount.yml).
+#   make ceph-bench-cephfs [ARGS="-e bench_hosts=node4:node3 -e ceph_bench_fio_size=4G"]
+- name: CephFS benchmark (fio)
+  hosts: "{{ bench_hosts | default('ceph') }}"
+  vars_files: [vars/bench.yml]
+  vars:
+    _dir: "{{ _bench.mount_point }}/bench/{{ inventory_hostname }}"
+  tasks:
+    - name: Run id
+      ansible.builtin.set_fact:
+        bench_run: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}-cephfs"
+      run_once: true
+
+    - name: Install fio
+      ansible.builtin.include_role:
+        name: ceph_bench
+        tasks_from: install_fio
+
+    # Listing the directory triggers the systemd automount.
+    - name: Trigger the automount
+      ansible.builtin.command: ls {{ _bench.mount_point }}
+      changed_when: false
+      failed_when: false
+
+    - name: CephFS is mounted
+      ansible.builtin.command: findmnt -rn -t ceph {{ _bench.mount_point }}
+      register: bench_mount
+      changed_when: false
+      failed_when: false
+
+    - name: Require the mount
+      ansible.builtin.assert:
+        that: bench_mount.rc == 0
+        fail_msg: >-
+          CephFS is not mounted on {{ _bench.mount_point }}; run
+          make ceph-cephfs-mount ARGS="-e cephfs_mount_hosts={{ bench_hosts | default('ceph') }}"
+
+    - name: Benchmark
+      block:
+        - name: Benchmark directory
+          ansible.builtin.file:
+            path: "{{ _dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Run the fio jobs (all load hosts at once)
+          ansible.builtin.include_role:
+            name: ceph_bench
+            tasks_from: fio_job
+          loop: "{{ _bench.fio_jobs }}"
+          loop_control:
+            loop_var: fio_job
+            label: "{{ fio_job.name }}"
+      always:
+        - name: Remove benchmark files
+          ansible.builtin.file:
+            path: "{{ _dir }}"
+            state: absent
+
+        - name: Remove the empty bench directory
+          ansible.builtin.command: rmdir {{ _bench.mount_point }}/bench
+          changed_when: false
+          failed_when: false
+          run_once: true
+
+    - name: Report
+      ansible.builtin.include_role:
+        name: ceph_bench
+        tasks_from: report
+      vars:
+        ceph_bench_report: cephfs

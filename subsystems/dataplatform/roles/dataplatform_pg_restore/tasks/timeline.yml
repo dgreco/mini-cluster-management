@@ -1,0 +1,31 @@
+---
+# The timeline a restore follows: pg_target_tli, else the one the live primary
+# writes on (from its current WAL file name). Sets dataplatform_pg_restore_tli.
+# In: dataplatform_pg_restore_primary
+- name: Timeline of {{ dataplatform_pg_restore_primary }}
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - -n
+      - "{{ dataplatform_pg_restore_namespace }}"
+      - exec
+      - "{{ dataplatform_pg_restore_primary }}"
+      - -c
+      - postgres
+      - --
+      - psql
+      - -U
+      - postgres
+      - -At
+      - -c
+      - select ('x' || substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8))::bit(32)::int
+  register: dataplatform_pg_restore_tli_out
+  changed_when: false
+  when: dataplatform_pg_restore_target_tli | string | length == 0
+
+- name: Keep it
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_tli: >-
+      {{ dataplatform_pg_restore_target_tli | string if dataplatform_pg_restore_target_tli | string | length > 0
+         else dataplatform_pg_restore_tli_out.stdout | trim }}

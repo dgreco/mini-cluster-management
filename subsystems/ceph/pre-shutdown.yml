@@ -1,0 +1,117 @@
+---
+# Cluster hook: called by cluster/shutdown.yml before the nodes are halted, for
+# a whole-cluster shutdown only (single nodes go into maintenance mode instead).
+# Quiesces Ceph so that a full power-off does not trigger recovery storms:
+# unmounts CephFS on the nodes, stops the client-facing services, marks CephFS
+# down, sets the OSD flags.
+- name: Unmount CephFS on the nodes
+  hosts: ceph
+  gather_facts: false
+  ignore_unreachable: true
+  tasks:
+    - name: Only for a whole-cluster shutdown
+      ansible.builtin.meta: end_host
+      when: not hostvars['localhost']['shutdown_whole'] | default(true)
+
+    - name: Skip a node that is off
+      ansible.builtin.include_tasks: ../../cluster/tasks/ssh-probe.yml
+
+    - name: Automount unit name
+      ansible.builtin.command: systemd-escape -p --suffix=automount {{ ceph_cephfs_mount_point }}
+      register: automount_unit
+      changed_when: false
+      when: ceph_cephfs_enabled | bool and ceph_cephfs_mount_nodes | bool
+
+    - name: Stop the automount unit
+      ansible.builtin.systemd:
+        name: "{{ automount_unit.stdout }}"
+        state: stopped
+      failed_when: false
+      when: ceph_cephfs_enabled | bool and ceph_cephfs_mount_nodes | bool
+
+    - name: Unmount {{ ceph_cephfs_mount_point }}
+      ansible.builtin.command: umount -l {{ ceph_cephfs_mount_point }}
+      register: umount_cmd
+      failed_when: false
+      changed_when: umount_cmd.rc == 0
+      when: ceph_cephfs_enabled | bool and ceph_cephfs_mount_nodes | bool
+
+- name: Ceph pre-shutdown
+  hosts: ceph_mons[0]
+  gather_facts: false
+  ignore_unreachable: true
+  tasks:
+    - name: Only for a whole-cluster shutdown
+      ansible.builtin.meta: end_host
+      when: not hostvars['localhost']['shutdown_whole'] | default(true)
+
+    - name: Skip a node that is off
+      ansible.builtin.include_tasks: ../../cluster/tasks/ssh-probe.yml
+
+    - name: Is the cluster reachable?
+      ansible.builtin.command: cephadm shell -- ceph -s
+      register: ceph_s
+      changed_when: false
+      failed_when: false
+
+    - name: Cluster not reachable, nothing to quiesce
+      ansible.builtin.debug:
+        msg: "ceph -s failed; skipping Ceph pre-shutdown hook"
+      when: ceph_s.rc != 0
+
+    - name: Stop ingress and RGW
+      ansible.builtin.command: cephadm shell -- ceph orch stop {{ item }}
+      loop:
+        - "ingress.rgw.{{ ceph_rgw_service_id }}"
+        - "rgw.{{ ceph_rgw_service_id }}"
+      failed_when: false
+      when: ceph_s.rc == 0 and ceph_rgw_enabled | bool
+      changed_when: true
+
+    # `orch stop` only schedules the stop. One still pending when the node
+    # halts is carried out after the next boot, possibly after post-startup
+    # has started the service again, which then stays down.
+    # The loop runs on the host (up to 2 min) so that waiting prints no
+    # "FAILED - RETRYING" lines.
+    - name: Wait for RGW and ingress to be stopped
+      ansible.builtin.shell: |
+        set -o pipefail
+        # Stopped: no daemon listed, or none of them running.
+        check='import sys, json
+        s = sys.stdin.read().strip()
+        sys.exit(0 if not s.startswith("[") or all(d["status_desc"] != "running" for d in json.loads(s)) else 1)'
+        for i in $(seq 24); do
+          cephadm shell -- ceph orch ps --service_name {{ item }} --refresh --format json 2>/dev/null \
+            | python3 -c "$check" && exit 0
+          sleep 5
+        done
+        exit 1
+      args:
+        executable: /bin/bash
+      loop: "{{ (['ingress.rgw.' ~ ceph_rgw_service_id] if ceph_rgw_ingress_enabled | bool else []) + ['rgw.' ~ ceph_rgw_service_id] }}"
+      changed_when: false
+      failed_when: false
+      when: ceph_s.rc == 0 and ceph_rgw_enabled | bool
+
+    - name: Mark CephFS down (stops MDS cleanly)
+      ansible.builtin.command: cephadm shell -- ceph fs set {{ ceph_cephfs_name }} down true
+      failed_when: false
+      when: ceph_s.rc == 0 and ceph_cephfs_enabled | bool
+      changed_when: true
+
+    - name: Set OSD flags
+      ansible.builtin.command: cephadm shell -- ceph osd set {{ item }}
+      loop: "{{ ceph_shutdown_osd_flags }}"
+      when: ceph_s.rc == 0
+      changed_when: true
+
+    - name: Status before halt
+      ansible.builtin.command: cephadm shell -- ceph -s
+      register: ceph_s_after
+      changed_when: false
+      when: ceph_s.rc == 0
+
+    - name: Ceph quiesced
+      ansible.builtin.debug:
+        msg: "{{ ceph_s_after.stdout_lines }}"
+      when: ceph_s.rc == 0

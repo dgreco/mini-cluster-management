@@ -1,0 +1,35 @@
+# NGINX Gateway Fabric 2.7: control plane in nginx-gateway; the data plane of
+# each Gateway (Deployment + Service <gateway>-nginx) in the Gateway's own
+# namespace (core/main-gateway-nginx).
+nginxGateway:
+  # Gateway API CRDs come from the gateway-api-crds Application (standard
+  # channel, the version this release pins); BackendTLSPolicy v1 is part of it.
+  gwAPIExperimentalFeatures:
+    enable: false
+  productTelemetry:
+    enable: false
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+    limits: {memory: 256Mi}
+
+nginx:
+  # Two data-plane pods: the platform stays reachable while a node reboots.
+  replicas: 2
+  config:
+    # Browsers reuse one HTTP/2 connection for every name the wildcard
+    # certificate covers (e.g. keycloak.* then argocd.*); with the SNI/Host
+    # check NGINX answers such requests 421 Misdirected Request. Safe to turn
+    # off here: every listener serves the same certificate with the same TLS
+    # settings (no client certificates), the Host header still picks the
+    # route, and each listener still only accepts routes of its namespace.
+    disableSNIHostValidation: true
+  container:
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {memory: 256Mi}
+  service:
+    # Served by k3s servicelb on the dataplatform_gateway nodes (node2,
+    # node3). Cluster: the forwarders there reach data-plane pods on any node
+    # (Local would drop traffic on nodes without one).
+    type: LoadBalancer
+    externalTrafficPolicy: Cluster

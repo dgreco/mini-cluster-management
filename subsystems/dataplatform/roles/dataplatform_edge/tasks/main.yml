@@ -1,0 +1,88 @@
+---
+# Where the platform is reachable from the LAN, on the first k3s server:
+# - k3s servicelb runs its :80/:443 forwarders only on the dataplatform_gateway
+#   nodes (node label svccontroller.k3s.cattle.io/enablelb). Once one node has
+#   the label, servicelb leaves every unlabelled node alone, so the S3 virtual
+#   IP's :443 on the ceph_ingress hosts is never caught by it.
+# - public DNS: *.<dataplatform_domain> -> those nodes (GoDaddy), so Let's
+#   Encrypt certificates and every client, RGW included, use the same names.
+- name: Gateway nodes do not hold the S3 virtual IP
+  ansible.builtin.assert:
+    that:
+      - groups['dataplatform_gateway'] | default([]) | length > 0
+      - groups['dataplatform_gateway'] | difference(groups['k3s']) | length == 0
+      - groups['dataplatform_gateway'] | intersect(groups['ceph_ingress'] | default([])) | length == 0
+    fail_msg: >-
+      [dataplatform_gateway] in inventory/hosts.ini must list k3s nodes that are not in
+      [ceph_ingress]: servicelb forwards :443 of every local address on its nodes, the S3
+      virtual IP included.
+    quiet: true
+
+- name: Read the servicelb node labels
+  ansible.builtin.command: >-
+    /usr/local/bin/k3s kubectl get nodes
+    -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.metadata.labels.svccontroller\.k3s\.cattle\.io/enablelb}{"\n"}{end}'
+  register: dataplatform_edge_labels
+  changed_when: false
+
+- name: Label the servicelb nodes
+  ansible.builtin.command: >-
+    /usr/local/bin/k3s kubectl label node {{ item.split()[0] }} --overwrite
+    svccontroller.k3s.cattle.io/enablelb{{ '=true' if _wanted else '-' }}
+  loop: "{{ dataplatform_edge_labels.stdout_lines }}"
+  loop_control:
+    label: "{{ item.split()[0] }}"
+  vars:
+    _wanted: >-
+      {{ item.split()[0] in (groups['dataplatform_gateway'] | map('extract', hostvars, ['ansible_facts', 'nodename']) | list)
+         or item.split()[0].split('.')[0] in groups['dataplatform_gateway'] }}
+    _current: "{{ item.split()[1:] | first | default('') }}"
+  when: (_wanted | bool) != (_current == 'true')
+  changed_when: true
+
+# ---------------------------------------------------------------- public DNS ----
+- name: Public DNS records to the gateway nodes
+  when: dataplatform_public_dns | bool
+  delegate_to: localhost
+  become: false
+  vars:
+    dataplatform_edge_record: "{{ dataplatform_domain | regex_replace('\\.' ~ (dataplatform_dns_zone | regex_escape) ~ '$', '') }}"
+    dataplatform_edge_ips: >-
+      {{ groups['dataplatform_gateway'] | map('extract', hostvars, ['ansible_facts', 'default_ipv4', 'address']) | sort }}
+  block:
+    - name: The GoDaddy token is in place
+      ansible.builtin.assert:
+        that:
+          - dataplatform_godaddy_pat | length > 0
+          - dataplatform_domain.endswith('.' ~ dataplatform_dns_zone)
+        fail_msg: >-
+          Needs dataplatform_domain inside dataplatform_dns_zone (inventory/group_vars/dataplatform.yml) and a
+          GoDaddy personal access token with the domains.dns:update scope in {{ secrets_dir }}/godaddy.env
+          as GODADDY_PAT=<token> (the one make ceph-s3-cert uses), or dataplatform_public_dns: false.
+        quiet: true
+
+    - name: Read the public A records
+      ansible.builtin.uri:
+        url: "{{ dataplatform_godaddy_api }}/{{ dataplatform_dns_zone }}/records/A/{{ item }}"
+        headers:
+          Authorization: "Bearer {{ dataplatform_godaddy_pat }}"
+        return_content: true
+      loop: ["{{ dataplatform_edge_record }}", "*.{{ dataplatform_edge_record }}"]
+      register: dataplatform_edge_a_records
+      failed_when: dataplatform_edge_a_records.status != 200
+      no_log: true
+
+    - name: Point the name and its wildcard to the gateway nodes - {{ dataplatform_domain ~ ' -> ' ~ dataplatform_edge_ips | join(', ') }}
+      ansible.builtin.uri:
+        url: "{{ dataplatform_godaddy_api }}/{{ dataplatform_dns_zone }}/records/A/{{ item.item }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ dataplatform_godaddy_pat }}"
+        body_format: json
+        body: "{{ dataplatform_edge_ips | map('community.general.dict_kv', 'data') | map('combine', {'ttl': 600}) | list }}"
+      loop: "{{ dataplatform_edge_a_records.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.json | default([]) | map(attribute='data') | sort != dataplatform_edge_ips
+      changed_when: true
+      no_log: true

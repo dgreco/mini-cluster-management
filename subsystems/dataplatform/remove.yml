@@ -1,0 +1,181 @@
+---
+# REMOVE the data platform: every Argo CD Application and what it created
+# (databases, OpenBao and its secrets, Keycloak and its realm, metrics and
+# logs: their volumes are deleted), Argo CD itself, the certificate timer and
+# the servicelb node labels.
+#   make dataplatform-remove ARGS="-e remove_confirm=yes"
+#   ... -e remove_ceph_data=true   also the S3 side: every bucket of the
+#                                   platform with its data, the group roles,
+#                                   the OIDC provider and the service users
+# The public DNS records and the k3s OIDC login settings stay.
+- name: Remove the data platform
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  vars:
+    remove_confirm: "no"
+    remove_ceph_data: false
+    remove_timeout: 900
+  tasks:
+    - name: Confirmation
+      ansible.builtin.assert:
+        that: remove_confirm == 'yes'
+        fail_msg: "This deletes the data platform and its data. Run with -e remove_confirm=yes."
+        quiet: true
+
+    # The root application's finalizer deletes every child Application, whose
+    # finalizers delete their resources.
+    - name: Delete the root application and everything it created
+      ansible.builtin.shell: |
+        set -o pipefail
+        k="/usr/local/bin/k3s kubectl"
+        $k -n argocd delete application dataplatform --ignore-not-found --wait=false
+        end=$((SECONDS + {{ remove_timeout }}))
+        while [ -n "$($k -n argocd get applications -o name 2>/dev/null)" ]; do
+          if [ $SECONDS -ge $end ]; then
+            echo "still there, finalizers removed: $($k -n argocd get applications -o name | tr '\n' ' ')"
+            for a in $($k -n argocd get applications -o name); do
+              $k -n argocd patch "$a" --type merge -p '{"metadata":{"finalizers":[]}}'
+            done
+            break
+          fi
+          sleep 10
+        done
+      args:
+        executable: /bin/bash
+      register: remove_apps
+      changed_when: true
+
+    - name: Namespaces of the platform
+      ansible.builtin.shell: |
+        set -o pipefail
+        k="/usr/local/bin/k3s kubectl"
+        nss="operators nginx-gateway core governance compute observability tools"
+        $k delete namespace --ignore-not-found --wait=false $nss
+        end=$((SECONDS + {{ remove_timeout }}))
+        for ns in $nss; do
+          while $k get namespace "$ns" >/dev/null 2>&1; do
+            [ $SECONDS -ge $end ] && { echo "namespace $ns still terminating"; break; }
+            sleep 5
+          done
+        done
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Argo CD (k3s HelmChart), its namespace and CRDs
+      ansible.builtin.shell: |
+        set -o pipefail
+        k="/usr/local/bin/k3s kubectl"
+        rm -f /var/lib/rancher/k3s/server/manifests/dataplatform-argocd.yaml
+        $k -n kube-system delete helmchart argo-cd --ignore-not-found --wait=true --timeout=300s
+        $k delete namespace argocd --ignore-not-found --wait=true --timeout=300s
+        $k get crd -o name | grep -E 'argoproj\.io' | xargs -r $k delete --ignore-not-found
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Stop the certificate renewal timer
+      ansible.builtin.systemd:
+        name: dataplatform-cert.timer
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Certificate renewal programs, units, lego account and certificate
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/dataplatform-cert.service
+        - /etc/systemd/system/dataplatform-cert.timer
+        - /usr/local/sbin/dataplatform-cert
+        - /usr/local/sbin/dataplatform-cert-deploy
+        - /etc/dataplatform
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    # The servicelb node labels stay: without them k3s would publish a later
+    # LoadBalancer Service on every node, the Ceph ingress hosts included
+    # (make dataplatform-edge sets them again anyway).
+
+    # OpenBao's storage is gone: its recovery keys and root token are useless
+    # now, but kept aside (the next install refuses to run with the old file).
+    - name: Keep the old OpenBao initialisation aside
+      ansible.builtin.command: >-
+        mv {{ dataplatform_openbao_init_file }} {{ dataplatform_openbao_init_file }}.removed-{{ now(utc=true, fmt='%Y%m%d%H%M%S') }}
+      args:
+        removes: "{{ dataplatform_openbao_init_file }}"
+      delegate_to: localhost
+      become: false
+
+- name: Remove the S3 side of the platform
+  hosts: "{{ groups['ceph_mons'][0] }}"
+  gather_facts: false
+  vars:
+    remove_confirm: "no"
+    remove_ceph_data: false
+  tasks:
+    - name: S3 data, roles, provider and users
+      when: remove_confirm == 'yes' and remove_ceph_data | bool
+      block:
+        - name: Roles of the platform (the account's)
+          ansible.builtin.shell: |
+            set -o pipefail
+            cephadm shell -- radosgw-admin role list --account-id={{ dataplatform_rgw_account_id }} 2>/dev/null \
+              | python3 -c 'import json,sys; print("\n".join(r["RoleName"] for r in json.load(sys.stdin)))' || true
+          args:
+            executable: /bin/bash
+          register: remove_roles
+          changed_when: false
+
+        - name: Delete the roles
+          ansible.builtin.command: >-
+            cephadm shell -- sh -c 'A={{ dataplatform_rgw_account_id }};
+            radosgw-admin role-policy delete --role-name={{ item }} --policy-name=access --account-id=$A;
+            radosgw-admin role delete --role-name={{ item }} --account-id=$A'
+          loop: "{{ remove_roles.stdout_lines | select | list }}"
+          changed_when: true
+          failed_when: false
+
+        - name: Delete the OIDC provider of the account
+          vars:
+            _idp: "{{ dataplatform_keycloak_issuer | regex_replace('^https?://', '') }}"
+          ansible.builtin.command: >-
+            cephadm shell -- radosgw-admin oidc-provider delete --account-id={{ dataplatform_rgw_account_id }}
+            --oidc-provider-arn=arn:aws:iam::{{ dataplatform_rgw_account_id }}:oidc-provider/{{ _idp }}
+          changed_when: true
+          failed_when: false
+
+        - name: Delete the service users with their buckets and data
+          ansible.builtin.command: cephadm shell -- radosgw-admin user rm --uid={{ item.uid }} --purge-data
+          loop: "{{ dataplatform_s3_users }}"
+          loop_control:
+            label: "{{ item.uid }}"
+          changed_when: true
+          failed_when: false
+
+        - name: Delete the account
+          ansible.builtin.command: cephadm shell -- radosgw-admin account rm --account-id={{ dataplatform_rgw_account_id }}
+          changed_when: true
+          failed_when: false
+
+        - name: Delete the pipeline's key on this computer
+          ansible.builtin.file:
+            path: "{{ secrets_dir }}/{{ item }}"
+            state: absent
+          loop: [s3-iam-terraform.json, s3-iam-terraform.env]
+          delegate_to: localhost
+          become: false
+
+    - name: What is left
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'The RGW account of the platform, its users, bucket, roles and OIDC provider were removed '
+             ~ '(the GitLab state of subsystems/dataplatform/iam is stale: delete it in GitLab, or the next apply recreates every role).'
+             if remove_ceph_data | bool else
+             'The RGW account with its users, bucket (and its data), roles and OIDC provider was kept: '
+             ~ 'make dataplatform-remove ARGS="-e remove_confirm=yes -e remove_ceph_data=true" removes them. '
+             ~ 'make dataplatform-install reuses them.' }}
+      when: remove_confirm == 'yes'

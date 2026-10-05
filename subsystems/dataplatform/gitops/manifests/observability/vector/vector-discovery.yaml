@@ -1,0 +1,11 @@
+# Where the Stackable products' Vector agents send their logs. The operators
+# read this discovery ConfigMap (key ADDRESS) from the product's own namespace,
+# so there is one per product namespace, as in bigdata-k8s-stack: compute here
+# (Trino, the Spark history server and every Spark job).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-aggregator-discovery
+  namespace: compute
+data:
+  ADDRESS: vector-aggregator.observability.svc.cluster.local:6000

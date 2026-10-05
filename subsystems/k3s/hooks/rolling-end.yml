@@ -1,0 +1,20 @@
+---
+# Task-file hook included once by cluster/rolling-reboot.yml after the last
+# node: show the k3s nodes.
+- name: Is k3s installed?
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  delegate_to: "{{ k3s_first_server }}"
+  register: k3s_rolling_bin
+
+- name: Read the k3s nodes
+  ansible.builtin.command: /usr/local/bin/k3s kubectl get nodes -o wide
+  delegate_to: "{{ k3s_rolling_server | default(k3s_first_server) }}"
+  register: k3s_rolling_end
+  changed_when: false
+  when: k3s_rolling_bin.stat.exists
+
+- name: The k3s nodes
+  ansible.builtin.debug:
+    msg: "{{ k3s_rolling_end.stdout_lines }}"
+  when: k3s_rolling_bin.stat.exists

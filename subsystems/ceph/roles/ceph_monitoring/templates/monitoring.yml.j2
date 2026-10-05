@@ -1,0 +1,27 @@
+# Managed by Ansible (subsystems/ceph/roles/ceph_monitoring). Placement is label
+# based; the `monitoring` label comes from the ceph_monitoring inventory group.
+---
+service_type: node-exporter
+placement:
+  host_pattern: '*'
+---
+service_type: ceph-exporter
+placement:
+  host_pattern: '*'
+---
+service_type: prometheus
+placement:
+  label: monitoring
+spec:
+  retention_time: "{{ ceph_prometheus_retention_time }}"
+  retention_size: "{{ ceph_prometheus_retention_size }}"
+---
+service_type: alertmanager
+placement:
+  label: monitoring
+---
+service_type: grafana
+placement:
+  label: monitoring
+spec:
+  initial_admin_password: "{{ ceph_grafana_admin_password }}"

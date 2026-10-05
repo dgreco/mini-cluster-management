@@ -1,0 +1,17 @@
+# RADOS baseline — {{ bench_run }}
+
+`rados bench`, pool `{{ _bench.rados_pool }}` (32 PGs, size 3), {{ _bench.duration }} s per mode,
+{{ _bench.rados_threads }} threads and {{ (_bench.rados_block_size | int / 1048576) | round(1) }} MiB objects per host, all hosts at once.
+
+| mode | host | MB/s | IOPS | avg latency ms |
+|---|---|---:|---:|---:|
+{% for mode in ['write', 'seq', 'rand'] %}
+{% set ns = namespace(bw=0, iops=0) %}
+{% for h in ansible_play_hosts %}
+{% set r = hostvars[h].ceph_bench_rados_results[mode] %}
+{% set ns.bw = ns.bw + r.bandwidth | float %}
+{% set ns.iops = ns.iops + r.average_iops | float %}
+| {{ mode }} | {{ h }} | {{ r.bandwidth | float | round(1) }} | {{ r.average_iops | float | round(0) | int }} | {{ (r.average_latency | float * 1000) | round(1) }} |
+{% endfor %}
+| **{{ mode }}** | **total** | **{{ ns.bw | round(1) }}** | **{{ ns.iops | round(0) | int }}** | |
+{% endfor %}

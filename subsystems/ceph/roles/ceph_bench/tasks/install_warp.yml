@@ -1,0 +1,34 @@
+---
+# MinIO warp from its GitHub release, verified against the release checksums.
+# v1.3.1 is the last release with plain (non-RDMA) Linux builds on GitHub.
+- name: Installed warp version
+  ansible.builtin.command: /usr/local/bin/warp --version
+  register: ceph_bench_warp_installed
+  changed_when: false
+  failed_when: false
+
+- name: Install warp {{ _bench.warp_version }}
+  when: _bench.warp_version not in ceph_bench_warp_installed.stdout | default('')
+  vars:
+    _arch: "{{ {'aarch64': 'arm64', 'x86_64': 'x86_64'}[ansible_facts['architecture']] }}"
+    _base: "https://github.com/minio/warp/releases/download/v{{ _bench.warp_version }}"
+  block:
+    - name: Download warp
+      ansible.builtin.get_url:
+        url: "{{ _base }}/warp_Linux_{{ _arch }}.tar.gz"
+        dest: "/tmp/warp_Linux_{{ _arch }}.tar.gz"
+        checksum: "sha256:{{ _base }}/checksums.txt"
+        mode: "0644"
+
+    - name: Unpack warp
+      ansible.builtin.unarchive:
+        src: "/tmp/warp_Linux_{{ _arch }}.tar.gz"
+        dest: /usr/local/bin
+        remote_src: true
+        include: [warp]
+        mode: "0755"
+
+    - name: Remove the downloaded archive
+      ansible.builtin.file:
+        path: "/tmp/warp_Linux_{{ _arch }}.tar.gz"
+        state: absent

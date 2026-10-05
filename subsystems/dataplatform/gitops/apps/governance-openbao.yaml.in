@@ -1,0 +1,41 @@
+# OpenBao, the secret store of the platform. The first sync stops here
+# (Progressing) until make dataplatform-openbao has initialised it.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: governance-openbao
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+spec:
+  project: dataplatform
+  sources:
+    - repoURL: https://openbao.github.io/openbao-helm
+      chart: openbao
+      targetRevision: "0.29.6"
+      helm:
+        releaseName: openbao
+        valueFiles:
+          - $values/subsystems/dataplatform/gitops/helm-values/openbao-values.yaml
+    - repoURL: <%= dataplatform_git_repo %>
+      targetRevision: <%= dataplatform_git_revision %>
+      ref: values
+      path: subsystems/dataplatform/gitops/manifests/governance/openbao
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: governance
+  syncPolicy:
+    # No finalizer and no prune: deleting or renaming this Application in Git
+  # must not take the data with it (the database cluster and its volumes)
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        maxDuration: 5m
+        factor: 2

@@ -1,0 +1,11 @@
+# Managed by Ansible (acme_lego)
+[Unit]
+Description=Daily renewal check of the certificate of {{ acme_lego_cert_name }}
+
+[Timer]
+OnCalendar={{ acme_lego_timer_calendar }}
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

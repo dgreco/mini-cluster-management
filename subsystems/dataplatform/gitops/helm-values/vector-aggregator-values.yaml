@@ -1,0 +1,123 @@
+# Vector aggregator: the product logs of every Stackable-managed platform
+# (Trino, the Spark History Server, Spark jobs). Each product pod runs a Vector
+# agent that reads the product's log files (structured: level, logger, thread,
+# errors) and sends them here (discovery ConfigMap vector-aggregator-discovery,
+# key ADDRESS, in each product namespace). Here they are reshaped into
+# OpenTelemetry log records, marked log.collector=vector, and sent with Vector's
+# OTLP sink to the OpenTelemetry cluster collector, which puts them in the
+# Stackable tenant of VictoriaLogs (otel-cluster-values.yaml). Vector's own
+# metrics take the same way to VictoriaMetrics.
+role: Aggregator
+fullnameOverride: vector-aggregator
+replicas: 1
+
+resources:
+  requests: {cpu: 50m, memory: 128Mi}
+  limits: {memory: 512Mi}
+
+# disk buffer: logs survive a VictoriaLogs outage or restart
+persistence:
+  enabled: true
+  storageClassName: ceph-rbd
+  size: 2Gi
+
+# the Kubernetes labels of Vector's own metrics
+env:
+  - name: VECTOR_SELF_POD_NAME
+    valueFrom: {fieldRef: {fieldPath: metadata.name}}
+  - name: VECTOR_SELF_POD_NAMESPACE
+    valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+
+customConfig:
+  data_dir: /vector-data-dir
+  api:
+    enabled: true
+    address: 0.0.0.0:8686
+  sources:
+    stackable:
+      type: vector
+      address: 0.0.0.0:6000
+      version: "2"
+    vector_metrics:
+      type: internal_metrics
+      # the collector's scrape interval: one sample per series and minute
+      scrape_interval_secs: 60
+  transforms:
+    # Stackable log event (namespace, cluster, role, roleGroup, pod, container,
+    # file, timestamp, level, logger, thread, message, errors) -> OTLP.
+    stackable_otlp:
+      type: remap
+      inputs: [stackable]
+      source: |
+        ts = now()
+        if is_timestamp(.timestamp) {
+          ts = timestamp!(.timestamp)
+        } else if is_string(.timestamp) {
+          ts = parse_timestamp(string!(.timestamp), "%+") ?? now()
+        }
+        level = upcase(to_string(.level) ?? "INFO")
+        severity = if level == "TRACE" { 1 } else if level == "DEBUG" { 5 } else if level == "INFO" { 9 } else if starts_with(level, "WARN") { 13 } else if level == "ERROR" { 17 } else if level == "FATAL" { 21 } else { 0 }
+        attrs = [
+          {"key": "log.file.path", "value": {"stringValue": to_string(.file) ?? ""}},
+          {"key": "k8s.pod.name", "value": {"stringValue": to_string(.pod) ?? ""}},
+          {"key": "thread.name", "value": {"stringValue": to_string(.thread) ?? ""}}
+        ]
+        if exists(.errors) {
+          attrs = push(attrs, {"key": "stackable.errors", "value": {"stringValue": join(array(.errors) ?? [], "; ") ?? to_string(.errors) ?? ""}})
+        }
+        . = {"resourceLogs": [{
+          "resource": {"attributes": [
+            {"key": "k8s.namespace.name", "value": {"stringValue": to_string(.namespace) ?? ""}},
+            {"key": "service.name", "value": {"stringValue": to_string(.cluster) ?? ""}},
+            {"key": "stackable.role", "value": {"stringValue": to_string(.role) ?? ""}},
+            {"key": "stackable.role_group", "value": {"stringValue": to_string(.roleGroup) ?? ""}},
+            {"key": "k8s.container.name", "value": {"stringValue": to_string(.container) ?? ""}},
+            {"key": "log.collector", "value": {"stringValue": "vector"}}
+          ]},
+          "scopeLogs": [{
+            "scope": {"name": to_string(.logger) ?? ""},
+            "logRecords": [{
+              "timeUnixNano": to_unix_timestamp(ts, unit: "nanoseconds"),
+              "severityText": level,
+              "severityNumber": severity,
+              "body": {"stringValue": to_string(.message) ?? ""},
+              "attributes": attrs
+            }]
+          }]
+        }]}
+    # the labels scraped metrics carry
+    vector_metrics_k8s:
+      type: remap
+      inputs: [vector_metrics]
+      source: |
+        .tags.job = "vector-aggregator"
+        .tags.namespace = get_env_var("VECTOR_SELF_POD_NAMESPACE") ?? "observability"
+        .tags.pod = get_env_var("VECTOR_SELF_POD_NAME") ?? to_string(.tags.host) ?? ""
+  sinks:
+    otel_logs:
+      type: opentelemetry
+      inputs: [stackable_otlp]
+      protocol:
+        type: http
+        uri: http://otel-cluster-opentelemetry-collector.observability.svc:4318/v1/logs
+        method: post
+        encoding:
+          codec: otlp
+        batch:
+          max_events: 1000
+          timeout_secs: 2
+      buffer:
+        type: disk
+        max_size: 1073741824
+        when_full: block
+    otel_metrics:
+      type: opentelemetry
+      inputs: [vector_metrics_k8s]
+      protocol:
+        type: http
+        uri: http://otel-cluster-opentelemetry-collector.observability.svc:4318/v1/metrics
+        method: post
+        encoding:
+          codec: otlp
+        batch:
+          timeout_secs: 5

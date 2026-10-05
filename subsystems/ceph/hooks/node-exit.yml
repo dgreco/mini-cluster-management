@@ -1,0 +1,70 @@
+---
+# Task-file hook included by cluster/rolling-reboot.yml after a node is back on
+# SSH. Takes the host out of maintenance, then waits until every OSD is up, every
+# PG active+clean and the cluster HEALTH_OK before the next node goes.
+# Right after boot cephadm may not reach the host yet: the exit is retried.
+# Also used to put back a node whose enter hooks failed or never ran, so it
+# does not rely on anything they set.
+- name: Pick an admin host other than {{ inventory_hostname }}
+  ansible.builtin.set_fact:
+    ceph_maint_admin: "{{ groups['ceph_mons'] | difference([inventory_hostname]) | first }}"
+
+# Before make ceph-install, the group exists but Ceph does not: nothing to do.
+- name: Is Ceph deployed?
+  ansible.builtin.stat:
+    path: /etc/ceph/ceph.conf
+  delegate_to: "{{ ceph_maint_admin }}"
+  register: ceph_maint_conf
+
+- name: Ceph is not deployed, nothing to do
+  ansible.builtin.debug:
+    msg: "no /etc/ceph/ceph.conf on {{ ceph_maint_admin }}: Ceph is not installed"
+  when: not ceph_maint_conf.stat.exists
+
+- name: Ceph maintenance - node-exit
+  when: ceph_maint_conf.stat.exists
+  block:
+    - name: Exit maintenance mode
+      ansible.builtin.shell: |
+        end=$((SECONDS + {{ ceph_maint_ok_to_stop_timeout }}))
+        while :; do
+          out=$(cephadm shell -- ceph orch host maintenance exit {{ ansible_facts['nodename'] }} 2>&1) && exit 0
+          grep -qi 'not in maintenance' <<<"$out" && { echo 'not in maintenance'; exit 0; }
+          if [ $SECONDS -ge $end ]; then
+            echo "$out"
+            exit 1
+          fi
+          sleep 10
+        done
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ ceph_maint_admin }}"
+      register: ceph_maint_exit
+      changed_when: ceph_maint_exit.stdout != 'not in maintenance'
+
+    # Healthy: HEALTH_OK, or HEALTH_WARN made only of ceph_rolling_benign_health.
+    - name: Wait until every OSD is up, every PG active+clean and Ceph healthy
+      ansible.builtin.shell: |
+        set -o pipefail
+        end=$((SECONDS + {{ ceph_maint_recovery_timeout }}))
+        healthy='import json, sys
+        h = json.load(sys.stdin)
+        bad = [c for c, v in h["checks"].items() if not v.get("muted") and c not in sys.argv[1:]]
+        sys.exit(0 if h["status"] == "HEALTH_OK" or (h["status"] == "HEALTH_WARN" and not bad) else 1)'
+        while :; do
+          st=$(cephadm shell -- sh -c 'ceph osd stat; ceph pg stat; ceph health' 2>/dev/null)
+          grep -Eq '^([0-9]+) osds: \1 up' <<<"$st" \
+            && grep -Eq '^([0-9]+) pgs: \1 active\+clean;' <<<"$st" \
+            && cephadm shell -- ceph health --format json 2>/dev/null \
+               | python3 -c "$healthy" {{ ceph_rolling_benign_health | join(' ') }} && exit 0
+          if [ $SECONDS -ge $end ]; then
+            echo "$st"
+            cephadm shell -- ceph health detail 2>/dev/null
+            exit 1
+          fi
+          sleep 10
+        done
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ ceph_maint_admin }}"
+      changed_when: false

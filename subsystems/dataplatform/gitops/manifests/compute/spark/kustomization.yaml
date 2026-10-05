@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - spark-history.yaml
+  - spark-template.yaml
+  - spark-rbac.yaml
+  - spark-secrets.yaml
+  - spark-fence.yaml

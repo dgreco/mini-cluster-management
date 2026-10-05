@@ -1,0 +1,9 @@
+---
+# All benchmarks in turn: RADOS baseline, S3 (warp), CephFS (fio).
+#   make ceph-bench [ARGS="-e ceph_bench_duration=30 -e bench_hosts=..."]
+- name: RADOS benchmark
+  ansible.builtin.import_playbook: bench-rados.yml
+- name: S3 benchmark
+  ansible.builtin.import_playbook: bench-s3.yml
+- name: CephFS benchmark
+  ansible.builtin.import_playbook: bench-cephfs.yml

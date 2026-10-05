@@ -1,0 +1,11 @@
+---
+# Collections the playbooks use beyond ansible-core:
+#   ansible-galaxy collection install -r requirements.yml
+# Pinned to the major versions the playbooks were written against.
+collections:
+  - name: ansible.posix # sysctl
+    version: ">=2.2.2,<3.0.0"
+  - name: community.general # modprobe
+    version: ">=13.4.0,<14.0.0"
+  - name: amazon.aws # s3_bucket (data platform buckets)
+    version: ">=11.4.0,<12.0.0"

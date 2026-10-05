@@ -1,0 +1,97 @@
+---
+# Renders the files that carry the site's values (inventory/group_vars/all/
+# site.yml, and what derives from it) from their *.in templates, next to
+# them: <file>.in -> <file>. The outputs are committed: Argo CD deploys the
+# gitops tree from Git, and Ansible and the scripts read the same files.
+#
+# Templates are Jinja with delimiters that occur nowhere else in the tree, so
+# Helm's and ESO's {{ }}, the shells' ${...} and [[ ]] pass through as text:
+#   <%= variable or expression %>   <% for / if ... %>   <%# comment %>
+# with trim_blocks and lstrip_blocks (a line holding only a block tag
+# vanishes). Every variable of the inventory is available, derived ones
+# included: the play runs as the first k3s server, which is in every group.
+#
+# Everything runs on the control node; nothing connects to the nodes. Secrets
+# never reach a template: make configure passes a secrets_dir that cannot
+# exist, so a template touching a password lookup fails.
+- name: The site's values have the shapes the templates rely on
+  ansible.builtin.assert:
+    that:
+      - site_cluster_name is match('^[a-z0-9][a-z0-9-]*$')
+      - site_lan_domain is match('^[a-z0-9.-]+$')
+      - site_dns_zone is match('^[a-z0-9-]+(\.[a-z0-9-]+)+$')
+      - site_platform_domain is match('^[a-z0-9-]+(\.[a-z0-9-]+)+$')
+      - site_s3_host is match('^[a-z0-9-]+(\.[a-z0-9-]+)+$')
+      - site_lan_network is match(_cidr)
+      - site_k3s_cluster_cidr is match('^([0-9]{1,3}\\.){2}0\\.0/16$')
+      - site_s3_vip is match(_cidr)
+      - site_git_repo is match('^[^@\s]+@[^:\s]+:[^\s]+\.git$')
+      - site_git_revision is string and site_git_revision is match('^[A-Za-z0-9._/-]+$')
+      - site_git_revision | lower not in ['true', 'false', 'yes', 'no', 'on', 'off', 'null']
+      - site_keycloak_realm is match('^[a-z0-9][a-z0-9-]*$')
+      - site_admin_group is match(_group)
+      - site_engineer_group is match(_group)
+      - site_analyst_group is match(_group)
+      - site_s3_region is match('^[a-z]{2}(-[a-z]+)+-[0-9]+$')
+      - site_bucket is match('^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
+      - site_backup_bucket is match('^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
+      - site_rgw_account_id is match('^RGW[0-9]{17}$')
+      - site_git_host_keys | length > 0
+      - groups['nodes'] | map('extract', hostvars, 'node_ip') | select('undefined') | list | length == 0
+    fail_msg: >-
+      A value of inventory/group_vars/all/site.yml (or a node_ip of hosts.ini) does not have the
+      expected shape (domain, CIDR, Git URL, region, RGW account id RGW + 17 digits, group names
+      as Keycloak's): the templates put them into YAML, regexes and URLs unquoted.
+    quiet: true
+  vars:
+    _cidr: '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+    _group: '^[a-z0-9][a-z0-9-]{0,40}[a-z0-9]$'     # as Keycloak and iam-sync accept them
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Templates
+  ansible.builtin.find:
+    paths: "{{ dataplatform_configure_dirs }}"
+    patterns: "*.in"
+    recurse: true
+    hidden: false
+  register: dataplatform_configure_found
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Render them
+  ansible.builtin.template:
+    src: "{{ item }}"
+    dest: "{{ item | regex_replace('\\.in$', '') }}"
+    mode: preserve
+    variable_start_string: "<%="
+    variable_end_string: "%>"
+    block_start_string: "<%"
+    block_end_string: "%>"
+    comment_start_string: "<%#"
+    comment_end_string: "%>"
+    trim_blocks: true
+    lstrip_blocks: true
+  loop: "{{ dataplatform_configure_found.files | map(attribute='path') | reject('search', '/charts/') | sort }}"
+  loop_control:
+    label: "{{ item | relpath(inventory_dir ~ '/..') }}"
+  register: dataplatform_configure_rendered
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Every rendered file is current (make configure-check)
+  ansible.builtin.assert:
+    that: dataplatform_configure_rendered.results | selectattr('changed') | list | length == 0
+    fail_msg: >-
+      Stale against their templates (or edited by hand):
+      {{ dataplatform_configure_rendered.results | selectattr('changed') | map(attribute='item')
+         | map('regex_replace', '\\.in$', '') | map('relpath', inventory_dir ~ '/..') | join(', ') }}.
+      Run make configure, commit and push; never edit a file that has a .in sibling.
+    quiet: true
+  when: dataplatform_configure_check | default(ansible_check_mode)
+  delegate_to: localhost
+  become: false
+  run_once: true

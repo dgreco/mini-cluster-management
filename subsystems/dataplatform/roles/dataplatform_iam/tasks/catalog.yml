@@ -1,0 +1,100 @@
+---
+# The Iceberg catalog side (gitops/.../iceberg-catalog/catalog-security.sql,
+# the same file the database ran at bootstrap): the Spark jobs' login
+# spark_writer (reads the catalog, commits to existing tables, makes none),
+# and the removal of the roles of earlier installs (per group, iam-sync's
+# reader) and their row-level security. Trino logs in as the catalog's owner; its own
+# rules give DDL to Meta Catalog's provisioner only. The files are Ceph's to
+# refuse, with the token's role. SQL goes to the primary through kubectl exec
+# on stdin, so no password is on a command line.
+- name: Primary of the catalog database
+  ansible.builtin.command: >-
+    /usr/local/bin/k3s kubectl -n {{ dataplatform_iam_catalog_namespace }} get cluster {{ dataplatform_iam_catalog_cluster }}
+    -o 'jsonpath={.status.currentPrimary}'
+  delegate_to: "{{ groups['k3s_servers'][0] }}"
+  register: dataplatform_iam_catalog_primary
+  changed_when: false
+  failed_when: dataplatform_iam_catalog_primary.rc != 0 or dataplatform_iam_catalog_primary.stdout | length == 0
+
+- name: Catalog roles (idempotent SQL)
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - -n
+      - "{{ dataplatform_iam_catalog_namespace }}"
+      - exec
+      - -i
+      - "{{ dataplatform_iam_catalog_primary.stdout }}"
+      - -c
+      - postgres
+      - --
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ dataplatform_iam_catalog_database }}"
+      - -v
+      - ON_ERROR_STOP=1
+      - -q
+      - -f
+      - "-"
+    stdin: "{{ lookup('ansible.builtin.file', dataplatform_iam_catalog_sql) }}"
+  delegate_to: "{{ groups['k3s_servers'][0] }}"
+  changed_when: false
+
+# ---------------------------------------------------------------- logins ----
+- name: Catalog logins in OpenBao
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/secret/data/dataplatform/{{ item }}"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    status_code: [200, 404]
+  loop: "{{ dataplatform_iam_catalog_logins }}"
+  delegate_to: "{{ groups['k3s_servers'][0] }}"
+  register: dataplatform_iam_catalog_login
+  no_log: true
+
+- name: The logins exist in OpenBao
+  ansible.builtin.assert:
+    that: dataplatform_iam_catalog_login.results | rejectattr('status', 'equalto', 200) | list | length == 0
+    fail_msg: "a catalog login is missing in OpenBao ({{ dataplatform_iam_catalog_logins | join(', ') }}): run make dataplatform-openbao first"
+    quiet: true
+
+- name: Their roles may log in, with their passwords
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - -n
+      - "{{ dataplatform_iam_catalog_namespace }}"
+      - exec
+      - -i
+      - "{{ dataplatform_iam_catalog_primary.stdout }}"
+      - -c
+      - postgres
+      - --
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ dataplatform_iam_catalog_database }}"
+      - -v
+      - ON_ERROR_STOP=1
+      - -q
+      - -f
+      - "-"
+    stdin: |
+      ALTER ROLE "{{ item.json.data.data.username }}" LOGIN
+        PASSWORD '{{ item.json.data.data.password }}' NOBYPASSRLS;
+  loop: "{{ dataplatform_iam_catalog_login.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  delegate_to: "{{ groups['k3s_servers'][0] }}"
+  no_log: true
+  changed_when: false
+
+- name: Catalog roles
+  ansible.builtin.debug:
+    msg: >-
+      Trino logs in as the catalog's owner (DDL only for Meta Catalog's provisioner, Trino's rules);
+      the Spark jobs as spark_writer (read, and commit to existing tables) (catalog-security.sql).

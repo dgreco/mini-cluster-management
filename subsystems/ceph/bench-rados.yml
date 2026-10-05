@@ -1,0 +1,70 @@
+---
+# RADOS baseline: `rados bench` write, seq and rand from every monitor host at
+# once (they hold the admin keyring) against a temporary pool that is deleted
+# afterwards. No RGW/CephFS overhead: the ceiling for the other two benchmarks.
+#   make ceph-bench-rados [ARGS="-e ceph_bench_duration=30"]
+- name: RADOS baseline
+  hosts: ceph_mons
+  gather_facts: false
+  vars_files: [vars/bench.yml]
+  tasks:
+    - name: Run id
+      ansible.builtin.set_fact:
+        bench_run: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}-rados"
+      run_once: true
+
+    - name: Existing pools
+      ansible.builtin.command: cephadm shell -- ceph osd pool ls --format json
+      register: bench_pools
+      changed_when: false
+      run_once: true
+
+    # Fixed PG count and no autoscaling: the pool lives for a few minutes only.
+    - name: Create the benchmark pool
+      ansible.builtin.command: >-
+        cephadm shell -- ceph osd pool create {{ _bench.rados_pool }} 32 32 --autoscale-mode off
+      when: _bench.rados_pool not in (bench_pools.stdout | from_json)
+      run_once: true
+      changed_when: true
+
+    - name: Tag the benchmark pool
+      ansible.builtin.command: cephadm shell -- ceph osd pool application enable {{ _bench.rados_pool }} benchmark
+      changed_when: false
+      run_once: true
+
+    - name: Benchmark
+      block:
+        - name: Run rados bench (all monitor hosts at once)
+          ansible.builtin.include_role:
+            name: ceph_bench
+            tasks_from: rados_mode
+          loop: [write, seq, rand]
+          loop_control:
+            loop_var: rados_mode
+      always:
+        - name: Remove benchmark objects
+          ansible.builtin.command: cephadm shell -- rados -p {{ _bench.rados_pool }} cleanup --run-name bench-{{ inventory_hostname }}
+          failed_when: false
+          changed_when: true
+
+        - name: Pool deletion setting
+          ansible.builtin.command: cephadm shell -- ceph config get mon mon_allow_pool_delete
+          register: bench_pool_delete
+          changed_when: false
+          run_once: true
+
+        - name: Delete the benchmark pool
+          ansible.builtin.command: "cephadm shell -- {{ item }}"
+          loop: >-
+            {{ (['ceph config set mon mon_allow_pool_delete true'] if bench_pool_delete.stdout | trim != 'true' else [])
+               + ['ceph osd pool rm ' ~ _bench.rados_pool ~ ' ' ~ _bench.rados_pool ~ ' --yes-i-really-really-mean-it']
+               + (['ceph config rm mon mon_allow_pool_delete'] if bench_pool_delete.stdout | trim != 'true' else []) }}
+          run_once: true
+          changed_when: true
+
+    - name: Report
+      ansible.builtin.include_role:
+        name: ceph_bench
+        tasks_from: report
+      vars:
+        ceph_bench_report: rados

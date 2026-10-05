@@ -1,0 +1,34 @@
+---
+# Create / converge an S3 user.
+#   make ceph-s3-user ARGS="-e uid=alice [-e display_name='Alice'] [-e caps='buckets=read'] [-e max_buckets=10]"
+# Keys are stored in .secrets/s3-<uid>.json and .secrets/s3-<uid>.env.
+- name: S3 user
+  hosts: ceph_mons[0]
+  gather_facts: false
+  tasks:
+    - name: S3 must be enabled
+      ansible.builtin.assert:
+        that: ceph_rgw_enabled | bool
+        fail_msg: "set ceph_rgw_enabled=true in inventory/group_vars/ceph/ and run make ceph-s3"
+
+    - name: The uid is required
+      ansible.builtin.assert:
+        that: uid is defined
+        fail_msg: "pass -e uid=<name>"
+
+    - name: Converge user
+      ansible.builtin.include_role:
+        name: ceph_rgw
+        tasks_from: rgw_user
+      vars:
+        ceph_rgw_user_uid: "{{ uid }}"
+        ceph_rgw_user_display_name: "{{ display_name | default(uid) }}"
+        ceph_rgw_user_caps: "{{ caps | default('') }}"
+        ceph_rgw_user_max_buckets: "{{ max_buckets | default('') }}"
+
+    - name: Credentials
+      ansible.builtin.debug:
+        msg:
+          - "endpoint   : {{ ceph_rgw_endpoint }}"
+          - "access_key : {{ ceph_rgw_user_info['keys'][0].access_key }}"
+          - "secret key : in {{ secrets_dir }}/s3-{{ uid }}.json (source {{ secrets_dir }}/s3-{{ uid }}.env for the aws CLI)"

@@ -1,0 +1,73 @@
+---
+# Task-file hook included by cluster/rolling-reboot.yml for each node (serial)
+# before it reboots, after the k3s drain. Moves the active manager away, waits
+# until Ceph calls the host safe to stop, then uses the orchestrator's
+# maintenance mode: sets noout for the host and stops its daemons cleanly.
+# Commands run on another monitor host.
+- name: Pick an admin host other than {{ inventory_hostname }}
+  ansible.builtin.set_fact:
+    ceph_maint_admin: "{{ groups['ceph_mons'] | difference([inventory_hostname]) | first }}"
+
+# Before make ceph-install, the group exists but Ceph does not: nothing to do.
+- name: Is Ceph deployed?
+  ansible.builtin.stat:
+    path: /etc/ceph/ceph.conf
+  delegate_to: "{{ ceph_maint_admin }}"
+  register: ceph_maint_conf
+
+- name: Ceph is not deployed, nothing to do
+  ansible.builtin.debug:
+    msg: "no /etc/ceph/ceph.conf on {{ ceph_maint_admin }}: Ceph is not installed"
+  when: not ceph_maint_conf.stat.exists
+
+- name: Ceph maintenance - node-enter
+  when: ceph_maint_conf.stat.exists
+  block:
+    - name: Read active manager
+      ansible.builtin.command: cephadm shell -- ceph mgr stat --format json
+      delegate_to: "{{ ceph_maint_admin }}"
+      register: mgr_stat
+      changed_when: false
+
+    - name: Fail the active manager when it lives on this node
+      ansible.builtin.command: cephadm shell -- ceph mgr fail
+      delegate_to: "{{ ceph_maint_admin }}"
+      changed_when: true
+      when: (mgr_stat.stdout | from_json).active_name is match(inventory_hostname ~ '\.')
+
+    # `ok-to-stop` exits 0 even when it refuses: an ALERT line means "not safe".
+    # WARNING lines (e.g. the only Grafana instance stops) do not block. Both go to
+    # stderr, together with cephadm's own start-up lines, which are dropped.
+    - name: Wait until Ceph calls the host safe to stop
+      ansible.builtin.shell: |
+        set -o pipefail
+        end=$((SECONDS + {{ ceph_maint_ok_to_stop_timeout }}))
+        while :; do
+          if out=$(cephadm shell -- ceph orch host ok-to-stop {{ ansible_facts['nodename'] }} 2>&1 \
+                     | grep -vE '^(Inferring |Using ceph image |[^ ]+@sha256:)') \
+             && ! grep -qE '^(ALERT|ERROR)' <<<"$out"; then
+            echo "$out"
+            exit 0
+          fi
+          if [ $SECONDS -ge $end ]; then
+            echo "$out"
+            exit 1
+          fi
+          sleep 10
+        done
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ ceph_maint_admin }}"
+      register: ceph_maint_ok_to_stop
+      changed_when: false
+
+    - name: Ceph warnings about stopping the host
+      ansible.builtin.debug:
+        msg: "{{ ceph_maint_ok_to_stop.stdout_lines | select('match', '^WARNING') | list }}"
+      when: ceph_maint_ok_to_stop.stdout is search('^WARNING', multiline=True)
+
+    # --force accepts the WARNINGs above; the ALERTs were ruled out.
+    - name: Enter maintenance mode
+      ansible.builtin.command: cephadm shell -- ceph orch host maintenance enter {{ ansible_facts['nodename'] }} --force
+      delegate_to: "{{ ceph_maint_admin }}"
+      changed_when: true

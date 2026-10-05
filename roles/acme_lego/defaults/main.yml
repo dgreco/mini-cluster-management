@@ -1,0 +1,27 @@
+---
+# A Let's Encrypt certificate with lego and the GoDaddy DNS-01 challenge, with a
+# daily renewal timer and a deploy hook the caller provides. Used by
+# subsystems/ceph (ceph_acme) and subsystems/dataplatform (dataplatform_cert).
+# The caller sets (include_role vars):
+#   acme_lego_version, acme_lego_dir, acme_lego_domains (list, the first is the
+#   certificate's name), acme_lego_email, acme_lego_zone, acme_lego_godaddy_pat,
+#   acme_lego_wrapper (path of the renewal program this role writes),
+#   acme_lego_deploy_hook (path of the caller's program lego runs after a renewal),
+#   acme_lego_unit (systemd service and timer name)
+# and may set the ones below. Sets the facts acme_lego_cert_file,
+# acme_lego_key_file and acme_lego_changed (a new certificate this run).
+acme_lego_staging: false
+acme_lego_godaddy_api: https://api.godaddy.com/v1/domains
+acme_lego_server: "{{ 'letsencrypt-staging' if acme_lego_staging | bool else 'letsencrypt' }}"
+acme_lego_cert_name: "{{ acme_lego_domains[0] }}"
+acme_lego_cert_file: "{{ acme_lego_dir }}/certificates/{{ acme_lego_cert_name }}.crt"   # with the chain
+acme_lego_key_file: "{{ acme_lego_dir }}/certificates/{{ acme_lego_cert_name }}.key"
+# shell lines the wrapper runs before lego and after it (after: also when
+# lego had nothing to renew)
+acme_lego_wrapper_pre: ""
+acme_lego_wrapper_post: ""
+acme_lego_unit_description: "Renew the Let's Encrypt certificate of {{ acme_lego_cert_name }}"
+acme_lego_unit_after: ""                  # extra units the renewal waits for, e.g. k3s.service
+acme_lego_timer_calendar: "*-*-* 04:00:00"
+acme_lego_force: false                    # renew now even when not due
+acme_lego_renew_on_new_names: true        # renew when a domain is missing from the certificate

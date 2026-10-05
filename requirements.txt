@@ -1,0 +1,6 @@
+# Python tools of the control node (pip install -r requirements.txt, into the
+# Python that runs Ansible): the versions the repository was last run with.
+ansible-core>=2.21,<2.22
+ansible-lint>=26.9,<27
+boto3>=1.43,<2          # amazon.aws, ceph/files/oidc_provider.py, the data platform's Ceph role
+PyYAML>=6.0,<7          # make dataplatform-render

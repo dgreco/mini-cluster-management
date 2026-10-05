@@ -1,0 +1,84 @@
+---
+# cephadm monitoring stack. Runs on the admin host. cephadm points the dashboard
+# at Prometheus, Alertmanager and Grafana by itself once they are deployed.
+- name: Read mgr modules
+  ansible.builtin.command: cephadm shell -- ceph mgr module ls --format json
+  register: ceph_monitoring_mgr_modules
+  changed_when: false
+
+- name: Enable the mgr prometheus module (cluster-level metrics)
+  ansible.builtin.command: cephadm shell -- ceph mgr module enable prometheus
+  when:
+    - ceph_monitoring_enabled | bool
+    - "'prometheus' not in (ceph_monitoring_mgr_modules.stdout | from_json).enabled_modules"
+  changed_when: true
+
+- name: Spec directory
+  ansible.builtin.file:
+    path: /etc/ceph/specs
+    state: directory
+    mode: "0750"
+  when: ceph_monitoring_enabled | bool
+
+- name: Render monitoring spec
+  ansible.builtin.template:
+    src: monitoring.yml.j2
+    dest: /etc/ceph/specs/monitoring.yml
+    mode: "0600"
+  register: ceph_monitoring_spec
+  no_log: true
+  when: ceph_monitoring_enabled | bool
+
+- name: Apply monitoring spec
+  ansible.builtin.command: cephadm shell --mount /etc/ceph/specs -- ceph orch apply -i /mnt/specs/monitoring.yml
+  when:
+    - ceph_monitoring_enabled | bool
+    - ceph_monitoring_spec.changed or (ceph_force_apply | default(false) | bool)
+  changed_when: true
+
+- name: Wait for the monitoring daemons
+  ansible.builtin.command: cephadm shell -- ceph orch ps --format json
+  register: ceph_monitoring_ps
+  changed_when: false
+  retries: 40
+  delay: 15
+  until: >-
+    (ceph_monitoring_ps.stdout | from_json | selectattr('daemon_type', 'in', ceph_monitoring_daemon_types) | list | length)
+      >= (2 * groups['ceph'] | length + 3 * groups['ceph_monitoring'] | length)
+    and (ceph_monitoring_ps.stdout | from_json | selectattr('daemon_type', 'in', ceph_monitoring_daemon_types)
+         | rejectattr('status_desc', 'equalto', 'running') | list | length) == 0
+  vars:
+    ceph_monitoring_daemon_types: [node-exporter, ceph-exporter, prometheus, alertmanager, grafana]
+  when: ceph_monitoring_enabled | bool
+
+# cephadm sets these after its post-deploy step, a little after the daemons
+# report running (Grafana is also redeployed once Prometheus exists).
+- name: Wait for the dashboard endpoints
+  ansible.builtin.command: cephadm shell -- ceph dashboard {{ item }}
+  loop:
+    - get-grafana-api-url
+    - get-prometheus-api-host
+    - get-alertmanager-api-host
+  register: ceph_monitoring_urls
+  changed_when: false
+  retries: 20
+  delay: 15
+  until: ceph_monitoring_urls.stdout | trim | length > 0
+  when: ceph_monitoring_enabled | bool
+
+- name: Endpoint summary
+  ansible.builtin.debug:
+    msg:
+      - "Grafana      : {{ ceph_monitoring_urls.results[0].stdout | trim }} (user admin, password in {{ secrets_dir }}/ceph-grafana.pw)"
+      - "Prometheus   : {{ ceph_monitoring_urls.results[1].stdout | trim }}"
+      - "Alertmanager : {{ ceph_monitoring_urls.results[2].stdout | trim }}"
+  when: ceph_monitoring_enabled | bool
+
+# ---------------------------------------------------------------- disabled ----
+- name: Remove the monitoring services when disabled
+  ansible.builtin.command: cephadm shell -- ceph orch rm {{ item }}
+  loop: [grafana, alertmanager, prometheus, ceph-exporter, node-exporter]
+  register: ceph_monitoring_rm
+  changed_when: "'Removed' in ceph_monitoring_rm.stdout"
+  failed_when: false
+  when: not ceph_monitoring_enabled | bool

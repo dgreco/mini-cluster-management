@@ -1,0 +1,22 @@
+---
+# Ceph-backed StorageClasses: ceph-rbd (RWO block, default) and ceph-cephfs
+# (RWX filesystem), via ceph-csi. Needs subsystems/ceph (RBD pool, CephFS).
+- name: Ceph resources for k3s
+  hosts: ceph_mons[0]
+  gather_facts: false
+  tasks:
+    - name: Ceph storage
+      ansible.builtin.include_role:
+        name: k3s_ceph
+      when: k3s_ceph_storage_enabled | bool
+
+- name: Install the ceph-csi drivers and StorageClasses
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  vars:
+    _ceph: "{{ hostvars[groups['ceph_mons'][0]] }}"
+  tasks:
+    - name: Install ceph-csi
+      ansible.builtin.include_role:
+        name: k3s_ceph_csi
+      when: k3s_ceph_storage_enabled | bool

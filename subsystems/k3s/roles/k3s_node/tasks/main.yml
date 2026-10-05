@@ -1,0 +1,224 @@
+---
+# Install / converge k3s on one node. k3s_node_role: server | agent.
+# The first server bootstraps embedded etcd (cluster-init) unless another
+# server already holds a cluster, which it then joins (a first server that
+# lost its data directory must not start a second cluster with the same
+# token); the other servers and the agents join at https://<k3s_api_host>:6443.
+- name: Role of this node
+  ansible.builtin.set_fact:
+    k3s_node_is_server: "{{ k3s_node_role == 'server' }}"
+    k3s_node_is_first: "{{ inventory_hostname == k3s_first_server }}"
+    k3s_node_service: "{{ 'k3s' if k3s_node_role == 'server' else 'k3s-agent' }}"
+    k3s_node_url: "https://{{ k3s_api_host }}:6443"
+
+- name: Configuration directory
+  ansible.builtin.file:
+    path: /etc/rancher/k3s
+    state: directory
+    mode: "0755"
+
+# OIDC logins (k3s_oidc_issuer_url): the API server reads this file and
+# reloads it when it changes, so only adding or removing the flag restarts k3s.
+- name: Authentication configuration of the API server
+  ansible.builtin.copy:
+    content: "{{ _auth | to_nice_yaml(indent=2) }}"
+    dest: /etc/rancher/k3s/authentication-config.yaml
+    mode: "0600"
+  vars:
+    _auth:
+      apiVersion: apiserver.config.k8s.io/v1
+      kind: AuthenticationConfiguration
+      jwt:
+        - issuer:
+            url: "{{ k3s_oidc_issuer_url }}"
+            audiences: ["{{ k3s_oidc_client_id }}"]
+          claimMappings:
+            username:
+              claim: "{{ k3s_oidc_username_claim }}"
+              prefix: "{{ k3s_oidc_prefix }}"
+            groups:
+              claim: "{{ k3s_oidc_groups_claim }}"
+              prefix: "{{ k3s_oidc_prefix }}"
+  when: k3s_node_is_server and k3s_oidc_issuer_url | length > 0
+
+- name: Own etcd data
+  ansible.builtin.stat:
+    path: /var/lib/rancher/k3s/server/db/etcd
+  register: k3s_node_own_etcd
+  when: k3s_node_is_server and k3s_node_is_first
+
+- name: Other servers that hold etcd data
+  ansible.builtin.stat:
+    path: /var/lib/rancher/k3s/server/db/etcd
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['k3s_servers'] | difference([inventory_hostname]) }}"
+  register: k3s_node_other_etcd
+  ignore_unreachable: true
+  when: k3s_node_is_server and k3s_node_is_first and not k3s_node_own_etcd.stat.exists
+
+# '' = bootstrap (cluster-init) or join at k3s_node_url; else the server to join.
+- name: Bootstrap, or join a cluster that already exists
+  ansible.builtin.set_fact:
+    k3s_node_join_server: >-
+      {{ '' if not k3s_node_is_first or k3s_node_own_etcd.stat.exists else
+         (k3s_node_other_etcd.results | default([]) | selectattr('stat', 'defined')
+          | selectattr('stat.exists') | map(attribute='item') | first | default('')) }}
+  when: k3s_node_is_server
+
+- name: Joining an existing cluster
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} has no etcd data but {{ k3s_node_join_server }} has: joining that
+      cluster instead of bootstrapping a new one.
+  when: k3s_node_is_server and k3s_node_join_server | length > 0
+
+# etcd snapshots to S3: the settings live in a Secret k3s reads, not in
+# config.yaml. The manifest is applied by k3s's own deploy controller once the
+# server is up (every server carries it, the leader applies it).
+- name: The backup key exists - {{ k3s_etcd_s3_keyfile }}
+  ansible.builtin.stat:
+    path: "{{ k3s_etcd_s3_keyfile }}"
+  delegate_to: localhost
+  become: false
+  register: k3s_node_s3_keyfile
+  when: k3s_node_is_server and k3s_etcd_s3_enabled | bool
+
+- name: The backup S3 user must exist before k3s can snapshot to S3
+  ansible.builtin.assert:
+    that: k3s_node_s3_keyfile.stat.exists
+    fail_msg: "{{ k3s_etcd_s3_keyfile }} is missing: run make ceph-s3 (it creates the backup user), or set k3s_etcd_s3_enabled=false"
+    quiet: true
+  when: k3s_node_is_server and k3s_etcd_s3_enabled | bool
+
+- name: S3 settings of the etcd snapshots
+  ansible.builtin.copy:
+    content: "{{ _secret | to_nice_yaml(indent=2) }}"
+    dest: /var/lib/rancher/k3s/server/manifests/k3s-etcd-snapshot-s3.yaml
+    mode: "0600"
+  vars:
+    _key: "{{ lookup('ansible.builtin.file', k3s_etcd_s3_keyfile) | from_json }}"
+    _secret:
+      apiVersion: v1
+      kind: Secret
+      metadata: {name: k3s-etcd-snapshot-s3, namespace: kube-system}
+      type: etcd.k3s.cattle.io/s3-config-secret
+      stringData:
+        etcd-s3-endpoint: "{{ _key.endpoint | regex_replace('^https?://', '') }}"
+        etcd-s3-insecure: "{{ 'true' if _key.endpoint is match('^http://') else 'false' }}"
+        etcd-s3-region: "{{ k3s_etcd_s3_region }}"
+        etcd-s3-bucket: "{{ k3s_etcd_s3_bucket }}"
+        etcd-s3-folder: "{{ k3s_etcd_s3_folder }}"
+        etcd-s3-access-key: "{{ _key.access_key }}"
+        etcd-s3-secret-key: "{{ _key.secret_key }}"
+  no_log: true
+  when: k3s_node_is_server and k3s_etcd_s3_enabled | bool
+
+- name: No S3 settings for the etcd snapshots
+  ansible.builtin.file:
+    path: /var/lib/rancher/k3s/server/manifests/k3s-etcd-snapshot-s3.yaml
+    state: absent
+  when: k3s_node_is_server and not k3s_etcd_s3_enabled | bool
+
+# The API virtual IP (k3s_api_vip): kube-vip on every server, as a manifest
+# the k3s deploy controller applies. Off: the manifest is removed.
+- name: Virtual IP of the API server (kube-vip)
+  ansible.builtin.template:
+    src: kube-vip.yaml.j2
+    dest: /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
+    mode: "0644"
+  when: k3s_node_is_server and k3s_api_vip | length > 0
+
+- name: No virtual IP of the API server
+  ansible.builtin.file:
+    path: /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
+    state: absent
+  when: k3s_node_is_server and k3s_api_vip | length == 0
+
+- name: Write the k3s configuration
+  ansible.builtin.copy:
+    content: "{{ _config | to_nice_yaml(indent=2) }}"
+    dest: /etc/rancher/k3s/config.yaml
+    mode: "0600"
+  vars:
+    _join: >-
+      {{ {'cluster-init': true} if (k3s_node_is_first and k3s_node_join_server | length == 0) else
+         {'server': ('https://' ~ hostvars[k3s_node_join_server]['ansible_host'] ~ ':6443')
+                    if k3s_node_join_server | length > 0 else k3s_node_url} }}
+    _server: >-
+      {{ {'tls-san': ([k3s_api_host] + groups['k3s_servers']
+                      + (groups['k3s_servers'] | map('extract', hostvars, 'ansible_host') | list)) | unique,
+          'disable': k3s_disable,
+          'write-kubeconfig-mode': '0600',
+          'etcd-snapshot-retention': k3s_etcd_snapshot_retention}
+         | combine({'kube-apiserver-arg': ['authentication-config=/etc/rancher/k3s/authentication-config.yaml']}
+                   if k3s_oidc_issuer_url | length > 0 else {})
+         | combine({'etcd-s3': true, 'etcd-s3-config-secret': 'k3s-etcd-snapshot-s3'}
+                   if k3s_etcd_s3_enabled | bool else {}) }}
+    _kubelet:
+      kubelet-arg:
+        - "system-reserved={{ k3s_kubelet_system_reserved }}"
+        - "eviction-hard={{ k3s_kubelet_eviction_hard }}"
+    _config: >-
+      {{ {'token': k3s_token}
+         | combine(_join if k3s_node_is_server else {'server': k3s_node_url})
+         | combine(_server if k3s_node_is_server else {})
+         | combine(_kubelet)
+         | combine(k3s_server_extra_config if k3s_node_is_server else k3s_agent_extra_config) }}
+  register: k3s_node_config
+  no_log: true
+
+- name: Installed k3s version
+  ansible.builtin.command: /usr/local/bin/k3s --version
+  register: k3s_node_installed
+  changed_when: false
+  failed_when: false
+
+- name: Install k3s - {{ k3s_version ~ ' (' ~ k3s_node_role ~ ')' }}
+  when: k3s_version not in k3s_node_installed.stdout | default('')
+  block:
+    - name: The vendored installer, the same script for every node and run
+      ansible.builtin.copy:
+        src: k3s-install.sh
+        dest: /usr/local/bin/k3s-install.sh
+        mode: "0755"
+
+    # Reads /etc/rancher/k3s/config.yaml; starts (or restarts, on upgrade) the
+    # service and returns once it is up, which for a joining server means it
+    # is part of etcd.
+    - name: Run the installer
+      ansible.builtin.command: /usr/local/bin/k3s-install.sh
+      environment: >-
+        {{ {'INSTALL_K3S_VERSION': k3s_version, 'INSTALL_K3S_EXEC': k3s_node_role}
+           | combine({} if k3s_node_is_server else {'K3S_URL': k3s_node_url, 'K3S_TOKEN': k3s_token}) }}
+      register: k3s_node_install
+      no_log: true
+      changed_when: true
+
+- name: Restart k3s for a configuration change
+  ansible.builtin.systemd:
+    name: "{{ k3s_node_service }}"
+    state: restarted
+  when: k3s_node_config is changed and k3s_node_install is not changed
+
+- name: Make sure the k3s service is enabled and running
+  ansible.builtin.systemd:
+    name: "{{ k3s_node_service }}"
+    state: started
+    enabled: true
+
+- name: Wait for the node to be Ready
+  ansible.builtin.command: >-
+    /usr/local/bin/k3s kubectl get node {{ ansible_facts['nodename'] }}
+    -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}'
+  delegate_to: "{{ k3s_first_server }}"
+  register: k3s_node_ready
+  changed_when: false
+  failed_when: false
+  retries: 40
+  delay: 10
+  until: k3s_node_ready.stdout == 'True'
+
+- name: Node must be Ready
+  ansible.builtin.assert:
+    that: k3s_node_ready.stdout == 'True'
+    fail_msg: "{{ ansible_facts['nodename'] }} did not become Ready: {{ k3s_node_ready.stderr | default('') }}"

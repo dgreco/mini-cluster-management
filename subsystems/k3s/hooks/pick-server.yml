@@ -1,0 +1,61 @@
+---
+# Task file shared by the k3s and data platform node hooks. Finds another k3s
+# server whose API answers, and whether this node is a member of the cluster.
+# Sets, on the node:
+#   k3s_maint_installed  k3s is installed on this node
+#   k3s_maint_server     another server whose API answers (the node itself when
+#                        k3s is not installed: delegate_to needs a name even on
+#                        skipped tasks)
+#   k3s_maint_member     the node is registered in the cluster
+# A node with k3s installed whose cluster cannot be reached is an error, not
+# "no k3s": skipping the drain would take the node down with its pods running.
+- name: The k3s binary on {{ inventory_hostname }}
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  register: k3s_maint_bin
+
+- name: Which other k3s server answers?
+  ansible.builtin.command: /usr/local/bin/k3s kubectl get --raw /readyz --request-timeout=10s
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['k3s_servers'] | difference([inventory_hostname]) }}"
+  register: k3s_maint_servers
+  changed_when: false
+  failed_when: false
+  ignore_unreachable: true
+  when: k3s_maint_bin.stat.exists
+
+- name: Pick the first server that answers
+  ansible.builtin.set_fact:
+    k3s_maint_installed: "{{ k3s_maint_bin.stat.exists }}"
+    k3s_maint_servers_ok: >-
+      {{ k3s_maint_servers.results | default([])
+         | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0)
+         | selectattr('stdout', 'equalto', 'ok')
+         | map(attribute='item') | list }}
+
+- name: Server to use
+  ansible.builtin.set_fact:
+    k3s_maint_server: "{{ k3s_maint_servers_ok | first | default(inventory_hostname) }}"
+
+- name: The k3s cluster must be reachable
+  ansible.builtin.fail:
+    msg: >-
+      k3s is installed on {{ inventory_hostname }} but no other k3s server answers
+      ({{ groups['k3s_servers'] | difference([inventory_hostname]) | join(', ') }}), so the node
+      can neither be drained nor checked. Repair the servers first (make k3s-status), or remove
+      k3s from the node before taking it down.
+  when: k3s_maint_installed and k3s_maint_servers_ok | length == 0
+
+- name: Cluster membership of {{ ansible_facts['nodename'] | default(inventory_hostname) }}
+  ansible.builtin.command: >-
+    /usr/local/bin/k3s kubectl get node {{ ansible_facts['nodename'] | default(inventory_hostname ~ '.' ~ cluster_domain) }}
+    -o name --request-timeout=10s
+  delegate_to: "{{ k3s_maint_server }}"
+  register: k3s_maint_probe
+  changed_when: false
+  failed_when: k3s_maint_probe.rc != 0 and 'not found' not in k3s_maint_probe.stderr
+  when: k3s_maint_installed
+
+- name: Membership of {{ inventory_hostname }}
+  ansible.builtin.set_fact:
+    k3s_maint_member: "{{ k3s_maint_installed and k3s_maint_probe.rc == 0 }}"

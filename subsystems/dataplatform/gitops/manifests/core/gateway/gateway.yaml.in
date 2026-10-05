@@ -1,0 +1,153 @@
+# The platform's single entry point: NGINX Gateway Fabric, TLS terminated with
+# the Let's Encrypt wildcard *.<%= dataplatform_domain %> (Secret gateway-tls, from
+# OpenBao). One HTTPS listener per public name, each accepting routes only
+# from the namespace that owns the service, as in bigdata-k8s-stack. Plain
+# HTTP on :80 only redirects to HTTPS.
+#
+# NGF creates the data-plane Service of this Gateway (type LoadBalancer, see
+# helm-values/nginx-gateway-fabric-values.yaml); k3s servicelb publishes it on
+# :80/:443 of the dataplatform_gateway nodes (node2, node3), where the public
+# DNS names point.
+#
+# Adding a service: a listener here, then an HTTPRoute in its namespace with
+# parentRefs sectionName <name>-https.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: main-gateway
+  namespace: core
+spec:
+  gatewayClassName: nginx
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: argocd-https
+      hostname: argocd.<%= dataplatform_domain %>
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: gateway-tls
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: argocd
+    - name: openbao-https
+      hostname: openbao.<%= dataplatform_domain %>
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: gateway-tls
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: governance
+    - name: keycloak-https
+      hostname: keycloak.<%= dataplatform_domain %>
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: gateway-tls
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: governance
+    - name: grafana-https
+      hostname: grafana.<%= dataplatform_domain %>
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: gateway-tls
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+    - name: trino-https
+      hostname: trino.<%= dataplatform_domain %>
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: gateway-tls
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: compute
+    - name: jupyter-https
+      hostname: jupyter.<%= dataplatform_domain %>
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: gateway-tls
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: tools
+    - name: s3browser-https
+      hostname: s3browser.<%= dataplatform_domain %>
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: gateway-tls
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: tools
+    - name: vmui-https
+      hostname: vmui.<%= dataplatform_domain %>
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: gateway-tls
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+    - name: metacatalog-https
+      hostname: metacatalog.<%= dataplatform_domain %>
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: gateway-tls
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: governance

@@ -1,0 +1,33 @@
+---
+# Where the data platform stands: Argo CD Applications, OpenBao, and the URLs.
+- name: Data platform status
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  tasks:
+    - name: Argo CD applications
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl -n argocd get applications
+        -o 'custom-columns=NAME:.metadata.name,WAVE:.metadata.annotations.argocd\.argoproj\.io/sync-wave,SYNC:.status.sync.status,HEALTH:.status.health.status'
+        --sort-by=.metadata.name
+      register: status_apps
+      changed_when: false
+      failed_when: false
+
+    - name: OpenBao pods
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl -n {{ dataplatform_openbao_namespace }} get pods
+        -l app.kubernetes.io/name=openbao,component=server
+        -o 'custom-columns=POD:.metadata.name,READY:.status.containerStatuses[0].ready,ACTIVE:.metadata.labels.openbao-active,NODE:.spec.nodeName'
+      register: status_openbao
+      changed_when: false
+      failed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Git: {{ dataplatform_git_repo }} @ {{ dataplatform_git_revision }}"
+          - "{{ status_apps.stdout_lines | default([]) }}"
+          - "{{ status_openbao.stdout_lines | default([]) }}"
+          - "Web UIs: {{ ['argocd', 'openbao', 'keycloak', 'grafana', 'trino', 'jupyter']
+                        | map('regex_replace', '^(.*)$', 'https://\\1.' ~ dataplatform_domain) | join('  ') }}"
+          - "Logins: make dataplatform-passwords"

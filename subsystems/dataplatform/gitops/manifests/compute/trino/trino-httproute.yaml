@@ -1,0 +1,35 @@
+# https://trino.data.example.org -> the coordinator (HTTPS 8443), TLS
+# re-encrypted by the Gateway and verified against the secret-operator's CA.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: trino
+  namespace: compute
+spec:
+  parentRefs:
+    - name: main-gateway
+      namespace: core
+      sectionName: trino-https
+  hostnames:
+    - trino.data.example.org
+  rules:
+    - backendRefs:
+        - name: trino-coordinator
+          port: 8443
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: trino-coordinator
+  namespace: compute
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: trino-coordinator
+  validation:
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: stackable-tls-ca
+    hostname: trino-coordinator.compute.svc.cluster.local

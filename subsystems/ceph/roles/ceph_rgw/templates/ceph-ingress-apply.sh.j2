@@ -1,0 +1,27 @@
+#!/bin/bash
+# Managed by Ansible (ceph_rgw). Builds /etc/ceph/specs/ingress.yml from
+# ingress-base.yml and a certificate, and applies it when it changed. Used by
+# the ceph_rgw role and by the Let's Encrypt renewal (ceph-s3-cert.service).
+#   ceph-ingress-apply [--force] [CERT KEY]      no CERT KEY: plain HTTP
+# Prints "applied" or "unchanged".
+set -euo pipefail
+force=0
+if [ "${1:-}" = --force ]; then force=1; shift; fi
+dir=/etc/ceph/specs
+new=$(mktemp)
+trap 'rm -f "$new"' EXIT
+cat "$dir/ingress-base.yml" > "$new"
+if [ $# -eq 2 ]; then
+  echo "  ssl_cert: |" >> "$new"
+  { cat "$1"; echo; cat "$2"; } | grep -v '^$' | sed 's/^/    /' >> "$new"
+fi
+if [ $force -eq 0 ] && cmp -s "$new" "$dir/ingress.yml"; then
+  echo unchanged
+  exit 0
+fi
+install -m 0600 "$new" "$dir/ingress.yml"
+cephadm shell --mount "$dir" -- ceph orch apply -i /mnt/specs/ingress.yml >/dev/null
+# A new spec alone does not reach running haproxy daemons (the certificate
+# stays the old one): reconfigure them. Nothing to do before they exist.
+cephadm shell -- ceph orch reconfig ingress.rgw.{{ ceph_rgw_service_id }} >/dev/null 2>&1 || true
+echo applied

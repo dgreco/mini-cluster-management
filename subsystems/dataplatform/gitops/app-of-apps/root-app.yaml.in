@@ -1,0 +1,31 @@
+# Root Application: every file in gitops/apps is a child Application. Applied
+# by Ansible (make dataplatform-argocd); from then on Argo CD manages the rest.
+# The children's sync waves order the first install, and the Application
+# health check (bootstrap/argocd-values.yaml) makes each wave wait until the
+# previous one is healthy.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: dataplatform
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: dataplatform
+  source:
+    repoURL: <%= dataplatform_git_repo %>
+    targetRevision: <%= dataplatform_git_revision %>
+    path: subsystems/dataplatform/gitops/apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        maxDuration: 5m
+        factor: 2

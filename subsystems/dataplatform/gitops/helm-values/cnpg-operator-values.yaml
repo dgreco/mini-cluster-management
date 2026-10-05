@@ -1,0 +1,8 @@
+# CloudNativePG operator: PostgreSQL for Keycloak and the Iceberg catalog.
+# the operator's metrics (:8080; the CloudNativePG dashboard reads them)
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+resources:
+  requests: {cpu: 50m, memory: 100Mi}
+  limits: {memory: 256Mi}

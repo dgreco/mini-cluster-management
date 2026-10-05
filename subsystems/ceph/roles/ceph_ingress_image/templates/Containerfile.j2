@@ -1,0 +1,9 @@
+# Managed by Ansible (subsystems/ceph/roles/ceph_ingress_image).
+# cephadm's own keepalived image (quay.io/ceph/keepalived) is amd64-only, so we
+# build an equivalent locally on every ingress host. cephadm starts the container
+# with KEEPALIVED_CMD set and the config mounted at /etc/keepalived/keepalived.conf.
+FROM {{ ceph_ingress_keepalived_base_image }}
+# curl: cephadm's keepalived.conf checks haproxy with /usr/bin/curl; without it
+# keepalived disables the check and keeps the VIP on a host whose haproxy is down.
+RUN apk add --no-cache {{ ceph_ingress_keepalived_package }} curl
+ENTRYPOINT ["/bin/sh", "-c", "exec ${KEEPALIVED_CMD:-/usr/sbin/keepalived -n -l -f /etc/keepalived/keepalived.conf}"]

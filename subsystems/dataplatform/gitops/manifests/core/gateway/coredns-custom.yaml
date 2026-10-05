@@ -1,0 +1,13 @@
+# Pods resolve the public names *.data.example.org to the Gateway's own
+# Service, so in-cluster clients (Argo CD, Grafana, OpenBao, Trino, Spark
+# fetching Keycloak's discovery and keys) use the same URLs and certificate as
+# everyone else without leaving the cluster. k3s's CoreDNS imports *.override
+# keys of this ConfigMap into its main server block.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  dataplatform.override: |
+    rewrite name regex ^(.*\.)?data\.example\.org\.?$ main-gateway-nginx.core.svc.cluster.local answer auto

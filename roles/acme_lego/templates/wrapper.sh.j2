@@ -1,0 +1,21 @@
+#!/bin/bash
+# Managed by Ansible (acme_lego). Obtain the Let's Encrypt certificate of
+# {{ acme_lego_cert_name }} ({{ acme_lego_domains | join(', ') }}), or renew it when
+# due; lego runs {{ acme_lego_deploy_hook }} after a renewal. Run daily by
+# {{ acme_lego_unit }}.timer. Extra arguments go to `lego run`, e.g.
+# --renew-force, --no-random-sleep. Propagation is checked on GoDaddy's
+# authoritative servers only: the LAN resolver may cache an earlier challenge
+# value for its TTL.
+set -euo pipefail
+{{ acme_lego_wrapper_pre }}
+/usr/local/bin/lego run \
+  --path {{ acme_lego_dir }} --env-file {{ acme_lego_dir }}/lego.env \
+  --accept-tos --email {{ acme_lego_email }} --server {{ acme_lego_server }} \
+  --cert.name {{ acme_lego_cert_name }} --force-cert-domains \
+{% for d in acme_lego_domains %}
+  --domains '{{ d }}' \
+{% endfor %}
+  --dns exec --dns.propagation.disable-rns \
+  --deploy-hook {{ acme_lego_deploy_hook }} \
+  "$@"
+{{ acme_lego_wrapper_post }}

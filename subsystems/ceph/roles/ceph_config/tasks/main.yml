@@ -1,0 +1,77 @@
+---
+# Compare-and-set for the monitor config database.
+# Input:  ceph_config_entries: [{who, name, value, secret?}]
+#         secret: true keeps the value off the command line (cephadm logs every
+#         command line it runs to /var/log/ceph/cephadm.log, and the monitors'
+#         audit log records `config set` with its value): the value is
+#         assimilated from a root-only file instead, removed again afterwards.
+#         assimilate-conf never overwrites a key that is set, so the key is
+#         removed first; a daemon reading it between the two steps sees it
+#         unset for a moment (the callers restart their daemons on a change).
+# Output: fact ceph_config_changed (true if anything was set)
+#
+# Values are compared against `ceph config dump` (exact section + name match).
+# `ceph config get <who> <key>` is not usable for this: it resolves what an
+# entity would see and returns nothing for the `global` section.
+- name: Read config database
+  ansible.builtin.command: cephadm shell -- ceph config dump --format json
+  register: ceph_config_dump
+  changed_when: false
+
+- name: Set values that differ
+  ansible.builtin.command: cephadm shell -- ceph config set {{ item.who }} {{ item.name }} {{ item.value | quote }}
+  loop: >-
+    {{ ceph_config_entries | rejectattr('secret', 'defined') | list
+       + ceph_config_entries | selectattr('secret', 'defined') | rejectattr('secret') | list }}
+  loop_control:
+    label: "{{ item.who }} {{ item.name }}"
+  vars:
+    _current: >-
+      {{ ceph_config_dump.stdout | from_json
+         | selectattr('section', 'equalto', item.who)
+         | selectattr('name', 'equalto', item.name)
+         | map(attribute='value') | first | default('') }}
+  register: ceph_config_set
+  when: (_current | string | trim) != (item.value | string | trim)
+  no_log: "{{ ceph_config_no_log | default(false) }}"
+  changed_when: true
+
+- name: Set secret values that differ, from a file
+  ansible.builtin.shell: |
+    set -o pipefail
+    umask 077
+    f=$(mktemp /etc/ceph/specs/config.XXXXXX)
+    trap 'rm -f "$f"' EXIT
+    printf '[%s]\n%s = %s\n' "$CEPH_CONFIG_WHO" "$CEPH_CONFIG_NAME" "$CEPH_CONFIG_VALUE" > "$f"
+    cephadm shell -- ceph config rm "$CEPH_CONFIG_WHO" "$CEPH_CONFIG_NAME" >/dev/null 2>&1 || true
+    # what assimilate-conf could not take is printed back: the option must not be in there
+    rest=$(cephadm shell --mount /etc/ceph/specs -- ceph config assimilate-conf -i "/mnt/specs/$(basename "$f")" 2>/dev/null)
+    if grep -q "^[[:space:]]*$CEPH_CONFIG_NAME[[:space:]]*=" <<<"$rest"; then
+      echo "ceph config assimilate-conf did not take $CEPH_CONFIG_WHO $CEPH_CONFIG_NAME" >&2
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
+  environment:
+    CEPH_CONFIG_WHO: "{{ item.who }}"
+    CEPH_CONFIG_NAME: "{{ item.name }}"
+    CEPH_CONFIG_VALUE: "{{ item.value }}"
+  loop: "{{ ceph_config_entries | selectattr('secret', 'defined') | selectattr('secret') | list }}"
+  loop_control:
+    label: "{{ item.who }} {{ item.name }}"
+  vars:
+    _current: >-
+      {{ ceph_config_dump.stdout | from_json
+         | selectattr('section', 'equalto', item.who)
+         | selectattr('name', 'equalto', item.name)
+         | map(attribute='value') | first | default('') }}
+  register: ceph_config_set_secret
+  when: (_current | string | trim) != (item.value | string | trim)
+  no_log: true
+  changed_when: true
+
+- name: Record whether anything changed
+  ansible.builtin.set_fact:
+    ceph_config_changed: >-
+      {{ (ceph_config_set.results | default([]) + ceph_config_set_secret.results | default([]))
+         | selectattr('changed', 'defined') | selectattr('changed') | list | length > 0 }}

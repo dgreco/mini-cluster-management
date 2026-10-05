@@ -1,0 +1,80 @@
+---
+# k3s subsystem (subsystems/k3s). Applies to every host in the `k3s` group.
+
+# ---------------------------------------------------------------- k3s ----
+k3s_version: v1.36.4+k3s1               # pinned; upgrade with make k3s-upgrade ARGS="-e k3s_version=..." then bump this
+# The installer is vendored in roles/k3s_node/files/k3s-install.sh (the same
+# script for every node and every run); refresh it from https://get.k3s.io
+# when bumping k3s_version.
+k3s_token: "{{ lookup('password', secrets_dir ~ '/k3s-token chars=ascii_letters,digits length=48') }}"
+# The first server bootstraps etcd (cluster-init); the others join it.
+k3s_first_server: "{{ groups['k3s_servers'][0] }}"
+# A virtual IP for the API server, held by whichever server is up (kube-vip in
+# ARP mode on the servers, a static manifest): kubectl from the laptop, the
+# agents and .secrets/k3s.yaml keep working when the first server is down.
+# Empty: off, the first server's address is the API endpoint. Set a free LAN
+# address (not the S3 one, ceph_rgw_ingress_virtual_ip) and run
+# make k3s-install: the servers get it in their certificates and the
+# manifest; then make k3s-kubeconfig.
+k3s_api_vip: "{{ site_k3s_api_vip }}"
+k3s_api_vip_interface: eth0
+k3s_api_vip_image: ghcr.io/kube-vip/kube-vip:v1.2.4
+k3s_api_host: "{{ k3s_api_vip if k3s_api_vip | length > 0 else hostvars[k3s_first_server]['ansible_host'] }}"
+k3s_disable: [traefik]                  # packaged components to leave out (servicelb stays)
+k3s_server_extra_config: {}             # merged into /etc/rancher/k3s/config.yaml on servers
+k3s_agent_extra_config: {}              # same for agents
+# Every board also runs Ceph (an OSD with osd_memory_target 4 GiB, and mon,
+# mgr, mds, rgw, ingress, monitoring on some): the kubelet keeps this much for
+# them and the OS, and evicts pods before the board swaps or the OOM killer
+# picks a Ceph daemon. 32 GiB boards: 24-25 GiB stay allocatable.
+k3s_kubelet_system_reserved: "cpu=1,memory=6Gi"
+k3s_kubelet_eviction_hard: "memory.available<1Gi,nodefs.available<10%"
+k3s_kubeconfig: "{{ secrets_dir }}/k3s.yaml"
+# The control node's kubeconfig, where the `k3s` context is merged (replacing
+# entries of an earlier install) and made current. '' to skip.
+k3s_local_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/config"
+k3s_ready_timeout: 600                  # s; rolling reboot: node Ready, ceph-csi pods, API healthy
+# etcd snapshots (every 12 h by k3s, and before every rolling reboot) also go
+# to S3, in the backup bucket of subsystems/ceph (ceph_rgw_backup_*), whose
+# owner's keys are in .secrets. The servers read them from the Secret
+# kube-system/k3s-etcd-snapshot-s3 (etcd-s3-config-secret), not from config.yaml.
+k3s_etcd_s3_enabled: true
+k3s_etcd_s3_keyfile: "{{ secrets_dir }}/s3-backup.json"   # written by make ceph-s3 (user ceph_rgw_backup_uid)
+k3s_etcd_s3_bucket: "{{ site_backup_bucket }}"             # ceph_rgw_backup_bucket
+k3s_etcd_s3_region: "{{ site_s3_region }}"
+k3s_etcd_s3_folder: etcd
+k3s_etcd_snapshot_retention: 10         # snapshots kept, locally and in S3
+
+# ---------------------------------------------------------------- logins ----
+# Kubernetes API logins through an OpenID Connect provider ('' = off): here the
+# Keycloak realm of the data platform (subsystems/dataplatform). A user becomes
+# <prefix><username claim>, their groups <prefix><group>; RBAC binds those
+# names (the data platform binds oidc:<its admin group> to cluster-admin). The
+# API server keeps serving when the provider is down (client certificates, as
+# in .secrets/k3s.yaml, always work). Structured authentication configuration
+# (/etc/rancher/k3s/authentication-config.yaml): later edits reload without a
+# restart; turning it on or off restarts the servers one at a time.
+# The data platform's realm (the k3s nodes are its hosts too); '' without it
+k3s_oidc_issuer_url: "{{ dataplatform_keycloak_issuer | default('') }}"
+k3s_oidc_client_id: kubernetes          # the token's audience
+k3s_oidc_username_claim: preferred_username
+k3s_oidc_groups_claim: groups
+k3s_oidc_prefix: "oidc:"
+
+# ---------------------------------------------------------------- storage ----
+# ceph-csi drivers for the Ceph cluster of subsystems/ceph, installed through the
+# k3s Helm controller. 3.15.1 is the newest release that works with the boards'
+# 5.10 kernel: from 3.16 the images carry Tentacle's rbd CLI, which adds
+# ms_mode=prefer-crc to every kernel map, an option 5.10 rejects (EINVAL).
+k3s_ceph_storage_enabled: true
+k3s_ceph_csi_version: 3.15.1
+k3s_ceph_csi_chart_repo: https://ceph.github.io/csi-charts
+k3s_ceph_rbd_pool: k3s-rbd
+k3s_ceph_rbd_pool_pg_num: 16            # grows with data (autoscaler); pg_num_min keeps it off the 32 floor
+k3s_ceph_rbd_image_features: layering   # what the boards' 5.10 kernel (krbd) maps safely
+k3s_ceph_rbd_user: k3s-rbd              # client.<name>, profile rbd on the pool
+k3s_ceph_cephfs_user: k3s-cephfs        # client.<name>, rw on /volumes/<subvolumegroup>
+k3s_ceph_cephfs_subvolumegroup: csi
+k3s_rbd_storage_class: "{{ site_rbd_storage_class }}"         # ReadWriteOnce block volumes
+k3s_cephfs_storage_class: "{{ site_cephfs_storage_class }}"   # ReadWriteMany shared filesystem
+k3s_default_storage_class: "{{ k3s_rbd_storage_class }}"   # local-path stays, not default

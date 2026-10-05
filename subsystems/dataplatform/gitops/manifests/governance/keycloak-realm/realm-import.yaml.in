@@ -1,0 +1,600 @@
+# The realm <%= dataplatform_keycloak_realm %>: groups (<%= site_admin_group %> administers the realm in
+# its own console, /admin/<%= dataplatform_keycloak_realm %>/console), one client per platform, the
+# first user (admin, in <%= site_admin_group %>) and the iam-sync service account.
+#
+# This file is the only definition of the realm:
+# - the Keycloak operator imports it once, when the realm does not exist yet
+#   (a KeycloakRealmImport never overwrites a realm);
+# - make dataplatform-iam reads it and converges the running realm: realm
+#   settings, clients (updated in place, protocol mappers included) and groups
+#   (only created). Users and memberships are managed in the Keycloak console.
+#
+# Signing keys: exactly one certificate (rsa-generated); the encryption key is
+# disabled. Ceph RGW trusts the realm by that certificate's SHA-1 thumbprint,
+# so the key providers are never managed afterwards and the realm is never
+# re-created (make dataplatform-iam refreshes the thumbprint when needed).
+# Every client gets the groups claim (short names). Tokens of data-cli carry
+# the audience trino; RGW accepts tokens of data-cli, spark and jupyterhub (azp).
+apiVersion: k8s.keycloak.org/v2beta1
+kind: KeycloakRealmImport
+metadata:
+  name: <%= dataplatform_keycloak_realm %>
+spec:
+  keycloakCRName: keycloak
+  placeholders:
+    ARGOCD_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: argocd
+    GRAFANA_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: grafana
+    OPENBAO_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: openbao
+    SMOKE_TEST_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: smoke-test
+    TRINO_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: trino
+    JUPYTERHUB_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: jupyterhub
+    IAM_SYNC_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: iam-sync
+    S3BROWSER_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: s3browser
+    VMUI_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: vmui
+    METACATALOG_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: metacatalog
+    METACATALOG_PROVISIONER_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: metacatalog-provisioner
+    ADMIN_PASSWORD:
+      secret:
+        name: keycloak-realm-secrets
+        key: admin-password
+  realm:
+    realm: <%= dataplatform_keycloak_realm %>
+    displayName: Data platform
+    enabled: true
+    sslRequired: external
+    registrationAllowed: false
+    loginWithEmailAllowed: true
+    duplicateEmailsAllowed: false
+    resetPasswordAllowed: false
+    bruteForceProtected: true
+    accessTokenLifespan: 3600
+    ssoSessionIdleTimeout: 28800
+    ssoSessionMaxLifespan: 43200
+    groups:
+    - name: <%= site_admin_group %>
+      clientRoles:
+        realm-management:
+        - realm-admin
+    - name: <%= site_engineer_group %>
+    - name: <%= site_analyst_group %>
+    clients:
+    - clientId: argocd
+      name: Argo CD
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${ARGOCD_SECRET}
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: false
+      redirectUris:
+      - https://argocd.<%= dataplatform_domain %>/auth/callback
+      - http://localhost:8085/auth/callback
+      webOrigins:
+      - +
+      attributes:
+        pkce.code.challenge.method: S256
+        post.logout.redirect.uris: https://argocd.<%= dataplatform_domain %>/*
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+    - clientId: grafana
+      name: Grafana
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${GRAFANA_SECRET}
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: false
+      redirectUris:
+      - https://grafana.<%= dataplatform_domain %>/login/generic_oauth
+      webOrigins:
+      - +
+      attributes:
+        pkce.code.challenge.method: S256
+        post.logout.redirect.uris: https://grafana.<%= dataplatform_domain %>/*
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+    - clientId: openbao
+      name: OpenBao
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${OPENBAO_SECRET}
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: false
+      redirectUris:
+      - https://openbao.<%= dataplatform_domain %>/ui/vault/auth/oidc/oidc/callback
+      - http://localhost:8250/oidc/callback
+      webOrigins:
+      - +
+      attributes:
+        pkce.code.challenge.method: S256
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+    - clientId: trino
+      name: Trino
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${TRINO_SECRET}
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: false
+      redirectUris:
+      - https://trino.<%= dataplatform_domain %>/oauth2/callback
+      webOrigins:
+      - +
+      attributes:
+        pkce.code.challenge.method: ''
+        post.logout.redirect.uris: https://trino.<%= dataplatform_domain %>/*
+        # a JDBC login (DBeaver) lasts as long as this token: a working day
+        access.token.lifespan: '43200'
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+      - name: audience-trino
+        protocol: openid-connect
+        protocolMapper: oidc-audience-mapper
+        config:
+          included.client.audience: trino
+          id.token.claim: 'false'
+          access.token.claim: 'true'
+          introspection.token.claim: 'true'
+    - clientId: jupyterhub
+      name: JupyterHub
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${JUPYTERHUB_SECRET}
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: false
+      redirectUris:
+      - https://jupyter.<%= dataplatform_domain %>/hub/oauth_callback
+      webOrigins:
+      - +
+      attributes:
+        post.logout.redirect.uris: https://jupyter.<%= dataplatform_domain %>/*
+        access.token.lifespan: '43200'    # the hub hands the token to the notebook server: a session's worth
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+      - name: audience-trino
+        protocol: openid-connect
+        protocolMapper: oidc-audience-mapper
+        config:
+          included.client.audience: trino
+          id.token.claim: 'false'
+          access.token.claim: 'true'
+          introspection.token.claim: 'true'
+    - clientId: s3browser
+      name: S3 browser (administrators)
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${S3BROWSER_SECRET}
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: false
+      redirectUris:
+      - https://s3browser.<%= dataplatform_domain %>/callback
+      webOrigins:
+      - +
+      attributes:
+        pkce.code.challenge.method: S256
+        post.logout.redirect.uris: https://s3browser.<%= dataplatform_domain %>/logged-out
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+    # oauth2-proxy in front of VictoriaMetrics' UI (manifests/observability/vmui):
+    # only <%= site_admin_group %> get in (--allowed-group, from the groups claim)
+    - clientId: vmui
+      name: VictoriaMetrics UI (administrators)
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${VMUI_SECRET}
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: false
+      redirectUris:
+      - https://vmui.<%= dataplatform_domain %>/oauth2/callback
+      webOrigins:
+      - +
+      attributes:
+        pkce.code.challenge.method: S256
+        post.logout.redirect.uris: https://vmui.<%= dataplatform_domain %>/*
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+      # oauth2-proxy's keycloak-oidc provider checks the access token's audience
+      - name: audience-vmui
+        protocol: openid-connect
+        protocolMapper: oidc-audience-mapper
+        config:
+          included.client.audience: vmui
+          id.token.claim: 'false'
+          access.token.claim: 'true'
+          introspection.token.claim: 'true'
+    # Meta Catalog (manifests/governance/metacatalog) logs users in itself
+    # (Spring Security, authorization code with PKCE S256), behind
+    # oauth2-proxy, which logs in with the same client and lets only
+    # <%= site_admin_group %> and <%= site_engineer_group %> through. API callers send tokens
+    # with the audience metacatalog (data-cli, smoke-test).
+    - clientId: metacatalog
+      name: Meta Catalog
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${METACATALOG_SECRET}
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: false
+      redirectUris:
+      - https://metacatalog.<%= dataplatform_domain %>/login/oauth2/code/metacatalog
+      # oauth2-proxy in front of it (metacatalog-proxy.yaml): its own login
+      - https://metacatalog.<%= dataplatform_domain %>/oauth2/callback
+      webOrigins:
+      - +
+      attributes:
+        pkce.code.challenge.method: S256
+        post.logout.redirect.uris: https://metacatalog.<%= dataplatform_domain %>/ui
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+    # Meta Catalog's provisioning scripts (manifests/governance/metacatalog/
+    # provisioning) create the medallion lakehouses' schemas and tables in
+    # Trino as this client's service account, service-account-metacatalog-
+    # provisioner: access.yaml grants it rw on lakehouse/. No realm roles.
+    - clientId: metacatalog-provisioner
+      name: Meta Catalog provisioning (service account)
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${METACATALOG_PROVISIONER_SECRET}
+      standardFlowEnabled: false
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: true
+      protocolMappers:
+      - name: audience-trino
+        protocol: openid-connect
+        protocolMapper: oidc-audience-mapper
+        config:
+          included.client.audience: trino
+          id.token.claim: 'false'
+          access.token.claim: 'true'
+          introspection.token.claim: 'true'
+    - clientId: data-cli
+      name: Command-line tools (Trino CLI, S3 single sign-on)
+      enabled: true
+      protocol: openid-connect
+      publicClient: true
+      # the browser flow (PKCE, loopback) of the scripts' -l <user>: a fresh
+      # login as that user (prompt=login), whatever session the browser has
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      redirectUris:
+      - http://127.0.0.1:18765/callback
+      attributes:
+        pkce.code.challenge.method: S256
+        oauth2.device.authorization.grant.enabled: 'true'
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+      - name: audience-trino
+        protocol: openid-connect
+        protocolMapper: oidc-audience-mapper
+        config:
+          included.client.audience: trino
+          id.token.claim: 'false'
+          access.token.claim: 'true'
+          introspection.token.claim: 'true'
+      - name: audience-metacatalog
+        protocol: openid-connect
+        protocolMapper: oidc-audience-mapper
+        config:
+          included.client.audience: metacatalog
+          id.token.claim: 'false'
+          access.token.claim: 'true'
+          introspection.token.claim: 'true'
+    - clientId: spark
+      name: Spark jobs (web identity token)
+      enabled: true
+      protocol: openid-connect
+      publicClient: true
+      # the browser flow (PKCE, loopback) of the scripts' -l <user>: a fresh
+      # login as that user (prompt=login), whatever session the browser has
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      redirectUris:
+      - http://127.0.0.1:18765/callback
+      attributes:
+        pkce.code.challenge.method: S256
+        oauth2.device.authorization.grant.enabled: 'true'
+        access.token.lifespan: '43200'
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+    - clientId: kubernetes
+      name: 'Kubernetes API (kubectl oidc-login: browser or device)'
+      enabled: true
+      protocol: openid-connect
+      publicClient: true
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      redirectUris:
+      - http://localhost:8000
+      - http://localhost:18000
+      attributes:
+        pkce.code.challenge.method: S256
+        oauth2.device.authorization.grant.enabled: 'true'
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+    - clientId: smoke-test
+      name: 'Smoke test (make dataplatform-smoke-test): password grant for its temporary users'
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${SMOKE_TEST_SECRET}
+      standardFlowEnabled: false
+      directAccessGrantsEnabled: true
+      serviceAccountsEnabled: false
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+      - name: audience-trino
+        protocol: openid-connect
+        protocolMapper: oidc-audience-mapper
+        config:
+          included.client.audience: trino
+          id.token.claim: 'false'
+          access.token.claim: 'true'
+          introspection.token.claim: 'true'
+      - name: audience-kubernetes
+        protocol: openid-connect
+        protocolMapper: oidc-audience-mapper
+        config:
+          included.client.audience: kubernetes
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          introspection.token.claim: 'true'
+      - name: audience-metacatalog
+        protocol: openid-connect
+        protocolMapper: oidc-audience-mapper
+        config:
+          included.client.audience: metacatalog
+          id.token.claim: 'false'
+          access.token.claim: 'true'
+          introspection.token.claim: 'true'
+    - clientId: iam-sync
+      name: iam-sync (reads groups and members)
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${IAM_SYNC_SECRET}
+      standardFlowEnabled: false
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: true
+      fullScopeAllowed: true
+    users:
+    - username: admin
+      enabled: true
+      email: admin@<%= dataplatform_domain %>
+      emailVerified: true
+      firstName: Platform
+      lastName: Administrator
+      groups:
+      - /<%= site_admin_group %>
+      credentials:
+      - type: password
+        value: ${ADMIN_PASSWORD}
+        temporary: false
+    - username: service-account-iam-sync
+      enabled: true
+      serviceAccountClientId: iam-sync
+      clientRoles:
+        realm-management:
+        - view-users
+        - query-groups
+        - query-users
+    - username: service-account-metacatalog-provisioner
+      enabled: true
+      serviceAccountClientId: metacatalog-provisioner
+    components:
+      org.keycloak.keys.KeyProvider:
+      - name: rsa-generated
+        providerId: rsa-generated
+        subComponents: {}
+        config:
+          priority:
+          - '100'
+          algorithm:
+          - RS256
+          keySize:
+          - '2048'
+          enabled:
+          - 'true'
+          active:
+          - 'true'
+      - name: rsa-enc-generated
+        providerId: rsa-enc-generated
+        subComponents: {}
+        config:
+          priority:
+          - '100'
+          algorithm:
+          - RSA-OAEP
+          keySize:
+          - '2048'
+          enabled:
+          - 'false'
+          active:
+          - 'false'
+      - name: hmac-generated-hs512
+        providerId: hmac-generated
+        subComponents: {}
+        config:
+          priority:
+          - '100'
+          algorithm:
+          - HS512
+          enabled:
+          - 'true'
+          active:
+          - 'true'
+      - name: aes-generated
+        providerId: aes-generated
+        subComponents: {}
+        config:
+          priority:
+          - '100'
+          enabled:
+          - 'true'
+          active:
+          - 'true'

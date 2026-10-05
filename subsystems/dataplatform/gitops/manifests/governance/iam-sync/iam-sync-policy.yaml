@@ -1,0 +1,34 @@
+# The fence around iam-sync's rights (iam-sync-rbac.yaml): every object it
+# creates, changes or deletes must be one of two named objects of compute.
+# Anything else (another Secret of compute, a RoleBinding to a wider role) is
+# refused by the API server, whatever the Role says.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dataplatform-iam-sync-scope
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: ["*"]
+  matchConditions:
+    - name: iam-sync
+      expression: request.userInfo.username == 'system:serviceaccount:governance:iam-sync'
+  validations:
+    - expression: >-
+        request.namespace == 'compute'
+        && ((request.kind.group == '' && request.kind.kind == 'ConfigMap' && request.name == 'trino-iam')
+            || (request.kind.group == 'rbac.authorization.k8s.io' && request.kind.kind == 'RoleBinding'
+                && request.name == 'spark-submitter'))
+      message: iam-sync may only write compute/trino-iam and the RoleBinding compute/spark-submitter
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dataplatform-iam-sync-scope
+spec:
+  policyName: dataplatform-iam-sync-scope
+  validationActions: [Deny]

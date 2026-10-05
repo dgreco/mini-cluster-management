@@ -1,0 +1,24 @@
+# Client secret of the Keycloak client argocd, referenced from
+# oidc.config as $argocd-oidc:client-secret. Argo CD only reads Secrets that
+# carry the label app.kubernetes.io/part-of: argocd.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: argocd-oidc
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: openbao
+    kind: SecretStore
+  target:
+    name: argocd-oidc
+    template:
+      mergePolicy: Merge
+      metadata:
+        labels:
+          app.kubernetes.io/part-of: argocd
+  data:
+    - secretKey: client-secret
+      remoteRef:
+        key: dataplatform/argocd/argocd-oidc
+        property: client-secret

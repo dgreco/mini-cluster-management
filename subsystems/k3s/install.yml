@@ -1,0 +1,12 @@
+---
+# Full k3s installation, idempotent end to end. Each step is also runnable alone.
+- name: Preflight
+  ansible.builtin.import_playbook: preflight.yml
+- name: Servers
+  ansible.builtin.import_playbook: servers.yml
+- name: Agents
+  ansible.builtin.import_playbook: agents.yml
+- name: Kubeconfig
+  ansible.builtin.import_playbook: kubeconfig.yml
+- name: Ceph storage
+  ansible.builtin.import_playbook: storage.yml

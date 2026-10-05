@@ -1,0 +1,112 @@
+---
+# Task-file hook included by cluster/rolling-reboot.yml after a node is back on
+# SSH (and after the Ceph hook): wait until the node and its ceph-csi driver pods
+# are Ready, uncordon it, then wait until the whole k3s cluster is healthy
+# before the next node goes. Also used to put back a node whose enter hooks
+# failed or never ran, so it does not rely on anything they set.
+- name: Find a k3s server that answers
+  ansible.builtin.include_tasks: pick-server.yml
+
+- name: Bring the node back
+  when: k3s_maint_member
+  block:
+    # Right after the reboot the API may still show the status from before it:
+    # compare the boot ID the kubelet reports with the node's own.
+    - name: Boot ID and boot time of {{ ansible_facts['nodename'] }}
+      ansible.builtin.shell: echo "$(cat /proc/sys/kernel/random/boot_id) $(( $(date +%s) - $(cut -d. -f1 /proc/uptime) ))"
+      register: k3s_maint_boot
+      changed_when: false
+
+    - name: Wait until Ready after the reboot - {{ ansible_facts['nodename'] }}
+      ansible.builtin.shell: |
+        end=$((SECONDS + {{ k3s_ready_timeout }}))
+        until [ "$(/usr/local/bin/k3s kubectl get node {{ ansible_facts['nodename'] }} \
+                   -o 'jsonpath={.status.nodeInfo.bootID} {.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" \
+                = "{{ k3s_maint_boot.stdout.split()[0] }} True" ]; do
+          if [ $SECONDS -ge $end ]; then
+            /usr/local/bin/k3s kubectl get node {{ ansible_facts['nodename'] }}
+            exit 1
+          fi
+          sleep 5
+        done
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ k3s_maint_server }}"
+      changed_when: false
+
+    # Pods with Ceph volumes cannot start on the node without these.
+    # Ready, with every container started after the boot (not a stale status).
+    - name: Wait for the ceph-csi driver pods on the node
+      ansible.builtin.shell: |
+        boot={{ k3s_maint_boot.stdout.split()[1] }}
+        # one line per pod: Ready status, then the start time of each container
+        jp='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{" "}'
+        jp+='{range .status.containerStatuses[*]}{.state.running.startedAt}{" "}{end}{"\n"}{end}'
+        fresh() {  # $1: namespace
+          local out ready started
+          out=$(/usr/local/bin/k3s kubectl -n "$1" get pods -l component=nodeplugin \
+                  --field-selector spec.nodeName={{ ansible_facts['nodename'] }} -o "jsonpath=$jp" 2>/dev/null)
+          [ -n "$out" ] || return 1
+          while read -r ready started; do
+            [ "$ready" = True ] || return 1
+            for t in $started; do
+              [ "$(date -d "$t" +%s)" -ge "$boot" ] || return 1
+            done
+          done <<<"$out"
+        }
+        end=$((SECONDS + {{ k3s_ready_timeout }}))
+        for ns in ceph-csi-rbd ceph-csi-cephfs; do
+          until fresh $ns; do
+            if [ $SECONDS -ge $end ]; then
+              echo "ceph-csi node plugin in $ns not running on {{ ansible_facts['nodename'] }} since the reboot"
+              exit 1
+            fi
+            sleep 5
+          done
+        done
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ k3s_maint_server }}"
+      changed_when: false
+      when: k3s_ceph_storage_enabled | bool
+
+    - name: Uncordon {{ ansible_facts['nodename'] }}
+      ansible.builtin.command: /usr/local/bin/k3s kubectl uncordon {{ ansible_facts['nodename'] }}
+      delegate_to: "{{ k3s_maint_server }}"
+      changed_when: true
+
+    # A server: its own API server answers only when its etcd member has
+    # caught up (readyz: etcd, etcd-readiness); the next server must not go
+    # before that.
+    - name: Wait until the etcd member on the node is healthy
+      ansible.builtin.shell: |
+        set -o pipefail
+        end=$((SECONDS + {{ k3s_ready_timeout }}))
+        until out=$(/usr/local/bin/k3s kubectl get --raw '/readyz?verbose' 2>/dev/null) \
+              && grep -q '^\[+\]etcd ok' <<<"$out" && grep -q '^\[+\]etcd-readiness ok' <<<"$out"; do
+          if [ $SECONDS -ge $end ]; then
+            echo "${out:-no answer from the API server on {{ inventory_hostname }}}" | grep -iE 'etcd|readyz' >&2
+            exit 1
+          fi
+          sleep 5
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: inventory_hostname in groups['k3s_servers']
+
+    - name: Wait until the API server and every node are healthy
+      ansible.builtin.shell: |
+        end=$((SECONDS + {{ k3s_ready_timeout }}))
+        until [ "$(/usr/local/bin/k3s kubectl get --raw /readyz 2>/dev/null)" = ok ] \
+              && /usr/local/bin/k3s kubectl wait node --all --for=condition=Ready --timeout=10s >/dev/null 2>&1; do
+          if [ $SECONDS -ge $end ]; then
+            /usr/local/bin/k3s kubectl get nodes
+            exit 1
+          fi
+          sleep 5
+        done
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ k3s_maint_server }}"
+      changed_when: false

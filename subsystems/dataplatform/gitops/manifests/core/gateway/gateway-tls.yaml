@@ -1,0 +1,26 @@
+# The wildcard certificate *.data.example.org. lego renews it on the first
+# k3s server (make dataplatform-cert, daily timer) and writes it to OpenBao;
+# this copies it into the Secret the Gateway serves.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: gateway-tls
+  namespace: core
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: openbao
+    kind: SecretStore
+  target:
+    name: gateway-tls
+    template:
+      type: kubernetes.io/tls
+  data:
+    - secretKey: tls.crt
+      remoteRef:
+        key: dataplatform/core/gateway-tls
+        property: tls.crt
+    - secretKey: tls.key
+      remoteRef:
+        key: dataplatform/core/gateway-tls
+        property: tls.key

@@ -1,0 +1,34 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: governance-openbao-snapshot
+  namespace: argocd
+  annotations:
+    # the last wave: Argo CD rates a CronJob whose last run failed Degraded
+    # (and one still running Progressing), and the root app waits for each
+    # wave to be healthy before the next. Here a failed or waiting snapshot
+    # shows, but holds no other Application back (after a power-on it did).
+    argocd.argoproj.io/sync-wave: "3"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: dataplatform
+  source:
+    repoURL: <%= dataplatform_git_repo %>
+    targetRevision: <%= dataplatform_git_revision %>
+    path: subsystems/dataplatform/gitops/manifests/governance/openbao-snapshot
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: governance
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        maxDuration: 5m
+        factor: 2

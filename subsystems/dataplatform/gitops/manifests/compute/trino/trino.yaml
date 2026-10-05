@@ -1,0 +1,87 @@
+# Trino 481 (Stackable): one coordinator, four workers.
+# - TLS inside the cluster from the secret-operator's tls class (Trino only
+#   authenticates over HTTPS); the Gateway re-encrypts (trino-httproute.yaml).
+# - Login with Keycloak (trino-authentication.yaml); groups from the file
+#   provider (trino-group-provider.yaml + ConfigMap trino-iam from iam-sync).
+# - Data access is decided by Ceph RGW through the STS role of the user's
+#   group (trino-catalog-lakehouse.yaml). Trino's own file-based access
+#   control (rules.json, written by iam-sync from the catalog's schema
+#   locations) only keeps the catalog entries of a schema to the group whose
+#   bucket holds it: others may query, not drop, rename or create in it.
+apiVersion: trino.stackable.tech/v1alpha1
+kind: TrinoCluster
+metadata:
+  name: trino
+  namespace: compute
+spec:
+  image:
+    productVersion: "481"
+  clusterConfig:
+    catalogLabelSelector:
+      matchLabels:
+        trino: trino
+    tls:
+      serverSecretClass: tls
+      internalSecretClass: tls
+    authentication:
+      - authenticationClass: keycloak
+        oidc:
+          clientCredentialsSecret: trino-oidc
+    # product logs: a Vector agent per pod -> the aggregator -> VictoriaLogs
+    # (tenant Stackable); see helm-values/vector-aggregator-values.yaml
+    vectorAggregatorConfigMapName: vector-aggregator-discovery
+  coordinators:
+    roleConfig:
+      listenerClass: cluster-internal
+    configOverrides:
+      config.properties:
+        # the Gateway sets X-Forwarded-*: OAuth2 redirects use the public URL
+        http-server.process-forwarded: "true"
+        # A bearer token is verified by its signature, issuer and audience (as
+        # Ceph STS does), not through Keycloak's userinfo endpoint, which wants
+        # a live SSO session: a JupyterHub logout ends that session while the
+        # token the hub gave the notebook server is still valid for hours.
+        http-server.authentication.oauth2.oidc.use-userinfo-endpoint: "false"
+      access-control.properties:
+        access-control.name: file
+        security.config-file: /stackable/mount/iam/rules.json
+        security.refresh-period: 30s
+    config:
+      resources:
+        cpu: {min: 500m, max: "2"}
+        memory: {limit: 4Gi}
+      logging:
+        enableVectorAgent: true
+    podOverrides: &iam
+      spec:
+        volumes:
+          - name: iam
+            configMap:
+              name: trino-iam
+          - name: group-provider
+            configMap:
+              name: trino-group-provider
+        containers:
+          - name: trino
+            volumeMounts:
+              - name: iam
+                mountPath: /stackable/mount/iam
+                readOnly: true
+              - name: group-provider
+                mountPath: /stackable/rwconfig/group-provider.properties
+                subPath: group-provider.properties
+                readOnly: true
+    roleGroups:
+      default:
+        replicas: 1
+  workers:
+    config:
+      resources:
+        cpu: {min: 500m, max: "3"}
+        memory: {limit: 6Gi}
+      logging:
+        enableVectorAgent: true
+    podOverrides: *iam
+    roleGroups:
+      default:
+        replicas: 4

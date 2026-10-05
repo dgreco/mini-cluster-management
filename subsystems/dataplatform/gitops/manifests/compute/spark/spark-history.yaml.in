@@ -1,0 +1,34 @@
+# Spark History Server: reads the event logs every job writes to
+# s3://<%= dataplatform_bucket %>/system/spark-events/ (static RGW user spark). Not published on the Gateway: users open
+# it with kubectl port-forward (their Keycloak login, see spark-rbac.yaml):
+#   kubectl -n compute port-forward svc/spark-history-node 18080
+apiVersion: spark.stackable.tech/v1alpha1
+kind: SparkHistoryServer
+metadata:
+  name: spark-history
+  namespace: compute
+spec:
+  image:
+    productVersion: "4.1.2"
+  logFileDirectory:
+    s3:
+      prefix: system/spark-events/
+      bucket:
+        reference: spark-logs
+  # product logs: Vector agent -> aggregator -> VictoriaLogs (tenant Stackable)
+  vectorAggregatorConfigMapName: vector-aggregator-discovery
+  sparkConf:
+    spark.history.fs.cleaner.enabled: "true"
+    spark.history.fs.cleaner.maxAge: 30d
+  nodes:
+    roleConfig:
+      listenerClass: cluster-internal
+    config:
+      resources:
+        cpu: {min: 100m, max: "1"}
+        memory: {limit: 1Gi}
+      logging:
+        enableVectorAgent: true
+    roleGroups:
+      default:
+        replicas: 1

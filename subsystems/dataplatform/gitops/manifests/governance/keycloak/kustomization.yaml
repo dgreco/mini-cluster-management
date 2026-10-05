@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: governance
+resources:
+  - keycloak-secrets.yaml
+  - keycloak-db.yaml
+  - keycloak-db-objectstore.yaml
+  - keycloak-backup.yaml
+  - keycloak.yaml
+  - keycloak-httproute.yaml

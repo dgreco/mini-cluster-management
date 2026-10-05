@@ -1,0 +1,140 @@
+---
+# Upgrade k3s one node at a time, with the same care as a rolling reboot:
+#   make k3s-upgrade ARGS="-e k3s_version=v1.36.5+k3s1"
+# Pre-flight: every node Ready, the API healthy, an etcd snapshot (the k3s
+# rolling-start hook). Per server, then per agent: the data platform's jobs
+# on the node finish, the node is drained, the installer runs with the new
+# version (k3s_node), the node's kubelet must report that version and be
+# Ready, then the exit hooks (CSI plugins, uncordon, the platform whole).
+# Afterwards, set k3s_version in inventory/group_vars/k3s.yml to the same
+# value, or the next make k3s-install would downgrade.
+- name: Pre-flight
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  tasks:
+    - name: Running version
+      ansible.builtin.command: /usr/local/bin/k3s --version
+      register: k3s_upgrade_running
+      changed_when: false
+      check_mode: false
+
+    - name: A full version is given, newer than the running one
+      ansible.builtin.assert:
+        that:
+          - k3s_version is match('^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$')
+          - k3s_version not in k3s_upgrade_running.stdout
+          - (k3s_version | regex_replace('\+.*$', '')) is version(k3s_upgrade_running.stdout | regex_search('v[0-9]+\.[0-9]+\.[0-9]+'), '>')
+        fail_msg: >-
+          pass -e k3s_version=vX.Y.Z+k3sN newer than the running
+          {{ k3s_upgrade_running.stdout | regex_search('v[0-9.]+\+k3s[0-9]+') }}
+        quiet: true
+
+    - name: Clear the order requests of the hooks
+      ansible.builtin.set_fact:
+        rolling_first: []
+        rolling_last: []
+      delegate_to: localhost
+      delegate_facts: true
+
+    - name: Every node Ready, the API healthy, an etcd snapshot
+      ansible.builtin.include_tasks: hooks/rolling-start.yml
+
+- name: Upgrade the servers, one at a time
+  hosts: k3s_servers
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Upgrade {{ inventory_hostname }}
+      block:
+        - name: Let the data platform's Spark jobs on the node finish
+          ansible.builtin.include_tasks: ../dataplatform/hooks/node-enter.yml
+          when: inventory_hostname in groups['dataplatform'] | default([])
+
+        - name: Drain the node
+          ansible.builtin.include_tasks: hooks/node-enter.yml
+
+        - name: Install {{ k3s_version }}
+          ansible.builtin.include_role:
+            name: k3s_node
+          vars:
+            k3s_node_role: server
+
+        - name: The kubelet reports {{ k3s_version }}
+          ansible.builtin.command: >-
+            /usr/local/bin/k3s kubectl get node {{ ansible_facts['nodename'] }}
+            -o 'jsonpath={.status.nodeInfo.kubeletVersion}'
+          register: k3s_upgrade_kubelet
+          changed_when: false
+          retries: 30
+          delay: 10
+          until: k3s_upgrade_kubelet.stdout == k3s_version
+
+        - name: Bring the node back
+          ansible.builtin.include_tasks: hooks/node-exit.yml
+
+        - name: Wait for the data platform
+          ansible.builtin.include_tasks: ../dataplatform/hooks/node-exit.yml
+          when: inventory_hostname in groups['dataplatform'] | default([])
+      rescue:
+        - name: Put the node back into service
+          ansible.builtin.include_tasks: hooks/node-exit.yml
+
+        - name: Stop the upgrade
+          ansible.builtin.fail:
+            msg: "Stopped at {{ inventory_hostname }}; it is back in service. Nodes after it were not touched."
+
+- name: Upgrade the agents, one at a time
+  hosts: k3s_agents
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Upgrade {{ inventory_hostname }}
+      block:
+        - name: Let the data platform's Spark jobs on the node finish
+          ansible.builtin.include_tasks: ../dataplatform/hooks/node-enter.yml
+          when: inventory_hostname in groups['dataplatform'] | default([])
+
+        - name: Drain the node
+          ansible.builtin.include_tasks: hooks/node-enter.yml
+
+        - name: Install {{ k3s_version }}
+          ansible.builtin.include_role:
+            name: k3s_node
+          vars:
+            k3s_node_role: agent
+
+        - name: The kubelet reports {{ k3s_version }}
+          ansible.builtin.command: >-
+            /usr/local/bin/k3s kubectl get node {{ ansible_facts['nodename'] }}
+            -o 'jsonpath={.status.nodeInfo.kubeletVersion}'
+          delegate_to: "{{ k3s_maint_server }}"
+          register: k3s_upgrade_kubelet
+          changed_when: false
+          retries: 30
+          delay: 10
+          until: k3s_upgrade_kubelet.stdout == k3s_version
+
+        - name: Bring the node back
+          ansible.builtin.include_tasks: hooks/node-exit.yml
+
+        - name: Wait for the data platform
+          ansible.builtin.include_tasks: ../dataplatform/hooks/node-exit.yml
+          when: inventory_hostname in groups['dataplatform'] | default([])
+      rescue:
+        - name: Put the node back into service
+          ansible.builtin.include_tasks: hooks/node-exit.yml
+
+        - name: Stop the upgrade
+          ansible.builtin.fail:
+            msg: "Stopped at {{ inventory_hostname }}; it is back in service. Nodes after it were not touched."
+
+- name: Summary
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  tasks:
+    - name: Show the nodes
+      ansible.builtin.include_tasks: hooks/rolling-end.yml
+
+    - name: Remember the inventory
+      ansible.builtin.debug:
+        msg: "Set k3s_version: {{ k3s_version }} in inventory/group_vars/k3s.yml now, or the next make k3s-install downgrades."

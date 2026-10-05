@@ -1,0 +1,34 @@
+# PostgreSQL of Keycloak: two instances, so a drain switches over instead of
+# blocking (a single instance's PodDisruptionBudget stops the rolling reboot).
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: keycloak-db
+spec:
+  instances: 2
+  storage:
+    storageClass: <%= dataplatform_storage_class %>
+    size: 5Gi
+  bootstrap:
+    initdb:
+      database: keycloak
+      owner: keycloak
+      secret:
+        name: keycloak-db
+  # Continuous WAL archiving and the nightly base backups go through the
+  # Barman Cloud plugin to the ObjectStore keycloak-db (keycloak-db-objectstore.yaml):
+  # s3://<%= site_backup_bucket %>/cnpg/keycloak-db/keycloak-db/, with the backup key.
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: keycloak-db
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+    limits: {memory: 512Mi}
+  monitoring:
+    enablePodMonitor: false
+  inheritedMetadata:
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9187"

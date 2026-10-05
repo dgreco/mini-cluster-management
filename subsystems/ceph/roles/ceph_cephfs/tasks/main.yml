@@ -1,0 +1,123 @@
+---
+# CephFS volume (pools + MDS via the orchestrator) and a client key. Admin host.
+- name: List filesystems
+  ansible.builtin.command: cephadm shell -- ceph fs ls --format json
+  register: ceph_cephfs_fs_ls
+  changed_when: false
+
+- name: Create the volume (pools, filesystem, MDS service) {{ ceph_cephfs_name }}
+  ansible.builtin.command: >-
+    cephadm shell -- ceph fs volume create {{ ceph_cephfs_name }} --placement=label:mds
+  when: ceph_cephfs_name not in (ceph_cephfs_fs_ls.stdout | from_json | map(attribute='name') | list)
+  changed_when: true
+
+- name: Read filesystem map
+  ansible.builtin.command: cephadm shell -- ceph fs get {{ ceph_cephfs_name }} --format json
+  register: ceph_cephfs_fs_get
+  changed_when: false
+  retries: 10
+  delay: 6
+  until: ceph_cephfs_fs_get.rc == 0
+
+- name: Set max_mds
+  ansible.builtin.command: cephadm shell -- ceph fs set {{ ceph_cephfs_name }} max_mds {{ ceph_cephfs_max_mds }}
+  when: (ceph_cephfs_fs_get.stdout | from_json).mdsmap.max_mds | int != ceph_cephfs_max_mds | int
+  changed_when: true
+
+- name: Wait for an active MDS
+  ansible.builtin.command: cephadm shell -- ceph fs status {{ ceph_cephfs_name }} --format json
+  register: ceph_cephfs_fs_status
+  changed_when: false
+  retries: 40
+  delay: 15
+  until: (ceph_cephfs_fs_status.stdout | from_json).mdsmap | selectattr('state', 'equalto', 'active') | list | length > 0
+
+# ---------------------------------------------------------------- client key ----
+# Squid issues AES-256 CephX keys ("AgB...", 60 chars). The kernel client on the
+# boards (5.10 Rockchip) and Reef's mount.ceph only handle legacy AES-128 keys
+# ("AQ...", 40 chars), so with ceph_cephfs_client_key_type=aes the monitors must
+# (1) allow creating such keys and (2) accept aes for authentication in the mon
+# map. Service and preferred ciphers stay aes256k; only legacy clients use aes.
+- name: Allow legacy (AES-128) key creation on the monitors
+  ansible.builtin.include_role:
+    name: ceph_config
+  vars:
+    ceph_config_entries:
+      - { who: mon, name: mon_auth_allow_insecure_key, value: "true" }
+  when: ceph_cephfs_client_key_type == 'aes'
+
+- name: Read monitor map
+  ansible.builtin.command: cephadm shell -- ceph mon dump --format json
+  register: ceph_cephfs_mon_dump_ciphers
+  changed_when: false
+  when: ceph_cephfs_client_key_type == 'aes'
+
+- name: Current allowed ciphers
+  ansible.builtin.set_fact:
+    ceph_cephfs_mon_allowed_ciphers: >-
+      {{ (ceph_cephfs_mon_dump_ciphers.stdout | from_json).auth_allowed_ciphers | map(attribute='name') | list
+         if (ceph_cephfs_mon_dump_ciphers.stdout | from_json).auth_allowed_ciphers is not string
+         else (ceph_cephfs_mon_dump_ciphers.stdout | from_json).auth_allowed_ciphers | split(',') | map('trim') | list }}
+  when: ceph_cephfs_client_key_type == 'aes'
+
+- name: Allow legacy (AES-128) authentication in the monitor map
+  ansible.builtin.command: cephadm shell -- ceph mon set auth_allowed_ciphers {{ (ceph_cephfs_mon_allowed_ciphers + ['aes']) | unique | join(',') }}
+  when:
+    - ceph_cephfs_client_key_type == 'aes'
+    - "'aes' not in ceph_cephfs_mon_allowed_ciphers"
+  changed_when: true
+
+- name: Check client key
+  ansible.builtin.command: cephadm shell -- ceph auth get-key client.{{ ceph_cephfs_client_name }}
+  register: ceph_cephfs_auth
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Drop a client key of the wrong type
+  ansible.builtin.command: cephadm shell -- ceph auth rm client.{{ ceph_cephfs_client_name }}
+  when:
+    - ceph_cephfs_auth.rc == 0
+    - ceph_cephfs_client_key_type == 'aes'
+    - not (ceph_cephfs_auth.stdout | trim) is match('^AQ.{38}$')
+  register: ceph_cephfs_auth_rm
+  changed_when: true
+
+- name: Create the client key - {{ 'client.' ~ ceph_cephfs_client_name ~ ' (' ~ ceph_cephfs_client_key_type ~ ' key, rw on /)' }}
+  ansible.builtin.command: >-
+    cephadm shell -- ceph auth get-or-create client.{{ ceph_cephfs_client_name }}
+    mon {{ ('allow r fsname=' ~ ceph_cephfs_name) | quote }}
+    mds {{ ('allow rw fsname=' ~ ceph_cephfs_name) | quote }}
+    osd {{ ('allow rw tag cephfs data=' ~ ceph_cephfs_name) | quote }}
+    --key_type {{ ceph_cephfs_client_key_type }}
+  when: ceph_cephfs_auth.rc != 0 or ceph_cephfs_auth_rm is changed
+  no_log: true
+  changed_when: true
+
+# The legacy key is a deliberate choice (kernel client), so silence the three
+# health warnings it raises. Sticky mutes survive the condition clearing.
+- name: Current health mutes
+  ansible.builtin.command: cephadm shell -- ceph health detail --format json
+  register: ceph_cephfs_health_json
+  changed_when: false
+  when: ceph_cephfs_client_key_type == 'aes'
+
+- name: Mute the insecure-key-type warnings
+  ansible.builtin.command: cephadm shell -- ceph health mute {{ item }} --sticky
+  loop:
+    - AUTH_INSECURE_CLIENT_KEY_TYPE
+    - AUTH_INSECURE_KEYS_ALLOWED
+    - AUTH_INSECURE_KEYS_CREATABLE
+  when:
+    - ceph_cephfs_client_key_type == 'aes'
+    - item not in ((ceph_cephfs_health_json.stdout | from_json).mutes | default([]) | map(attribute='code') | list)
+  changed_when: true
+
+- name: Filesystem status
+  ansible.builtin.command: cephadm shell -- ceph fs status {{ ceph_cephfs_name }}
+  register: ceph_cephfs_fs_status_text
+  changed_when: false
+
+- name: CephFS
+  ansible.builtin.debug:
+    msg: "{{ ceph_cephfs_fs_status_text.stdout_lines }}"

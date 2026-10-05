@@ -1,0 +1,4 @@
+# SSH host keys of the boards and the BMC (ansible.cfg pins them:
+# StrictHostKeyChecking=yes). Empty in the example: fill it in setup step 2 of
+# the README, with ssh-keyscan of every host of inventory/hosts.ini, once you
+# have checked the keys.

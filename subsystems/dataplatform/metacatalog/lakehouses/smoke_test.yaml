@@ -1,0 +1,74 @@
+# The smoke test's lakehouse (make dataplatform-smoke-test): Meta Catalog
+# creates every table and grants every directory, so the test writes and
+# reads tables of its own lakehouse instead of making any. Its policy is
+# shaped for the checks, not for a real medallion:
+#
+#   bronze   data-engineers read and write (eng_t: Trino writes it,
+#            spark_t: a Spark job writes it)
+#   silver   nobody
+#   gold     data-analysts read and write (ana_t)
+#
+# The smoke test loads and provisions it when it is missing, and authorizes it
+# on every run as its temporary member of platform-admins. The tables are
+# emptied at every run.
+entityType: "LakehouseType"
+values:
+  name: "smoke_test"
+  owner: "platform-admins"
+  storageRoot: "s3://dataplatform/lakehouse/smoke_test"
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+    - { id: "data-analysts", type: "GROUP" }
+  permissions:
+    - { name: "READ" }
+    - { name: "WRITE" }
+  grants:
+    - principals: ["data-engineers"]
+      permissions: ["READ", "WRITE"]
+      resources:
+        values: { layer: "bronze" }
+    - principals: ["data-analysts"]
+      permissions: ["READ", "WRITE"]
+      resources:
+        values: { layer: "gold" }
+
+parts:
+
+  - ref: "bronze"
+    entityType: "BronzeLayerType"
+    values: { name: "bronze" }
+    parts:
+      - ref: "eng_t"
+        entityType: "BronzeTableType"
+        values:
+          name: "eng_t"
+          sourceSystem: "smoke-test"
+          ingestion: "batch"
+          columns:
+            - { name: "x", type: "int" }
+      - ref: "spark_t"
+        entityType: "BronzeTableType"
+        values:
+          name: "spark_t"
+          sourceSystem: "smoke-test"
+          ingestion: "batch"
+          columns:
+            - { name: "id", type: "long" }
+
+  - ref: "silver"
+    entityType: "SilverLayerType"
+    values: { name: "silver" }
+    dependsOn: ["bronze"]
+
+  - ref: "gold"
+    entityType: "GoldLayerType"
+    values: { name: "gold" }
+    dependsOn: ["silver"]
+    parts:
+      - ref: "ana_t"
+        entityType: "GoldTableType"
+        values:
+          name: "ana_t"
+          businessOwner: "smoke-test"
+          columns:
+            - { name: "y", type: "int" }

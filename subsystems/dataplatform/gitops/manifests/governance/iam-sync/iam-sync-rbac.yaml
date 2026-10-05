@@ -1,0 +1,69 @@
+# What iam-sync may do: read the record of grants in governance (below), and
+# in compute write the ConfigMap trino-iam,
+# the Secret spark-catalog-logins (server-side apply, and delete when an immutable
+# field must change; never read) and the RoleBinding spark-submitter, whose
+# only allowed role is dataplatform-spark-submitter. The admission policy in
+# iam-sync-policy.yaml pins it to those three names.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: iam-sync
+  namespace: governance
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: iam-sync
+  namespace: compute
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, create, patch]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [rolebindings]
+    verbs: [get, create, patch]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    resourceNames: [dataplatform-spark-submitter]
+    verbs: [bind]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: iam-sync
+  namespace: compute
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: iam-sync
+subjects:
+  - kind: ServiceAccount
+    name: iam-sync
+    namespace: governance
+---
+# The record of grants (governance/metacatalog-grants, written by Meta
+# Catalog's authorize and reject): read only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: iam-sync-grants-reader
+  namespace: governance
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [metacatalog-grants]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: iam-sync-grants-reader
+  namespace: governance
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: iam-sync-grants-reader
+subjects:
+  - kind: ServiceAccount
+    name: iam-sync
+    namespace: governance

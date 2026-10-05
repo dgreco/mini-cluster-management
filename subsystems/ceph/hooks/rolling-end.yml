@@ -1,0 +1,29 @@
+---
+# Task-file hook included once by cluster/rolling-reboot.yml after the last
+# node: show the Ceph status and check that the S3 endpoint answers.
+- name: Is Ceph deployed?
+  ansible.builtin.stat:
+    path: /etc/ceph/ceph.conf
+  delegate_to: "{{ ceph_admin_host }}"
+  register: ceph_rolling_conf
+
+- name: Show Ceph and check S3
+  when: ceph_rolling_conf.stat.exists
+  block:
+    - name: Read the Ceph status
+      ansible.builtin.command: cephadm shell -- ceph -s
+      delegate_to: "{{ ceph_admin_host }}"
+      register: ceph_rolling_end
+      changed_when: false
+
+    - name: Ceph
+      ansible.builtin.debug:
+        msg: "{{ ceph_rolling_end.stdout_lines }}"
+
+    - name: The S3 endpoint answers
+      ansible.builtin.uri:
+        url: "{{ ceph_rgw_endpoint }}"
+        validate_certs: false
+      delegate_to: localhost
+      become: false
+      when: ceph_rgw_enabled | bool

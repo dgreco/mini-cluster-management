@@ -1,0 +1,11 @@
+---
+# ansible-lint configuration; run with `make lint`.
+profile: production
+offline: false # installs requirements.yml collections for the lint run
+
+exclude_paths:
+  - .ansible/
+  - .secrets/
+  - bench-results/
+  # Helm charts synced by Argo CD (Go templates, not Ansible YAML); make dataplatform-render checks them
+  - subsystems/dataplatform/gitops/

@@ -1,0 +1,57 @@
+# Keycloak 26.7, the identity provider of the whole platform (realm
+# <%= dataplatform_keycloak_realm %>, gitops/manifests/governance/keycloak-realm). Plain HTTP inside
+# the cluster; TLS ends at the Gateway, which forwards X-Forwarded-* headers.
+# Tokens always carry the public issuer https://keycloak.<%= dataplatform_domain %>/...
+# which Ceph RGW, Trino, Argo CD, Grafana, OpenBao and the Kubernetes API trust.
+apiVersion: k8s.keycloak.org/v2beta1
+kind: Keycloak
+metadata:
+  name: keycloak
+spec:
+  instances: 2
+  db:
+    vendor: postgres
+    host: keycloak-db-rw
+    database: keycloak
+    usernameSecret:
+      name: keycloak-db
+      key: username
+    passwordSecret:
+      name: keycloak-db
+      key: password
+  http:
+    httpEnabled: true
+  hostname:
+    hostname: https://keycloak.<%= dataplatform_domain %>
+  proxy:
+    headers: xforwarded
+  ingress:
+    enabled: false
+  bootstrapAdmin:
+    user:
+      secret: keycloak-bootstrap-admin
+  additionalOptions:
+    - name: metrics-enabled
+      value: "true"
+    - name: health-enabled
+      value: "true"
+  resources:
+    requests: {cpu: 200m, memory: 1Gi}
+    limits: {memory: 1536Mi}
+  # never both instances on one node: a node's reboot must not stop every login
+  scheduling:
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app: keycloak
+                app.kubernetes.io/instance: keycloak
+  unsupported:
+    podTemplate:
+      metadata:
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "9000"
+          prometheus.io/path: /metrics

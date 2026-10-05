@@ -1,0 +1,100 @@
+---
+# Ceph subsystem (subsystems/ceph). Applies to every host in the `ceph` group.
+# Deployment method: upstream cephadm + containers (quay.io/ceph/ceph, multi-arch).
+# The settings are split by concern: this file (release, cluster, OSDs, CephFS,
+# lifecycle, monitoring), rgw.yml (S3, STS, the ingress and its certificate)
+# and bench.yml (the benchmarks); Ansible reads every file of this directory.
+
+# ---------------------------------------------------------------- release ----
+# Release name drives the cephadm binary download; the image tag drives what
+# actually runs. Keep them in sync (squid = v19, tentacle = v20). Pin a full
+# tag (e.g. v19.2.3) for reproducible rebuilds.
+ceph_release: squid
+ceph_image: "quay.io/ceph/ceph:v19"
+ceph_upgrade_timeout: 5400              # s; make ceph-upgrade waits this long for the orchestrator
+ceph_cephadm_url: "https://download.ceph.com/rpm-{{ ceph_release }}/el9/noarch/cephadm"
+# The download.ceph.com file has no version in its name: this checksum pins it
+# (sha256sum of the binary in use; update it together with ceph_release).
+ceph_cephadm_sha256: 570db07b80fa1fb8f14be2a1f23d5c8fc53b0f0fd45aefbce43e55c6f348b418
+ceph_cephadm_force_download: false     # true to refresh an existing /usr/local/bin/cephadm
+
+# ---------------------------------------------------------------- cluster ----
+ceph_admin_host: "{{ groups['ceph_mons'][0] }}"
+ceph_public_network: "{{ site_lan_network }}"
+ceph_cluster_network: "{{ site_lan_network }}"
+# IP used for the first monitor; defaults to the admin host's default IPv4.
+ceph_mon_ip: "{{ hostvars[ceph_admin_host]['ansible_facts']['default_ipv4']['address'] }}"
+ceph_bootstrap_extra_args: ""
+# Rolling reboot (hooks/node-enter.yml, node-exit.yml), seconds
+ceph_maint_ok_to_stop_timeout: 600      # wait for Ceph to call the host safe to stop
+ceph_maint_recovery_timeout: 1800       # wait for all PGs active+clean and HEALTH_OK afterwards
+# Health checks that do not stop a rolling reboot (HEALTH_WARN with only these
+# counts as healthy): a crash report of the last 14 days (archived before the
+# reboot anyway), a pool without an application tag (the benchmark pool).
+ceph_rolling_benign_health: [RECENT_CRASH, POOL_APP_NOT_ENABLED]
+
+ceph_dashboard_user: admin
+ceph_dashboard_password: "{{ lookup('password', secrets_dir ~ '/ceph-dashboard.pw chars=ascii_letters,digits length=20') }}"
+
+# Host label -> inventory group. Labels drive service placement in the specs.
+ceph_host_labels:
+  _admin: ceph_mons
+  mon: ceph_mons
+  mgr: ceph_mgrs
+  mds: ceph_mdss
+  osd: ceph_osds
+  rgw: ceph_rgws
+  ingress: ceph_ingress
+  monitoring: ceph_monitoring
+
+# Extra `ceph config set` entries applied by subsystems/ceph/services.yml
+ceph_extra_config:
+  # /var on the boards is shared with other data and sits at 60-80% used; the
+  # monitors need only a few hundred MB, so warn at 15% free instead of 30%.
+  - { who: mon, name: mon_data_avail_warn, value: "15" }
+#  - { who: osd, name: osd_memory_target, value: "2147483648" }
+
+# ---------------------------------------------------------------- osds ----
+# LVM logical volumes that become one OSD each on every ceph_osds host.
+# Only these LVs are ever touched: the NVMe PV, vg_data, lv_var/lv_home and
+# any other disk are out of bounds (the role refuses anything that is not an
+# unmounted LV). Override per host in inventory/host_vars/<host>.yml.
+ceph_osd_devices:
+  - /dev/vg_data/lv_data
+# When true, LVs that still carry a signature (old MicroCeph BlueStore, a
+# filesystem...) are wiped with `ceph-volume lvm zap` (contents only, the LV
+# is kept) before use. DATA LOSS on that LV. Needed once when migrating.
+ceph_osd_zap_devices: false
+
+# ---------------------------------------------------------------- cephfs ----
+ceph_cephfs_enabled: true
+ceph_cephfs_name: cephfs
+ceph_cephfs_max_mds: 1
+ceph_cephfs_client_name: cephfs          # client.<name> key with rw on /
+# Squid issues AES-256 CephX keys by default; the kernel client on the boards
+# (5.10 Rockchip) and Reef's mount.ceph only understand legacy AES-128 keys.
+ceph_cephfs_client_key_type: aes
+# Mount the filesystem on every cluster node via /etc/fstab (install.yml step
+# cephfs-mount.yml). A subset: make ceph-cephfs-mount ARGS="-e cephfs_mount_hosts=node4"
+ceph_cephfs_mount_nodes: true
+ceph_cephfs_mount_point: /cephfs
+# nofail + systemd automount: the node boots even if Ceph is down; the mount
+# is established on first access.
+ceph_cephfs_mount_options: "noatime,_netdev,nofail,x-systemd.automount,x-systemd.mount-timeout=60"
+
+# ---------------------------------------------------------------- lifecycle ----
+# OSD flags set by pre-shutdown.yml and cleared by post-startup.yml (pause
+# last, and always: it freezes all client I/O, k3s volumes included)
+ceph_shutdown_osd_flags: [noout, norecover, norebalance, nobackfill, nodown, pause]
+ceph_startup_osd_timeout: 300         # s; post-startup waits this long for every OSD (then clears the flags anyway), and again for every placement group
+
+# ---------------------------------------------------------------- monitoring ----
+# cephadm monitoring stack (monitoring.yml, part of install.yml): Prometheus,
+# Alertmanager and Grafana on the ceph_monitoring hosts, node-exporter and
+# ceph-exporter on every ceph host. cephadm wires them into the dashboard
+# (graphs, alert list). Alerts are not forwarded anywhere else.
+ceph_monitoring_enabled: true
+# Prometheus TSDB lives on /var (shared, 60-80% used): whichever limit is hit first.
+ceph_prometheus_retention_time: 15d
+ceph_prometheus_retention_size: 10GB
+ceph_grafana_admin_password: "{{ lookup('password', secrets_dir ~ '/ceph-grafana.pw chars=ascii_letters,digits length=20') }}"

@@ -1,0 +1,45 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: stackable-spark-k8s-operator
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-4"
+spec:
+  project: dataplatform
+  # The chart through kustomize (manifests/operators/spark-k8s-operator,
+  # version pinned there): one ClusterRole is patched
+  source:
+    repoURL: <%= dataplatform_git_repo %>
+    targetRevision: <%= dataplatform_git_revision %>
+    path: subsystems/dataplatform/gitops/manifests/operators/spark-k8s-operator
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: operators
+  ignoreDifferences:
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+      # only what is written at runtime. With RespectIgnoreDifferences Argo CD
+      # copies the ignored live fields into the apply: never .spec (a chart
+      # upgrade would keep the old schema), never the whole .metadata
+      # (managedFields is refused)
+      jqPathExpressions:
+        - .status
+        - .metadata.labels
+        - .metadata.annotations
+  syncPolicy:
+    # No finalizer and no prune: deleting this Application, or a chart that
+  # drops a CRD, must not delete the custom resources with it
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+      - SkipDryRunOnMissingResource=true
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        maxDuration: 5m
+        factor: 2

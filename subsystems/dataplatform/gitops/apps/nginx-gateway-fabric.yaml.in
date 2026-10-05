@@ -1,0 +1,52 @@
+# NGINX Gateway Fabric 2.7.2 (OCI chart). Its cert-generator Job (a Helm hook,
+# PreSync in Argo CD) creates the control/data-plane TLS Secrets at runtime.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nginx-gateway-fabric
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-4"
+spec:
+  project: dataplatform
+  sources:
+    - repoURL: oci://ghcr.io/nginx/charts/nginx-gateway-fabric
+      chart: nginx-gateway-fabric
+      targetRevision: "2.7.2"
+      helm:
+        releaseName: nginx-gateway-fabric
+        valueFiles:
+          - $values/subsystems/dataplatform/gitops/helm-values/nginx-gateway-fabric-values.yaml
+    - repoURL: <%= dataplatform_git_repo %>
+      targetRevision: <%= dataplatform_git_revision %>
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: nginx-gateway
+  ignoreDifferences:
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+      # only what is written at runtime. With RespectIgnoreDifferences Argo CD
+      # copies the ignored live fields into the apply: never .spec (a chart
+      # upgrade would keep the old schema), never the whole .metadata
+      # (managedFields is refused)
+      jqPathExpressions:
+        - .status
+        - .metadata.labels
+        - .metadata.annotations
+  syncPolicy:
+    # No finalizer and no prune: deleting this Application, or a chart that
+  # drops a CRD, must not delete the custom resources with it
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+      - SkipDryRunOnMissingResource=true
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        maxDuration: 5m
+        factor: 2

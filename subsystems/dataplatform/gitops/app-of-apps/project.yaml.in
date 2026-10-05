@@ -1,0 +1,31 @@
+# AppProject of every data platform Application. Applied by Ansible
+# (make dataplatform-argocd) together with root-app.yaml.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: dataplatform
+  namespace: argocd
+spec:
+  description: The data platform (subsystems/dataplatform)
+  # only this repository and the chart sources the Applications name
+  sourceRepos:
+    - <%= dataplatform_git_repo %>
+    - https://charts.external-secrets.io
+    - https://charts.jetstack.io
+    - https://cloudnative-pg.github.io/charts
+    - https://grafana-community.github.io/helm-charts
+    - https://helm.vector.dev
+    - https://hub.jupyter.org/helm-chart/
+    - https://open-telemetry.github.io/opentelemetry-helm-charts
+    - https://openbao.github.io/openbao-helm
+    - https://prometheus-community.github.io/helm-charts
+    - https://victoriametrics.github.io/helm-charts/
+    - https://github.com/nginx/nginx-gateway-fabric.git
+    - oci://ghcr.io/nginx/charts/nginx-gateway-fabric
+    - oci://oci.stackable.tech/sdp-charts/*
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: "*"
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"

@@ -1,0 +1,17 @@
+# Where the Barman Cloud plugin archives metacatalog-db's WAL and base backups:
+# s3://<%= site_backup_bucket %>/cnpg/metacatalog-db/metacatalog-db/ (the server name is the cluster's),
+# with the backup key (governance/backup-s3); 14 days kept.
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: metacatalog-db
+spec:
+  configuration:
+    destinationPath: s3://<%= site_backup_bucket %>/cnpg/metacatalog-db
+    endpointURL: https://<%= site_s3_host %>
+    s3Credentials:
+      accessKeyId: {name: backup-s3, key: access-key}
+      secretAccessKey: {name: backup-s3, key: secret-key}
+    wal: {compression: gzip}
+    data: {compression: gzip}
+  retentionPolicy: 14d

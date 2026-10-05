@@ -1,0 +1,134 @@
+---
+# DESTROYS k3s on every node: workloads, cluster state (etcd), images; pod
+# volumes are unmounted. Uses the uninstall scripts the k3s installer leaves on
+# each node, agents first, then servers.
+#   make k3s-remove ARGS="-e remove_confirm=yes"
+# Add -e remove_ceph_storage=true to also delete the Ceph side (RBD pool with
+# every PV image, the CephFS subvolume group with every RWX volume, the CSI users).
+- name: Safety check
+  hosts: nodes
+  gather_facts: false
+  tasks:
+    - name: Require explicit confirmation
+      ansible.builtin.assert:
+        that: remove_confirm | default('no') == 'yes'
+        fail_msg: "refusing to remove k3s without -e remove_confirm=yes"
+      run_once: true
+
+- name: Uninstall k3s agents
+  hosts: nodes
+  gather_facts: false
+  tasks:
+    - name: Agent uninstall script
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s-agent-uninstall.sh
+      register: k3s_agent_uninstall
+
+    - name: Uninstall the agent
+      ansible.builtin.command: /usr/local/bin/k3s-agent-uninstall.sh
+      when: k3s_agent_uninstall.stat.exists
+      changed_when: true
+
+- name: Uninstall k3s servers
+  hosts: nodes
+  gather_facts: false
+  tasks:
+    - name: Server uninstall script
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s-uninstall.sh
+      register: k3s_server_uninstall
+
+    - name: Uninstall the server
+      ansible.builtin.command: /usr/local/bin/k3s-uninstall.sh
+      when: k3s_server_uninstall.stat.exists
+      changed_when: true
+
+    # The uninstall script kills the pods; an RBD image a pod had mapped can
+    # stay mapped and block the module (and a later install's map).
+    - name: Unmap RBD images
+      ansible.builtin.shell: |
+        for d in /sys/bus/rbd/devices/*; do
+          [ -e "$d" ] || continue
+          echo "$(basename "$d")" > /sys/bus/rbd/remove && echo "unmapped rbd$(basename "$d")"
+        done
+      register: k3s_remove_rbd
+      changed_when: k3s_remove_rbd.stdout | length > 0
+      failed_when: false
+
+    # The scripts leave these behind in some versions (or after a partial install).
+    - name: Remove leftovers
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/rancher/k3s
+        - /var/lib/rancher/k3s
+        - /var/lib/kubelet
+        - /usr/local/bin/k3s-install.sh
+
+    - name: Local kubeconfig
+      ansible.builtin.file:
+        path: "{{ k3s_kubeconfig }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: k3s_kubeconfig is defined
+
+    - name: The k3s context in the control node's kubeconfig
+      ansible.builtin.shell: |
+        set -o pipefail
+        k="kubectl --kubeconfig {{ k3s_local_kubeconfig }}"
+        out=""
+        $k config get-contexts k3s >/dev/null 2>&1 && $k config delete-context k3s >/dev/null && out="context"
+        $k config get-clusters | grep -qx k3s && $k config delete-cluster k3s >/dev/null && out="$out cluster"
+        $k config get-users | grep -qx k3s && $k config delete-user k3s >/dev/null && out="$out user"
+        echo "$out"
+      args:
+        executable: /bin/bash
+      register: k3s_remove_context
+      changed_when: k3s_remove_context.stdout | trim | length > 0
+      failed_when: false
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: k3s_local_kubeconfig | default('') | length > 0
+
+- name: Remove the Ceph side of the k3s storage
+  hosts: ceph_mons[0]
+  gather_facts: false
+  tasks:
+    - name: Ceph resources used by the CSI drivers
+      when: remove_ceph_storage | default(false) | bool
+      block:
+        - name: Pool deletion setting
+          ansible.builtin.command: cephadm shell -- ceph config get mon mon_allow_pool_delete
+          register: k3s_pool_delete
+          changed_when: false
+
+        - name: Delete the RBD pool
+          ansible.builtin.command: "cephadm shell -- {{ item }}"
+          loop: >-
+            {{ (['ceph config set mon mon_allow_pool_delete true'] if k3s_pool_delete.stdout | trim != 'true' else [])
+               + ['ceph osd pool rm ' ~ k3s_ceph_rbd_pool ~ ' ' ~ k3s_ceph_rbd_pool ~ ' --yes-i-really-really-mean-it']
+               + (['ceph config rm mon mon_allow_pool_delete'] if k3s_pool_delete.stdout | trim != 'true' else []) }}
+          changed_when: true
+
+        - name: Delete the CephFS subvolume group (with every RWX volume in it)
+          ansible.builtin.shell: >-
+            set -o pipefail;
+            for sv in $(cephadm shell -- ceph fs subvolume ls {{ ceph_cephfs_name }} {{ k3s_ceph_cephfs_subvolumegroup }} --format json 2>/dev/null
+                        | python3 -c 'import sys,json; [print(s["name"]) for s in json.load(sys.stdin)]'); do
+              cephadm shell -- ceph fs subvolume rm {{ ceph_cephfs_name }} "$sv" {{ k3s_ceph_cephfs_subvolumegroup }} --force;
+            done;
+            cephadm shell -- ceph fs subvolumegroup rm {{ ceph_cephfs_name }} {{ k3s_ceph_cephfs_subvolumegroup }} --force
+          args:
+            executable: /bin/bash
+          changed_when: true
+
+        - name: Delete the CSI users
+          ansible.builtin.command: cephadm shell -- ceph auth rm client.{{ item }}
+          loop: ["{{ k3s_ceph_rbd_user }}", "{{ k3s_ceph_cephfs_user }}"]
+          register: k3s_remove_auth
+          failed_when: k3s_remove_auth.rc != 0 and 'does not exist' not in k3s_remove_auth.stderr
+          changed_when: k3s_remove_auth.rc == 0

@@ -1,0 +1,152 @@
+# Meta Catalog (github.com/dgreco/metacatalog): REST API, UI (/ui) and SPARQL
+# endpoint over its own PostgreSQL. Users log in with Keycloak (the app's own
+# authorization-code login, client metacatalog); the API also takes any
+# <%= dataplatform_keycloak_realm %> access token as a bearer token. The app checks only that a
+# user is logged in: it has no roles, so oauth2-proxy in front of it
+# (metacatalog-proxy.yaml) lets only <%= site_admin_group %> and <%= site_engineer_group %>
+# through. One replica: login sessions live in memory.
+#
+# Its `script` provisioning task builds the medallion lakehouses
+# (subsystems/dataplatform/metacatalog): the scripts in provisioning/, for the
+# physical types MedallionSchemaType and MedallionTableType, create and drop
+# Iceberg schemas and tables through Trino, and apply the lakehouse's grants:
+# authorize writes them into the record of grants and Ceph's STS roles
+# (metacatalog-grants.yaml), reject takes them back. Only <%= site_admin_group %> may
+# authorize or reject (the gate in metacatalog-proxy.yaml).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metacatalog
+  labels:
+    app.kubernetes.io/name: metacatalog
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: metacatalog
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: metacatalog
+    spec:
+      # the scripts read and write the record of grants (and nothing else:
+      # metacatalog-grants.yaml); the application does not use the token
+      serviceAccountName: metacatalog
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: metacatalog
+          image: ghcr.io/dgreco/metacatalog:29815bb@sha256:e3e8b2750f22386130ebdeff93147fa75ec2943c009803cade67b568a421f9ad
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            # the kubernetes profile refuses to start with authentication off
+            - {name: SPRING_PROFILES_ACTIVE, value: kubernetes}
+            - {name: SPRING_DATASOURCE_URL, value: "jdbc:postgresql://metacatalog-db-rw:5432/metacatalog"}
+            - name: SPRING_DATASOURCE_USERNAME
+              valueFrom:
+                secretKeyRef: {name: metacatalog-db-owner, key: username}
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: metacatalog-db-owner, key: password}
+            # Relaxed binding: one underscore per dot of the property name,
+            # none for its dashes (AUTH_MODE would bind auth.mode, not auth-mode).
+            - {name: APPLICATION_CONFIG_SECURITY_AUTHMODE, value: oauth2}
+            # read at start (OIDC discovery): the app does not start until Keycloak answers
+            - {name: APPLICATION_CONFIG_SECURITY_OAUTH2_ISSUERURI, value: https://keycloak.<%= dataplatform_domain %>/realms/<%= dataplatform_keycloak_realm %>}
+            - {name: APPLICATION_CONFIG_SECURITY_OAUTH2_CLIENTID, value: metacatalog}
+            - name: APPLICATION_CONFIG_SECURITY_OAUTH2_CLIENTSECRET
+              valueFrom:
+                secretKeyRef: {name: metacatalog-oidc, key: client-secret}
+            # The login's redirect URI is built from the request: behind the
+            # Gateway it must be https://metacatalog.<%= dataplatform_domain %>, from
+            # the X-Forwarded-* headers NGINX sets
+            - {name: SERVER_FORWARDHEADERSSTRATEGY, value: native}
+            # the server the Swagger UI's "Try it out" calls
+            - {name: INGRESS_URL, value: https://metacatalog.<%= dataplatform_domain %>}
+            # Heap at half the limit. Under 1792 MiB the JVM would also switch
+            # to SerialGC, and the image's AOT cache was trained with G1.
+            - {name: JDK_JAVA_OPTIONS, value: "-XX:MaxRAMPercentage=50"}
+            # The `script` provisioning task: one script for both physical
+            # types of the medallion model, which tells them apart itself
+            - name: SPRING_APPLICATION_JSON
+              value: >-
+                {"application": {"config": {"provisioning": {"tasks": {"script": {
+                "entity-types": ["MedallionSchemaType", "MedallionTableType"],
+                "path": "/opt/metacatalog/provisioning/medallion.sh"}}}}}}
+            # ... and what the scripts need (provisioning/medallion.sh; the
+            # bucket and prefix come with the IAM settings below)
+            - {name: MEDALLION_CATALOG, value: lakehouse}
+            - {name: TRINO_URL, value: https://trino.<%= dataplatform_domain %>}
+            - {name: KEYCLOAK_TOKEN_URL, value: https://keycloak.<%= dataplatform_domain %>/realms/<%= dataplatform_keycloak_realm %>/protocol/openid-connect/token}
+            - {name: PROVISIONER_CLIENT_ID, value: metacatalog-provisioner}
+            - {name: PROVISIONER_CLIENT_SECRET_FILE, value: /etc/metacatalog/provisioner/client-secret}
+          # ... the record of grants and Ceph's IAM (authorize, reject),
+          # with MEDALLION_BUCKET and MEDALLION_PREFIX (metacatalog-grants.yaml)
+          envFrom:
+            - configMapRef: {name: metacatalog-iam}
+          # Liveness and readiness include the database; the start (Flyway,
+          # the immutable model) can take minutes on these boards.
+          startupProbe:
+            httpGet: {path: /actuator/health, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /actuator/health/readiness, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: {path: /actuator/health/liveness, port: http}
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          resources:
+            requests: {cpu: 100m, memory: 1Gi}
+            limits: {memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            - {name: provisioning, mountPath: /opt/metacatalog/provisioning, readOnly: true}
+            - {name: provisioner, mountPath: /etc/metacatalog/provisioner, readOnly: true}
+            - {name: iam, mountPath: /etc/metacatalog/iam, readOnly: true}
+      volumes:
+        # Tomcat's work directory, the JVM's and the scripts' temporary files
+        - name: tmp
+          emptyDir: {}
+        - name: provisioning
+          configMap:
+            name: metacatalog-provisioning
+        # optional: Meta Catalog starts without them; provisioning and
+        # authorizing fail, naming the missing file, until they are there
+        - name: provisioner
+          secret:
+            secretName: metacatalog-provisioner
+            optional: true
+        # the RGW user metacatalog-iam: it may manage the usr-* and grp-*
+        # roles of the account, the platform's excepted (make dataplatform-ceph)
+        - name: iam
+          secret:
+            secretName: metacatalog-iam
+            optional: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metacatalog
+  labels:
+    app.kubernetes.io/name: metacatalog
+spec:
+  selector:
+    app.kubernetes.io/name: metacatalog
+  ports:
+    - {name: http, port: 80, targetPort: http}

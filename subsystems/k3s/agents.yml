@@ -1,0 +1,6 @@
+---
+- name: Join the k3s agents
+  hosts: k3s_agents
+  roles:
+    - role: k3s_node
+      k3s_node_role: agent

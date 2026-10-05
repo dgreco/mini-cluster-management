@@ -1,0 +1,63 @@
+---
+# Register every ceph host with the orchestrator and keep labels in sync.
+- name: Read orchestrator host list
+  ansible.builtin.command: cephadm shell -- ceph orch host ls --format json
+  register: ceph_hosts_orch_host_ls
+  changed_when: false
+
+- name: Index current hosts and labels
+  ansible.builtin.set_fact:
+    ceph_hosts_orch_hosts: "{{ ceph_hosts_orch_host_ls.stdout | from_json }}"
+
+- name: Add missing hosts
+  ansible.builtin.command: >-
+    cephadm shell -- ceph orch host add
+    {{ hostvars[item]['ansible_facts']['nodename'] }}
+    {{ hostvars[item]['ansible_facts']['default_ipv4']['address'] }}
+  loop: "{{ groups['ceph'] }}"
+  when: hostvars[item]['ansible_facts']['nodename'] not in (ceph_hosts_orch_hosts | map(attribute='hostname') | list)
+  changed_when: true
+
+- name: Ensure labels
+  ansible.builtin.command: >-
+    cephadm shell -- ceph orch host label add
+    {{ hostvars[item.0]['ansible_facts']['nodename'] }} {{ item.1 }}
+  loop: "{{ groups['ceph'] | product(ceph_host_labels.keys() | list) | list }}"
+  loop_control:
+    label: "{{ item.0 }}:{{ item.1 }}"
+  vars:
+    _nodename: "{{ hostvars[item.0]['ansible_facts']['nodename'] }}"
+    _current: >-
+      {{ (ceph_hosts_orch_hosts | selectattr('hostname', 'equalto', _nodename) | map(attribute='labels') | first) | default([]) }}
+  when:
+    - item.0 in groups[ceph_host_labels[item.1]]
+    - item.1 not in _current
+  changed_when: true
+
+# A host that left a group loses its label, so cephadm moves the service away
+# (e.g. the ingress off a node that became a k3s gateway node). Only labels
+# managed through ceph_host_labels are touched.
+- name: Remove stale labels
+  ansible.builtin.command: >-
+    cephadm shell -- ceph orch host label rm
+    {{ hostvars[item.0]['ansible_facts']['nodename'] }} {{ item.1 }}
+  loop: "{{ groups['ceph'] | product(ceph_host_labels.keys() | list) | list }}"
+  loop_control:
+    label: "{{ item.0 }}:{{ item.1 }}"
+  vars:
+    _nodename: "{{ hostvars[item.0]['ansible_facts']['nodename'] }}"
+    _current: >-
+      {{ (ceph_hosts_orch_hosts | selectattr('hostname', 'equalto', _nodename) | map(attribute='labels') | first) | default([]) }}
+  when:
+    - item.0 not in groups[ceph_host_labels[item.1]]
+    - item.1 in _current
+  changed_when: true
+
+- name: Show orchestrator hosts
+  ansible.builtin.command: cephadm shell -- ceph orch host ls
+  register: ceph_hosts_orch_host_ls_after
+  changed_when: false
+
+- name: Hosts
+  ansible.builtin.debug:
+    msg: "{{ ceph_hosts_orch_host_ls_after.stdout_lines }}"

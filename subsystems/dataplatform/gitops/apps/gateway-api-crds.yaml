@@ -1,0 +1,31 @@
+# Gateway API CRDs, standard channel, at the version NGINX Gateway Fabric
+# v2.7.2 pins (v1.6.1): the NGF repository's kustomization of the upstream CRDs.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gateway-api-crds
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  project: dataplatform
+  source:
+    repoURL: https://github.com/nginx/nginx-gateway-fabric.git
+    targetRevision: v2.7.2
+    path: config/crd/gateway-api/standard
+  destination:
+    server: https://kubernetes.default.svc
+  # No finalizer and no prune: deleting this Application must not delete the
+  # CRDs and, with them, every Gateway and HTTPRoute
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        maxDuration: 5m
+        factor: 2

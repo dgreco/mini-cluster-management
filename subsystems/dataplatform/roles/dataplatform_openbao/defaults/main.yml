@@ -1,0 +1,9 @@
+---
+# Kubernetes auth: the service account every SecretStore logs in with
+dataplatform_openbao_store_sa: external-secrets-store
+# Recovery keys of the one-time initialisation (static seal: they cannot
+# unseal, only authorise root-token generation)
+dataplatform_openbao_recovery_shares: 3
+dataplatform_openbao_recovery_threshold: 2
+# How long to wait for the pods and the Raft cluster (s)
+dataplatform_openbao_timeout: 900

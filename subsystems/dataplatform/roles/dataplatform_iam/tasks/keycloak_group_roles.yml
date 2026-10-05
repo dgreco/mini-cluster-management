@@ -1,0 +1,58 @@
+---
+# Client roles of one group of realm-import.yaml (dataplatform_iam_group):
+# add the missing ones (e.g. the admin group -> realm-management realm-admin).
+- name: Group {{ dataplatform_iam_group.name }}
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/groups?search={{ dataplatform_iam_group.name | urlencode }}&exact=true&briefRepresentation=true"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_grp
+
+- name: Clients that own the roles
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/clients?clientId={{ item | urlencode }}&search=false"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  loop: "{{ dataplatform_iam_group.clientRoles.keys() | list }}"
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_grp_clients
+  no_log: true   # a client representation carries the client secret
+
+- name: Roles the group has now
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/groups/{{ _gid }}/role-mappings/clients/{{ item.json[0].id }}"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  loop: "{{ dataplatform_iam_grp_clients.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    _gid: "{{ (dataplatform_iam_grp.json | selectattr('name', 'equalto', dataplatform_iam_group.name) | first).id }}"
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_grp_roles
+
+- name: Available roles of those clients
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/clients/{{ item.json[0].id }}/roles"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  loop: "{{ dataplatform_iam_grp_clients.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_grp_available
+
+- name: Grant the missing roles
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/groups/{{ _gid }}/role-mappings/clients/{{ item.0.json[0].id }}"
+    method: POST
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: "{{ item.2.json | selectattr('name', 'in', _missing) | list }}"
+    status_code: [204]
+  loop: "{{ dataplatform_iam_grp_clients.results | zip(dataplatform_iam_grp_roles.results, dataplatform_iam_grp_available.results) | list }}"
+  loop_control:
+    label: "{{ dataplatform_iam_group.name }}: {{ item.0.item }}"
+  vars:
+    _gid: "{{ (dataplatform_iam_grp.json | selectattr('name', 'equalto', dataplatform_iam_group.name) | first).id }}"
+    _missing: "{{ dataplatform_iam_group.clientRoles[item.0.item] | difference(item.1.json | map(attribute='name')) }}"
+  when: _missing | length > 0
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true

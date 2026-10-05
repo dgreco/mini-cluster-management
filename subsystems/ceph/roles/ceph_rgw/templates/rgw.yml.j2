@@ -1,0 +1,7 @@
+# Managed by Ansible. One RGW daemon per `rgw`-labelled host, default realm/zone.
+service_type: rgw
+service_id: {{ ceph_rgw_service_id }}
+placement:
+  label: rgw
+spec:
+  rgw_frontend_port: {{ ceph_rgw_port }}

@@ -1,0 +1,31 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: governance-backup
+  namespace: argocd
+  annotations:
+    # after the SecretStores (-2), before the databases (0) that back up with its key
+    argocd.argoproj.io/sync-wave: "-1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: dataplatform
+  source:
+    repoURL: <%= dataplatform_git_repo %>
+    targetRevision: <%= dataplatform_git_revision %>
+    path: subsystems/dataplatform/gitops/manifests/governance/backup
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: governance
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        maxDuration: 5m
+        factor: 2

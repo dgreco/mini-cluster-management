@@ -1,0 +1,208 @@
+---
+# End-to-end check of the IAM model on the live platform (about 10 minutes):
+# temporary Keycloak users smoke-eng (the engineer group), smoke-ana (the
+# analyst group), smoke-both (both), smoke-nogroup and smoke-adm (also the
+# admin group: only it may authorize; site.yml names the groups) exercise direct
+# STS, Trino and Spark in the smoke test's own lakehouse (Meta Catalog,
+# metacatalog/lakehouses/smoke_test.yaml): every data access must be decided
+# by Ceph through a group role and the layers the lakehouse's policy grants
+# it, and only Meta Catalog may create a schema or a table. Missing pieces of
+# the lakehouse are made on the way (load, provision); smoke-adm authorizes
+# it on every run.
+# The users go at the end, pass or fail; the lakehouse stays, emptied.
+#   make dataplatform-smoke-test
+- name: Data platform smoke test
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  vars:
+    # the site's groups (group_vars/all/site.yml)
+    smoke_users:
+      smoke-eng: ["{{ site_engineer_group }}"]
+      smoke-ana: ["{{ site_analyst_group }}"]
+      smoke-both: "{{ [site_analyst_group, site_engineer_group] | sort }}"
+      smoke-nogroup: []
+      # the admin group after other groups: the gate must find it among several
+      smoke-adm: ["{{ site_analyst_group }}", "{{ site_engineer_group }}", "{{ site_admin_group }}"]
+  tasks:
+    - name: OpenBao client
+      ansible.builtin.include_role:
+        name: dataplatform_openbao
+        tasks_from: client
+
+    - name: Keycloak bootstrap admin and client secrets
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/secret/data/dataplatform/governance/{{ item }}"
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+      loop: [keycloak-admin, keycloak-clients]
+      register: smoke_kc_secrets
+      no_log: true
+
+    - name: Logins
+      ansible.builtin.set_fact:
+        smoke_kc_admin: "{{ smoke_kc_secrets.results[0] }}"
+        dataplatform_iam_kc_client_secret: "{{ smoke_kc_secrets.results[1].json.data.data.ansible | default('') }}"
+        smoke_client_secret: "{{ smoke_kc_secrets.results[1].json.data.data['smoke-test'] }}"
+      no_log: true
+
+    - name: Admin API base (inside the cluster)
+      ansible.builtin.include_role:
+        name: dataplatform_iam
+        tasks_from: keycloak_admin_base
+
+    - name: Admin token
+      ansible.builtin.include_role:
+        name: dataplatform_iam
+        tasks_from: keycloak_token
+      vars:
+        dataplatform_iam_kc_admin: "{{ smoke_kc_admin.json.data.data }}"
+
+    - name: Password of the temporary users
+      ansible.builtin.set_fact:
+        smoke_password: "{{ lookup('ansible.builtin.password', '/dev/null', length=24, chars=['ascii_letters', 'digits']) }}"
+        smoke_users_json: >-
+          {%- set out = {} -%}
+          {%- for u, g in smoke_users.items() -%}{%- set _ = out.update({u: {'group': g[0] if g else '', 'groups': g}}) -%}{%- endfor -%}
+          {{ out }}
+      no_log: true
+
+    - name: Run the checks with temporary users
+      block:
+        - name: Create the temporary users
+          ansible.builtin.uri:
+            url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}/users"
+            method: POST
+            headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+            body_format: json
+            body:
+              username: "{{ item.key }}"
+              enabled: true
+              emailVerified: true
+              email: "{{ item.key }}@{{ dataplatform_domain }}"
+              firstName: Smoke
+              lastName: "{{ item.key }}"
+              groups: "{{ item.value | map('regex_replace', '^', '/') | list }}"
+              credentials: [{type: password, value: "{{ smoke_password }}", temporary: false}]
+            status_code: [201, 409]
+          loop: "{{ smoke_users | dict2items }}"
+          loop_control:
+            label: "{{ item.key }} ({{ item.value | join(', ') or 'no group' }})"
+          delegate_to: "{{ dataplatform_iam_kc_host }}"
+
+        # A user left behind by an interrupted run (409 above) keeps its old
+        # password: set this run's on every user.
+        - name: Find the temporary users
+          ansible.builtin.uri:
+            url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}/users?username={{ item }}&exact=true"
+            headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+          loop: "{{ smoke_users.keys() | list }}"
+          delegate_to: "{{ dataplatform_iam_kc_host }}"
+          register: smoke_created
+
+        - name: Set this run's password on every temporary user
+          ansible.builtin.uri:
+            url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}/users/{{ item.json[0].id }}/reset-password"
+            method: PUT
+            headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+            body_format: json
+            body: {type: password, value: "{{ smoke_password }}", temporary: false}
+            status_code: [204]
+          loop: "{{ smoke_created.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+          delegate_to: "{{ dataplatform_iam_kc_host }}"
+          changed_when: false
+          no_log: true
+
+        # iam-sync (every 30 s) writes Trino's group file; Trino re-reads it
+        # every 10 s.
+        - name: Wait for iam-sync to pick the users up
+          ansible.builtin.shell: |
+            set -o pipefail
+            k="/usr/local/bin/k3s kubectl"
+            end=$((SECONDS + 300))
+            until $k -n compute get configmap trino-iam -o 'jsonpath={.data.groups\.txt}' | grep -q smoke-ana \
+                  && $k -n compute get rolebinding spark-submitter -o name >/dev/null 2>&1 \
+                  && $k -n compute get sparkapptemplate lakehouse -o name >/dev/null 2>&1; do
+              [ $SECONDS -ge $end ] && exit 1
+              sleep 5
+            done
+            sleep 30
+          args:
+            executable: /bin/bash
+          changed_when: false
+
+        - name: Direct STS, Trino and Spark
+          ansible.builtin.command:
+            argv: ["{{ ansible_playbook_python }}", "{{ playbook_dir }}/files/smoke_test.py"]
+          environment:
+            KEYCLOAK_ISSUER: "{{ dataplatform_keycloak_issuer }}"
+            S3_ENDPOINT: "{{ dataplatform_s3_endpoint }}"
+            S3_REGION: "{{ dataplatform_s3_region }}"
+            TRINO_URL: https://trino.{{ dataplatform_domain }}
+            JUPYTER_URL: https://jupyter.{{ dataplatform_domain }}
+            METACATALOG_URL: https://metacatalog.{{ dataplatform_domain }}
+            SMOKE_LAKEHOUSE_FILE: "{{ playbook_dir }}/metacatalog/lakehouses/smoke_test.yaml"
+            SPARK_SUBMIT: "{{ playbook_dir }}/files/dp-spark-submit.sh"
+            S3_LOGIN: "{{ playbook_dir }}/files/dp-s3-login.sh"
+            S3_BUCKET: "{{ dataplatform_bucket }}"
+            ROLE_ARN_PREFIX: "arn:aws:iam::{{ dataplatform_rgw_account_id }}:role/"
+            GROUP_ROLE_PREFIX: "{{ dataplatform_iam_group_role_prefix }}"
+            ADMIN_GROUP: "{{ site_admin_group }}"
+            ENGINEER_GROUP: "{{ site_engineer_group }}"
+            ANALYST_GROUP: "{{ site_analyst_group }}"
+            LABEL_DOMAIN: "{{ dataplatform_domain }}"
+            SMOKE_USERS: "{{ smoke_users_json | to_json }}"
+            SMOKE_PASSWORD: "{{ smoke_password }}"
+            SMOKE_CLIENT: smoke-test
+            SMOKE_CLIENT_SECRET: "{{ smoke_client_secret }}"
+            K8S_SERVER: "{{ (lookup('ansible.builtin.file', k3s_kubeconfig) | from_yaml).clusters[0].cluster.server }}"
+            K8S_CA: "{{ (lookup('ansible.builtin.file', k3s_kubeconfig) | from_yaml).clusters[0].cluster['certificate-authority-data'] }}"
+          delegate_to: localhost
+          become: false
+          register: smoke_result
+          changed_when: false
+          failed_when: false
+
+        - name: Results
+          ansible.builtin.debug:
+            msg: "{{ smoke_result.stdout_lines + (smoke_result.stderr_lines | select | list) }}"
+
+        - name: Every check passed
+          ansible.builtin.assert:
+            that: smoke_result.rc == 0
+            fail_msg: "Some checks failed: see the FAIL lines above."
+            quiet: true
+
+      always:
+        - name: Fresh admin token
+          ansible.builtin.include_role:
+            name: dataplatform_iam
+            tasks_from: keycloak_token
+          vars:
+            dataplatform_iam_kc_admin: "{{ smoke_kc_admin.json.data.data }}"
+
+        - name: Find the temporary users
+          ansible.builtin.uri:
+            url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}/users?username={{ item }}&exact=true"
+            headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+          loop: "{{ smoke_users.keys() | list }}"
+          delegate_to: "{{ dataplatform_iam_kc_host }}"
+          register: smoke_found
+
+        - name: Delete the temporary users
+          ansible.builtin.uri:
+            url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}/users/{{ item.json[0].id }}"
+            method: DELETE
+            headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+            status_code: [204]
+          loop: "{{ smoke_found.results | selectattr('json', 'truthy') | list }}"
+          loop_control:
+            label: "{{ item.item }}"
+          delegate_to: "{{ dataplatform_iam_kc_host }}"
+          changed_when: true
+
+        - name: Delete their Spark namespaces
+          ansible.builtin.command: >-
+            /usr/local/bin/k3s kubectl delete namespace --ignore-not-found --wait=false
+            {{ smoke_users.keys() | map('regex_replace', '^', 'spark-') | join(' ') }}
+          changed_when: true

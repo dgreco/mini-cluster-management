@@ -1,0 +1,107 @@
+---
+# Create an STS role that a user (AssumeRole) or an OIDC identity
+# (AssumeRoleWithWebIdentity) can assume, and attach a permission policy.
+#
+#   make ceph-sts-role ARGS="-e role_name=readers -e trusted_uid=alice"
+#   make ceph-sts-role ARGS="-e role_name=k8s -e oidc_provider_arn=arn:aws:iam:::oidc-provider/idp.example/realms/x -e oidc_client_id=app"
+#
+# Optional: -e policy_json='{"Version":...}'  (default: full s3:* access)
+#           -e max_session_duration=3600  -e sts_role_path=/  -e sts_role_update=true (re-put trust + policy)
+- name: STS role
+  hosts: ceph_mons[0]
+  gather_facts: false
+  vars:
+    sts_role_path: /
+    max_session_duration: 3600
+    policy_name: "{{ role_name | default('role') }}-policy"
+    sts_role_update: false
+    _trust_user:
+      Version: "2012-10-17"
+      Statement:
+        - Effect: Allow
+          Principal:
+            AWS: ["arn:aws:iam:::user/{{ trusted_uid | default('') }}"]
+          Action: ["sts:AssumeRole"]
+    _trust_oidc:
+      Version: "2012-10-17"
+      Statement:
+        - Effect: Allow
+          Principal:
+            Federated: ["{{ oidc_provider_arn | default('') }}"]
+          Action: ["sts:AssumeRoleWithWebIdentity"]
+          Condition:
+            StringEquals:
+              "{{ oidc_provider_arn | default('') | regex_replace('^arn:aws:iam:::oidc-provider/', '') }}:app_id": "{{ oidc_client_id | default('') }}"
+    _default_policy:
+      Version: "2012-10-17"
+      Statement:
+        - Effect: Allow
+          Action: "s3:*"
+          Resource: "*"
+    trust_policy: "{{ _trust_oidc if oidc_provider_arn is defined else _trust_user }}"
+    permission_policy: "{{ (policy_json | from_json) if policy_json is defined else _default_policy }}"
+  tasks:
+    - name: S3 must be enabled
+      ansible.builtin.assert:
+        that: ceph_rgw_enabled | bool
+        fail_msg: "set ceph_rgw_enabled=true in inventory/group_vars/ceph/ and run make ceph-s3"
+
+    - name: Validate input
+      ansible.builtin.assert:
+        that:
+          - role_name is defined
+          - trusted_uid is defined or (oidc_provider_arn is defined and oidc_client_id is defined)
+        fail_msg: "pass -e role_name=<name> and either -e trusted_uid=<uid> or -e oidc_provider_arn=<arn> -e oidc_client_id=<id>"
+
+    - name: Look up role
+      ansible.builtin.command: cephadm shell -- radosgw-admin role get --role-name={{ role_name }}
+      register: role_get
+      changed_when: false
+      failed_when: false
+
+    - name: Create role
+      ansible.builtin.command: >-
+        cephadm shell -- radosgw-admin role create
+        --role-name={{ role_name }} --path={{ sts_role_path }}
+        --max-session-duration={{ max_session_duration }}
+        --assume-role-policy-doc={{ trust_policy | to_json | quote }}
+      when: role_get.rc != 0
+      changed_when: true
+
+    - name: Update trust policy
+      ansible.builtin.command: >-
+        cephadm shell -- radosgw-admin role update
+        --role-name={{ role_name }} --max-session-duration={{ max_session_duration }}
+        --assume-role-policy-doc={{ trust_policy | to_json | quote }}
+      when: role_get.rc == 0 and sts_role_update | bool
+      changed_when: true
+
+    - name: Look up permission policy
+      ansible.builtin.command: cephadm shell -- radosgw-admin role-policy get --role-name={{ role_name }} --policy-name={{ policy_name }}
+      register: policy_get
+      changed_when: false
+      failed_when: false
+
+    - name: Attach permission policy
+      ansible.builtin.command: >-
+        cephadm shell -- radosgw-admin role-policy put
+        --role-name={{ role_name }} --policy-name={{ policy_name }}
+        --policy-doc={{ permission_policy | to_json | quote }}
+      when: policy_get.rc != 0 or sts_role_update | bool
+      changed_when: true
+
+    - name: Show role
+      ansible.builtin.command: cephadm shell -- radosgw-admin role get --role-name={{ role_name }}
+      register: role_show
+      changed_when: false
+
+    - name: Role
+      ansible.builtin.debug:
+        msg: "{{ role_show.stdout_lines }}"
+
+    - name: How to use it
+      ansible.builtin.debug:
+        msg:
+          - "source {{ secrets_dir | realpath }}/s3-{{ trusted_uid | default('<uid>') }}.env"
+          - "aws sts assume-role --role-arn arn:aws:iam:::role{{ sts_role_path }}{{ role_name }} --role-session-name test"
+          - "(the caller signs with the S3 keys of '{{ trusted_uid | default('an identity from ' ~ oidc_provider_arn | default('')) }}')"

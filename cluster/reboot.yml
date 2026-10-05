@@ -1,0 +1,22 @@
+---
+# Safe rolling reboot of every node (or one: -e target=<node>), one at a time:
+# k3s drained, Ceph in maintenance, and each node back to full health before
+# the next one goes. Options: -e reboot_order=inventory, -e reboot_drain_timeout=600s,
+# -e reboot_force_drain=true (see inventory/group_vars/all/main.yml).
+# The procedure itself is cluster/rolling-reboot.yml, shared with update.yml.
+- name: Nodes to reboot
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Resolve the target
+      ansible.builtin.set_fact:
+        rolling_candidates: "{{ query('inventory_hostnames', target | default('nodes')) | select('in', groups['nodes']) | list }}"
+
+    - name: The target names nodes of the inventory
+      ansible.builtin.assert:
+        that: rolling_candidates | length > 0
+        fail_msg: "-e target={{ target | default('') }} matches no node; use one of {{ groups['nodes'] | join(', ') }}"
+        quiet: true
+
+- name: Rolling reboot
+  ansible.builtin.import_playbook: rolling-reboot.yml

@@ -1,0 +1,41 @@
+# Vector aggregator for the Stackable product logs (OTLP to VictoriaLogs,
+# tenant Stackable) and the discovery ConfigMaps the products look it up with.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: observability-vector
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: dataplatform
+  sources:
+    - repoURL: https://helm.vector.dev
+      chart: vector
+      targetRevision: "0.58.0"
+      helm:
+        releaseName: vector-aggregator
+        valueFiles:
+          - $values/subsystems/dataplatform/gitops/helm-values/vector-aggregator-values.yaml
+    - repoURL: git@github.com:your-account/mini-cluster-management.git
+      targetRevision: main
+      ref: values
+      path: subsystems/dataplatform/gitops/manifests/observability/vector
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        maxDuration: 5m
+        factor: 2

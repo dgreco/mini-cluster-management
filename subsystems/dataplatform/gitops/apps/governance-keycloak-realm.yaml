@@ -1,0 +1,29 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: governance-keycloak-realm
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: dataplatform
+  source:
+    repoURL: git@github.com:your-account/mini-cluster-management.git
+    targetRevision: main
+    path: subsystems/dataplatform/gitops/manifests/governance/keycloak-realm
+  destination:
+    server: https://kubernetes.default.svc
+  # No finalizer: deleting this Application must not delete the realm import
+  # (the realm itself lives in Keycloak's database)
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        maxDuration: 5m
+        factor: 2

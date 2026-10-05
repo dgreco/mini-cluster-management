@@ -1,0 +1,117 @@
+---
+# Ansible's own client in the master realm (dataplatform_iam_kc_client): a
+# confidential client whose service account holds the realm role admin, so
+# make dataplatform-iam does not depend on the temporary bootstrap admin,
+# which is deleted once the client works.
+- name: The master realm's client {{ dataplatform_iam_kc_client }}
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/master/clients?clientId={{ dataplatform_iam_kc_client }}&search=false"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_master_client
+  no_log: true
+
+- name: Create it
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/master/clients"
+    method: POST
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body:
+      clientId: "{{ dataplatform_iam_kc_client }}"
+      name: Ansible (make dataplatform-iam)
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: "{{ dataplatform_iam_kc_client_secret }}"
+      standardFlowEnabled: false
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: true
+    status_code: [201]
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  no_log: true
+  changed_when: true
+  when: dataplatform_iam_master_client.json | length == 0
+
+- name: Keep its secret equal to OpenBao's
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/master/clients/{{ dataplatform_iam_master_client.json[0].id }}"
+    method: PUT
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: "{{ dataplatform_iam_master_client.json[0] | combine({'secret': dataplatform_iam_kc_client_secret, 'serviceAccountsEnabled': true}) }}"
+    status_code: [204]
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  no_log: true
+  changed_when: true
+  when:
+    - dataplatform_iam_master_client.json | length > 0
+    - dataplatform_iam_master_client.json[0].secret | default('') != dataplatform_iam_kc_client_secret
+      or not dataplatform_iam_master_client.json[0].serviceAccountsEnabled | default(false)
+
+- name: Read it back
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/master/clients?clientId={{ dataplatform_iam_kc_client }}&search=false"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_master_client
+  no_log: true
+
+- name: Its service-account user
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/master/clients/{{ dataplatform_iam_master_client.json[0].id }}/service-account-user"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_master_sa
+
+- name: The realm role admin, and the roles the service account has
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/master/{{ item }}"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  loop:
+    - roles/admin
+    - "users/{{ dataplatform_iam_master_sa.json.id }}/role-mappings/realm"
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_master_roles
+
+- name: Grant it the realm role admin
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/master/users/{{ dataplatform_iam_master_sa.json.id }}/role-mappings/realm"
+    method: POST
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: ["{{ dataplatform_iam_master_roles.results[0].json }}"]
+    status_code: [204]
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+  when: dataplatform_iam_master_roles.results[1].json | map(attribute='name') | select('equalto', 'admin') | list | length == 0
+
+# From here on the client is used; the bootstrap admin can go.
+- name: Admin token through the client
+  ansible.builtin.include_tasks: keycloak_token.yml
+
+- name: The client works
+  ansible.builtin.assert:
+    that: dataplatform_iam_kc_token_via == 'client'
+    fail_msg: "the client {{ dataplatform_iam_kc_client }} cannot log in to the master realm; the bootstrap admin is kept"
+    quiet: true
+
+- name: The temporary bootstrap admin
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/master/users?username={{ dataplatform_iam_kc_admin.username | urlencode }}&exact=true"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_temp_admin
+  no_log: true
+  when: dataplatform_iam_delete_temp_admin | bool
+
+- name: Delete the temporary bootstrap admin - {{ dataplatform_iam_kc_admin.username }}
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/master/users/{{ dataplatform_iam_temp_admin.json[0].id }}"
+    method: DELETE
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    status_code: [204]
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+  when: dataplatform_iam_delete_temp_admin | bool and dataplatform_iam_temp_admin.json | length > 0

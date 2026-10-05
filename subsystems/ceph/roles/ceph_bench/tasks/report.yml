@@ -1,0 +1,36 @@
+---
+# Render ceph_bench_report (rados | s3 | cephfs) from the facts of every play host,
+# save it with the raw results under <results_dir>/<run>/ and print it.
+- name: Results directory
+  ansible.builtin.file:
+    path: "{{ _bench.results_dir }}/{{ bench_run }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Raw results
+  ansible.builtin.copy:
+    content: >-
+      {{ dict(ansible_play_hosts | zip(ansible_play_hosts | map('extract', hostvars, 'ceph_bench_' ~ ceph_bench_report ~ '_results'))) | to_nice_json }}
+    dest: "{{ _bench.results_dir }}/{{ bench_run }}/{{ ceph_bench_report }}.json"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: ceph_bench_report != 's3'
+
+- name: Report
+  ansible.builtin.template:
+    src: "{{ ceph_bench_report }}.md.j2"
+    dest: "{{ _bench.results_dir }}/{{ bench_run }}/report.md"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Show report
+  ansible.builtin.debug:
+    msg: "{{ lookup('file', _bench.results_dir ~ '/' ~ bench_run ~ '/report.md').splitlines() }}"
+  run_once: true

@@ -1,0 +1,203 @@
+## Argo CD Helm values for the data platform.
+## Ansible (roles/dataplatform_argocd) installs the chart with these values as a
+## k3s HelmChart and adds the SSH host keys of the Git server
+## (configs.ssh.extraHosts). Edit here, then make dataplatform-argocd.
+## Unlike bigdata-k8s-stack there is no ksops: secrets come from OpenBao through
+## External Secrets, so Argo CD never renders a secret value.
+
+# Resource names argocd-server, argocd-repo-server, ... (not argo-cd-argocd-*,
+# after the k3s HelmChart name); the HTTPRoute and the playbooks use them.
+fullnameOverride: argocd
+
+global:
+  domain: argocd.<%= dataplatform_domain %>
+
+crds:
+  keep: true
+
+dex:
+  enabled: false
+
+notifications:
+  enabled: false
+
+configs:
+  params:
+    # TLS ends at the platform Gateway
+    server.insecure: true
+    # Compare with what the API server would store (defaults filled in, e.g. in
+    # HTTPRoutes), not with the raw manifests: no false OutOfSync.
+    controller.diff.server.side: "true"
+
+  cm:
+    url: https://argocd.<%= dataplatform_domain %>
+    # <%= site_admin_group %> log in through Keycloak; the local admin stays off (set
+    # "true" and make dataplatform-argocd to get it back in an emergency)
+    admin.enabled: "false"
+    exec.enabled: false
+    statusbadge.enabled: false
+    timeout.reconciliation: 180s
+    # Kustomize directories may inflate a chart (helmCharts): the Spark
+    # operator's, whose job ClusterRole is patched (manifests/operators/spark-k8s-operator)
+    kustomize.buildOptions: --enable-helm
+    # Keycloak realm <%= dataplatform_keycloak_realm %>. The client secret comes from OpenBao through
+    # the ExternalSecret argocd/argocd-oidc (manifests/core/argocd-gateway); until
+    # Keycloak runs, only the local admin can log in.
+    oidc.config: |
+      name: Keycloak
+      issuer: https://keycloak.<%= dataplatform_domain %>/realms/<%= dataplatform_keycloak_realm %>
+      clientID: argocd
+      clientSecret: $argocd-oidc:client-secret
+      # the groups claim comes from the client's mapper (no "groups" scope in the realm)
+      requestedScopes: [openid, profile, email]
+      enablePKCEAuthentication: true
+
+    # ---------------------------------------------------------------- health ----
+    # An Application is healthy only when its own resources are: the root app's
+    # sync waves then wait for each component before starting the next wave.
+    resource.customizations.health.argoproj.io_Application: |
+      hs = {}
+      hs.status = "Progressing"
+      hs.message = ""
+      if obj.status ~= nil and obj.status.health ~= nil then
+        hs.status = obj.status.health.status
+        if obj.status.health.message ~= nil then
+          hs.message = obj.status.health.message
+        end
+      end
+      return hs
+
+    # Stackable products: Available / Degraded conditions; stopped = Suspended
+    resource.customizations.health.trino.stackable.tech_TrinoCluster: |
+      hs = {status = "Progressing", message = "Waiting for the TrinoCluster"}
+      if obj.status ~= nil and obj.status.conditions ~= nil then
+        for _, c in ipairs(obj.status.conditions) do
+          if c.type == "Stopped" and c.status == "True" then
+            return {status = "Suspended", message = c.message or "stopped"}
+          end
+          if c.type == "Degraded" and c.status == "True" then
+            return {status = "Degraded", message = c.message or "degraded"}
+          end
+        end
+        for _, c in ipairs(obj.status.conditions) do
+          if c.type == "Available" and c.status == "True" then
+            return {status = "Healthy", message = c.message or "available"}
+          end
+        end
+      end
+      return hs
+
+    resource.customizations.health.k8s.keycloak.org_Keycloak: |
+      hs = {status = "Progressing", message = "Waiting for Keycloak to become ready"}
+      if obj.status ~= nil and obj.status.conditions ~= nil then
+        for _, c in ipairs(obj.status.conditions) do
+          if c.type == "HasErrors" and c.status == "True" then
+            return {status = "Degraded", message = c.message or "Keycloak has errors"}
+          end
+        end
+        for _, c in ipairs(obj.status.conditions) do
+          if c.type == "Ready" and c.status == "True" then
+            return {status = "Healthy", message = "Keycloak is ready"}
+          end
+        end
+      end
+      return hs
+
+    resource.customizations.health.k8s.keycloak.org_KeycloakRealmImport: |
+      hs = {status = "Progressing", message = "Realm import in progress"}
+      if obj.status ~= nil and obj.status.conditions ~= nil then
+        for _, c in ipairs(obj.status.conditions) do
+          if c.type == "HasErrors" and c.status == "True" then
+            return {status = "Degraded", message = c.message or "Realm import failed"}
+          end
+        end
+        for _, c in ipairs(obj.status.conditions) do
+          if c.type == "Done" and c.status == "True" then
+            return {status = "Healthy", message = "Realm imported"}
+          end
+        end
+      end
+      return hs
+
+    # Configuration objects without a status
+    resource.customizations.health.s3.stackable.tech_S3Connection: |
+      return {status = "Healthy", message = "configuration"}
+    resource.customizations.health.s3.stackable.tech_S3Bucket: |
+      return {status = "Healthy", message = "configuration"}
+    resource.customizations.health.authentication.stackable.tech_AuthenticationClass: |
+      return {status = "Healthy", message = "configuration"}
+    resource.customizations.health.secrets.stackable.tech_SecretClass: |
+      return {status = "Healthy", message = "configuration"}
+    resource.customizations.health.secrets.stackable.tech_TrustStore: |
+      return {status = "Healthy", message = "configuration"}
+    resource.customizations.health.trino.stackable.tech_TrinoCatalog: |
+      return {status = "Healthy", message = "configuration"}
+    resource.customizations.health.spark.stackable.tech_SparkApplicationTemplate: |
+      return {status = "Healthy", message = "configuration"}
+
+  rbac:
+    # Keycloak groups (groups claim) -> Argo CD roles; everyone else sees nothing.
+    # role:viewer is role:readonly without the pod logs (they hold other
+    # tenants' data, OpenBao's audit stream among them).
+    policy.csv: |
+      p, role:viewer, applications, get, */*, allow
+      p, role:viewer, applicationsets, get, */*, allow
+      p, role:viewer, projects, get, *, allow
+      p, role:viewer, repositories, get, *, allow
+      p, role:viewer, clusters, get, *, allow
+      p, role:viewer, certificates, get, *, allow
+      p, role:viewer, gpgkeys, get, *, allow
+      g, <%= site_admin_group %>, role:admin
+      g, <%= site_engineer_group %>, role:viewer
+    policy.default: ""
+    scopes: "[groups]"
+
+# Metrics services, annotated for the OTel collector (observability)
+controller:
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {memory: 1536Mi}
+  metrics:
+    enabled: true
+    service:
+      annotations: {prometheus.io/scrape: "true", prometheus.io/port: "8082"}
+
+repoServer:
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 1Gi}
+  metrics:
+    enabled: true
+    service:
+      annotations: {prometheus.io/scrape: "true", prometheus.io/port: "8084"}
+  # The full health check takes more than the default 1 s on the RK1 boards
+  # (as in bigdata-k8s-stack): without this the repo server restarts in a loop.
+  readinessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 15
+    timeoutSeconds: 15
+    failureThreshold: 10
+  livenessProbe:
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 15
+    failureThreshold: 10
+
+server:
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 512Mi}
+  metrics:
+    enabled: true
+    service:
+      annotations: {prometheus.io/scrape: "true", prometheus.io/port: "8083"}
+
+applicationSet:
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+    limits: {memory: 256Mi}
+
+redis:
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+    limits: {memory: 256Mi}

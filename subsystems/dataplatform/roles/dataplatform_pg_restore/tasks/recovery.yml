@@ -1,0 +1,42 @@
+---
+# The recovery bootstrap of a cluster restored from the backups of
+# dataplatform_pg_restore_orig (its Barman Cloud ObjectStore), along timeline
+# dataplatform_pg_restore_tli: sets dataplatform_pg_restore_bootstrap and
+# dataplatform_pg_restore_external. The application owner keeps its password
+# (the initdb secret), so the applications log in as before.
+- name: The source's archiver and initdb
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_archiver: >-
+      {{ dataplatform_pg_restore_orig.spec.plugins | default([])
+         | selectattr('name', 'equalto', dataplatform_pg_restore_plugin) | first | default({}) }}
+    dataplatform_pg_restore_initdb: "{{ dataplatform_pg_restore_orig.spec.bootstrap.initdb | default({}) }}"
+
+- name: The source archives through the Barman Cloud plugin and was made by initdb
+  ansible.builtin.assert:
+    that:
+      - dataplatform_pg_restore_archiver.parameters.barmanObjectName is defined
+      - dataplatform_pg_restore_initdb.database is defined
+    fail_msg: >-
+      {{ dataplatform_pg_restore_cluster }} has no {{ dataplatform_pg_restore_plugin }} archiver
+      or no initdb bootstrap: nothing to restore from
+    quiet: true
+
+- name: Recovery bootstrap and source
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_bootstrap:
+      recovery: >-
+        {{ {'source': 'origin',
+            'database': dataplatform_pg_restore_initdb.database,
+            'owner': dataplatform_pg_restore_initdb.owner,
+            'recoveryTarget': {'targetTLI': dataplatform_pg_restore_tli | string}
+                              | combine({'targetTime': dataplatform_pg_restore_target_time}
+                                        if dataplatform_pg_restore_target_time | length > 0 else {})}
+           | combine({'secret': dataplatform_pg_restore_initdb.secret}
+                     if dataplatform_pg_restore_initdb.secret is defined else {}) }}
+    dataplatform_pg_restore_external:
+      - name: origin
+        plugin:
+          name: "{{ dataplatform_pg_restore_plugin }}"
+          parameters:
+            barmanObjectName: "{{ dataplatform_pg_restore_archiver.parameters.barmanObjectName }}"
+            serverName: "{{ dataplatform_pg_restore_archiver.parameters.serverName | default(dataplatform_pg_restore_cluster) }}"

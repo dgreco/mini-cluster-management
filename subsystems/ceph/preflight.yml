@@ -1,0 +1,5 @@
+---
+- name: Ceph host prerequisites
+  hosts: ceph
+  roles:
+    - ceph_preflight

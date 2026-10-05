@@ -1,0 +1,119 @@
+---
+# ---------------------------------------------------------------- lego ----
+- name: Installed lego
+  ansible.builtin.command: /usr/local/bin/lego --version
+  register: acme_lego_installed
+  changed_when: false
+  failed_when: false
+
+- name: Install lego {{ acme_lego_version }}
+  when: acme_lego_installed.rc != 0 or ('version ' ~ acme_lego_version ~ ' ') not in acme_lego_installed.stdout
+  vars:
+    acme_lego_url: https://github.com/go-acme/lego/releases/download/v{{ acme_lego_version }}
+    acme_lego_tarball: lego_v{{ acme_lego_version }}_linux_{{ 'arm64' if ansible_facts['architecture'] == 'aarch64' else 'amd64' }}.tar.gz
+  block:
+    - name: Download lego (checksum verified)
+      ansible.builtin.get_url:
+        url: "{{ acme_lego_url }}/{{ acme_lego_tarball }}"
+        dest: /tmp/{{ acme_lego_tarball }}
+        checksum: "sha256:{{ acme_lego_url }}/lego_{{ acme_lego_version }}_checksums.txt"
+        mode: "0644"
+
+    - name: Unpack lego
+      ansible.builtin.unarchive:
+        src: /tmp/{{ acme_lego_tarball }}
+        dest: /usr/local/bin
+        remote_src: true
+        include: [lego]
+        mode: "0755"
+
+- name: Directory for lego
+  ansible.builtin.file:
+    path: "{{ acme_lego_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: Environment of lego (GoDaddy token)
+  ansible.builtin.template:
+    src: lego.env.j2
+    dest: "{{ acme_lego_dir }}/lego.env"
+    mode: "0600"
+  no_log: true
+
+- name: GoDaddy DNS program and the renewal program
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "0755"
+  loop:
+    - {src: godaddy-dns.sh.j2, dest: "{{ acme_lego_dir }}/godaddy-dns"}
+    - {src: wrapper.sh.j2, dest: "{{ acme_lego_wrapper }}"}
+
+- name: Renewal service and timer
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: /etc/systemd/system/{{ acme_lego_unit }}.{{ item }}
+    mode: "0644"
+  loop: [service, timer]
+  register: acme_lego_units
+
+- name: Enable the renewal timer
+  ansible.builtin.systemd:
+    name: "{{ acme_lego_unit }}.timer"
+    enabled: true
+    state: started
+    daemon_reload: "{{ acme_lego_units is changed }}"
+
+# ---------------------------------------------------------------- certificate ----
+- name: Current certificate
+  ansible.builtin.shell: |
+    set -o pipefail
+    [ -f {{ acme_lego_cert_file }} ] || exit 0
+    openssl x509 -in {{ acme_lego_cert_file }} -noout -fingerprint -sha256 -issuer -ext subjectAltName | tr '\n' ' '
+  args:
+    executable: /bin/bash
+  register: acme_lego_current
+  changed_when: false
+
+# A certificate from the other CA (staging / production) cannot be renewed:
+# the new CA refuses to replace a certificate it did not issue. Start afresh.
+- name: Drop a certificate issued by the other CA
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ acme_lego_cert_file }}"
+    - "{{ acme_lego_key_file }}"
+    - "{{ acme_lego_cert_file | regex_replace('\\.crt$', '.issuer.crt') }}"
+    - "{{ acme_lego_cert_file | regex_replace('\\.crt$', '.json') }}"
+  when:
+    - acme_lego_current.stdout | length > 0
+    - ('STAGING' in acme_lego_current.stdout) != (acme_lego_staging | bool)
+
+# Renew now when a name is missing (lego only looks at the expiry date).
+- name: Obtain the certificate, or renew it when due
+  ansible.builtin.command: >-
+    {{ acme_lego_wrapper }} --no-random-sleep
+    {{ '--renew-force' if acme_lego_force | bool or acme_lego_new_names | bool else '' }}
+  vars:
+    acme_lego_new_names: >-
+      {{ acme_lego_renew_on_new_names | bool
+         and acme_lego_current.stdout | length > 0
+         and ('STAGING' in acme_lego_current.stdout) == (acme_lego_staging | bool)
+         and (acme_lego_domains | map('regex_replace', '^', 'DNS:') | reject('in', acme_lego_current.stdout) | list | length > 0) }}
+  changed_when: false
+
+# Changed when the fingerprint differs from before the run.
+- name: The certificate
+  ansible.builtin.command: >-
+    openssl x509 -in {{ acme_lego_cert_file }} -noout -fingerprint -sha256 -subject -issuer -enddate -ext subjectAltName
+  register: acme_lego_cert
+  changed_when: acme_lego_cert.stdout_lines[0] not in acme_lego_current.stdout
+
+- name: A new certificate this run
+  ansible.builtin.set_fact:
+    acme_lego_changed: "{{ acme_lego_cert is changed }}"
+
+- name: Certificate of {{ acme_lego_cert_name }}
+  ansible.builtin.debug:
+    msg: "{{ acme_lego_cert.stdout_lines[1:] | map('trim') | reject('equalto', '') | list }}"

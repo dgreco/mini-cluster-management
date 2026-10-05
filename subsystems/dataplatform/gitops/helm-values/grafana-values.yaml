@@ -1,0 +1,159 @@
+# Grafana: the platform's dashboards and log search.
+# Login with Keycloak (realm data-platform): platform-admins -> Admin,
+# data-engineers -> Editor, everyone else Viewer. The local admin (from
+# OpenBao, make dataplatform-passwords) is the break-glass login.
+admin:
+  existingSecret: grafana-admin
+  userKey: admin-user
+  passwordKey: admin-password
+
+# client secret of the Keycloak client grafana (ExternalSecret grafana-oidc)
+envFromSecrets:
+  - name: grafana-oidc
+
+# Grafana's own metrics (:3000/metrics), scraped by the OTel cluster collector
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "3000"
+
+persistence:
+  enabled: true
+  storageClassName: ceph-rbd
+  size: 2Gi
+# the volume is ReadWriteOnce: a rolling update would wait forever for the old
+# pod to release it when the new one lands on another node
+deploymentStrategy:
+  type: Recreate
+
+resources:
+  requests: {cpu: 50m, memory: 192Mi}
+  limits: {memory: 512Mi}
+
+plugins:
+  - victoriametrics-logs-datasource
+
+grafana.ini:
+  server:
+    root_url: https://grafana.data.example.org
+  auth:
+    disable_login_form: false
+    signout_redirect_url: https://keycloak.data.example.org/realms/data-platform/protocol/openid-connect/logout?post_logout_redirect_uri=https%3A%2F%2Fgrafana.data.example.org%2Flogin&client_id=grafana
+  auth.generic_oauth:
+    enabled: true
+    name: Keycloak
+    allow_sign_up: true
+    auto_login: false
+    client_id: grafana
+    scopes: openid profile email
+    use_pkce: true
+    auth_url: https://keycloak.data.example.org/realms/data-platform/protocol/openid-connect/auth
+    token_url: https://keycloak.data.example.org/realms/data-platform/protocol/openid-connect/token
+    api_url: https://keycloak.data.example.org/realms/data-platform/protocol/openid-connect/userinfo
+    login_attribute_path: preferred_username
+    name_attribute_path: name
+    email_attribute_path: email
+    groups_attribute_path: groups
+    role_attribute_path: >-
+      contains(groups[*], 'platform-admins') && 'Admin' || contains(groups[*], 'data-engineers') && 'Editor' || 'Viewer'
+    role_attribute_strict: false
+    allow_assign_grafana_admin: true
+  users:
+    auto_assign_org_role: Viewer
+
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: VictoriaMetrics
+        uid: victoriametrics
+        type: prometheus
+        url: http://victoria-metrics.observability.svc:8428
+        access: proxy
+        isDefault: true
+      # Two log stores ("indexes"), as VictoriaLogs tenants: every pod's log
+      # (OTel agent, tenant 0) and the Stackable products' logs (Vector,
+      # tenant 1: AccountID header).
+      - name: VictoriaLogs
+        uid: victorialogs
+        type: victoriametrics-logs-datasource
+        url: http://victoria-logs.observability.svc:9428
+        access: proxy
+      - name: VictoriaLogs Stackable
+        uid: victorialogs-stackable
+        type: victoriametrics-logs-datasource
+        url: http://victoria-logs.observability.svc:9428
+        access: proxy
+        jsonData:
+          httpHeaderName1: AccountID
+          httpHeaderName2: ProjectID
+        secureJsonData:
+          httpHeaderValue1: "1"
+          httpHeaderValue2: "0"
+
+# Community dashboards from grafana.com (downloaded when Grafana starts); their
+# ${DS_*} data source inputs point at VictoriaMetrics. More dashboards: add a
+# ConfigMap labelled grafana_dashboard=1 in observability.
+dashboardProviders:
+  dashboardproviders.yaml:
+    apiVersion: 1
+    providers:
+      - name: platform
+        folder: Platform
+        type: file
+        disableDeletion: false
+        options:
+          path: /var/lib/grafana/dashboards/platform
+# grafana.com dashboards, pinned: without a revision the chart downloads
+# revision 1, the oldest
+dashboards:
+  platform:
+    node-exporter-full:
+      gnetId: 1860
+      revision: 45
+      datasource: [{name: DS_PROMETHEUS, value: victoriametrics}]
+    kubernetes-global:
+      gnetId: 15757
+      revision: 43
+      datasource: [{name: DS_PROMETHEUS, value: victoriametrics}]
+    kubernetes-namespaces:
+      gnetId: 15758
+      revision: 46
+      datasource: [{name: DS_PROMETHEUS, value: victoriametrics}]
+    kubernetes-nodes:
+      gnetId: 15759
+      revision: 40
+      datasource: [{name: DS_PROMETHEUS, value: victoriametrics}]
+    kubernetes-pods:
+      gnetId: 15760
+      revision: 41
+      datasource: [{name: DS_PROMETHEUS, value: victoriametrics}]
+    ceph-cluster:
+      gnetId: 2842
+      revision: 18
+      datasource: [{name: DS_PROMETHEUS, value: victoriametrics}]
+    cloudnative-pg:
+      gnetId: 20417
+      revision: 4
+      datasource: [{name: DS_PROMETHEUS, value: victoriametrics}, {name: DS_EXPRESSION, value: __expr__}]
+    argo-cd:
+      gnetId: 14584
+      revision: 1
+      datasource: [{name: DS_PROMETHEUS, value: victoriametrics}]
+    victoria-metrics:
+      gnetId: 10229
+      revision: 58
+      datasource: [{name: DS_PROMETHEUS, value: victoriametrics}]
+    opentelemetry-collector:
+      gnetId: 15983
+      revision: 31
+      datasource: [{name: DS_PROMETHEUS, value: victoriametrics}]
+
+sidecar:
+  dashboards:
+    enabled: true
+    label: grafana_dashboard
+    labelValue: "1"
+    folderAnnotation: grafana_folder
+    provider:
+      # the ConfigMap's grafana_folder annotation is the Grafana folder
+      foldersFromFilesStructure: true

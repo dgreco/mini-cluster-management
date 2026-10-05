@@ -1,0 +1,10 @@
+---
+# OpenBao: initialise it once (keys in .secrets/openbao-init.json), then
+# converge KV, Kubernetes auth, the per-namespace SecretStore roles and the
+# generated values. The first install waits here until Argo CD has reached
+# OpenBao's wave.
+- name: OpenBao
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  roles:
+    - dataplatform_openbao

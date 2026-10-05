@@ -1,0 +1,16 @@
+# Kubernetes API logins through Keycloak (k3s_oidc_* in inventory/group_vars/
+# k3s.yml): user oidc:<username>, groups oidc:<group>. Members of the Keycloak
+# group <%= site_admin_group %> administer the cluster; data users only get the Spark
+# jobs of compute (RoleBinding spark-submitter, written by iam-sync).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: oidc-<%= site_admin_group %>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: "oidc:<%= site_admin_group %>"

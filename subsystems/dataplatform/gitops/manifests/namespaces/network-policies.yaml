@@ -1,0 +1,87 @@
+# Ingress policies of the namespaces that hold secrets and state. Pod-to-pod
+# traffic from any other namespace is refused unless listed. Traffic from a
+# node to a pod on the same node (kubelet probes) is not subject to k3s's
+# policy controller, but a node reaching a pod on another node (Ansible
+# calling OpenBao or Keycloak from the first k3s server, the certificate job)
+# arrives through the overlay from the node's flannel address: those are
+# listed (one .0 and one .1 per node's pod CIDR, 10.42.N.0/24). Egress is not
+# restricted here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingress
+  namespace: governance
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {}}]                                                     # Keycloak, OpenBao, PostgreSQL, iam-sync, the operator, among themselves
+    - from:                                                                             # the nodes themselves, through the overlay
+        - {ipBlock: {cidr: 10.42.0.0/32}}
+        - {ipBlock: {cidr: 10.42.0.1/32}}
+        - {ipBlock: {cidr: 10.42.1.0/32}}
+        - {ipBlock: {cidr: 10.42.1.1/32}}
+        - {ipBlock: {cidr: 10.42.2.0/32}}
+        - {ipBlock: {cidr: 10.42.2.1/32}}
+        - {ipBlock: {cidr: 10.42.3.0/32}}
+        - {ipBlock: {cidr: 10.42.3.1/32}}
+        - {ipBlock: {cidr: 192.168.1.0/24}}
+    - from:                                                                             # the Gateway's NGINX pods (in the Gateway's namespace, core; the controller in nginx-gateway): every web UI and the public OIDC endpoints
+        - {namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: core}}}
+        - {namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: nginx-gateway}}}
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: operators}}}]       # External Secrets (OpenBao), CloudNativePG (its instances)
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: observability}}}]   # scrapes
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: compute}}}]         # Trino and the Spark jobs: the Iceberg catalog
+      ports: [{protocol: TCP, port: 5432}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingress
+  namespace: observability
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {}}]                                                     # collectors, aggregator, stores and Grafana among themselves
+    - from:                                                                             # the nodes themselves, through the overlay
+        - {ipBlock: {cidr: 10.42.0.0/32}}
+        - {ipBlock: {cidr: 10.42.0.1/32}}
+        - {ipBlock: {cidr: 10.42.1.0/32}}
+        - {ipBlock: {cidr: 10.42.1.1/32}}
+        - {ipBlock: {cidr: 10.42.2.0/32}}
+        - {ipBlock: {cidr: 10.42.2.1/32}}
+        - {ipBlock: {cidr: 10.42.3.0/32}}
+        - {ipBlock: {cidr: 10.42.3.1/32}}
+        - {ipBlock: {cidr: 192.168.1.0/24}}
+    - from:                                                                             # the Gateway's NGINX pods (in core) and its controller: Grafana
+        - {namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: core}}}
+        - {namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: nginx-gateway}}}
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: compute}}}]         # the Vector agents of Trino, the Spark history server and the jobs
+      ports: [{protocol: TCP, port: 6000}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingress
+  namespace: tools
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {}}]                                                     # the hub, the proxy and the notebooks among themselves (JupyterHub's own policies narrow it)
+    - from:                                                                             # the nodes themselves, through the overlay
+        - {ipBlock: {cidr: 10.42.0.0/32}}
+        - {ipBlock: {cidr: 10.42.0.1/32}}
+        - {ipBlock: {cidr: 10.42.1.0/32}}
+        - {ipBlock: {cidr: 10.42.1.1/32}}
+        - {ipBlock: {cidr: 10.42.2.0/32}}
+        - {ipBlock: {cidr: 10.42.2.1/32}}
+        - {ipBlock: {cidr: 10.42.3.0/32}}
+        - {ipBlock: {cidr: 10.42.3.1/32}}
+        - {ipBlock: {cidr: 192.168.1.0/24}}
+    - from:                                                                             # the Gateway's NGINX pods (in core) and its controller: the proxy
+        - {namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: core}}}
+        - {namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: nginx-gateway}}}
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: observability}}}]   # scrapes of the hub's metrics
+      ports: [{protocol: TCP, port: 8081}]

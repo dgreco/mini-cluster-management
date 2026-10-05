@@ -1,0 +1,20 @@
+---
+# Benchmark settings, read from the admin host so that any `bench_hosts`
+# pattern gets them. `-e ceph_bench_*` overrides apply.
+_admin: "{{ groups['ceph_mons'][0] }}"
+_bench:
+  duration: "{{ hostvars[_admin]['ceph_bench_duration'] }}"
+  results_dir: "{{ hostvars[_admin]['ceph_bench_results_dir'] }}"
+  rados_pool: "{{ hostvars[_admin]['ceph_bench_rados_pool'] }}"
+  rados_threads: "{{ hostvars[_admin]['ceph_bench_rados_threads'] }}"
+  rados_block_size: "{{ hostvars[_admin]['ceph_bench_rados_block_size'] }}"
+  warp_version: "{{ hostvars[_admin]['ceph_bench_warp_version'] }}"
+  s3_uid: "{{ hostvars[_admin]['ceph_bench_s3_uid'] }}"
+  s3_target: "{{ hostvars[_admin]['ceph_bench_s3_target'] }}"
+  s3_ops: "{{ hostvars[_admin]['ceph_bench_s3_ops'] }}"
+  s3_obj_size: "{{ hostvars[_admin]['ceph_bench_s3_obj_size'] }}"
+  s3_concurrent: "{{ hostvars[_admin]['ceph_bench_s3_concurrent'] }}"
+  s3_objects: "{{ hostvars[_admin]['ceph_bench_s3_objects'] }}"
+  fio_size: "{{ hostvars[_admin]['ceph_bench_fio_size'] }}"
+  fio_jobs: "{{ hostvars[_admin]['ceph_bench_fio_jobs'] }}"
+  mount_point: "{{ hostvars[_admin]['ceph_cephfs_mount_point'] }}"

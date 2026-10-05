@@ -1,0 +1,142 @@
+---
+# Check mode: restore the backups of dataplatform_pg_restore_cluster into a
+# scratch cluster <cluster>-restore-check (one instance, no WAL archiver, so
+# it never writes into the source's backups), compare it with the live
+# database, try the bootstrap switch replace mode relies on, delete it.
+# The live cluster is only read.
+- name: Read the live cluster
+  ansible.builtin.include_tasks: live.yml
+
+- name: The live cluster exists
+  ansible.builtin.assert:
+    that: dataplatform_pg_restore_live | length > 0
+    fail_msg: "{{ dataplatform_pg_restore_cluster }} does not exist in {{ dataplatform_pg_restore_namespace }}"
+    quiet: true
+
+- name: Source, primary and scratch name
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_orig: "{{ dataplatform_pg_restore_live }}"
+    dataplatform_pg_restore_primary: "{{ dataplatform_pg_restore_live.status.currentPrimary }}"
+    dataplatform_pg_restore_scratch: "{{ dataplatform_pg_restore_cluster }}-restore-check"
+
+- name: Timeline to follow
+  ansible.builtin.include_tasks: timeline.yml
+
+- name: Recovery bootstrap
+  ansible.builtin.include_tasks: recovery.yml
+
+- name: No scratch cluster left from an earlier run
+  ansible.builtin.shell: |
+    set -o pipefail
+    k="{{ dataplatform_pg_restore_kubectl }} -n {{ dataplatform_pg_restore_namespace }}"
+    $k delete clusters.postgresql.cnpg.io {{ dataplatform_pg_restore_scratch }} --ignore-not-found --wait=true
+    end=$((SECONDS + 300))
+    while [ -n "$($k get pods,pvc -l cnpg.io/cluster={{ dataplatform_pg_restore_scratch }} -o name)" ]; do
+      if [ $SECONDS -ge $end ]; then echo "pods or volumes of {{ dataplatform_pg_restore_scratch }} still there"; exit 1; fi
+      sleep 5
+    done
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Create the scratch cluster {{ dataplatform_pg_restore_scratch }}
+  ansible.builtin.command:
+    argv: ["/usr/local/bin/k3s", "kubectl", "create", "-f", "-"]
+    stdin: >-
+      {{ {'apiVersion': dataplatform_pg_restore_orig.apiVersion, 'kind': 'Cluster',
+          'metadata': {'name': dataplatform_pg_restore_scratch, 'namespace': dataplatform_pg_restore_namespace},
+          'spec': dataplatform_pg_restore_orig.spec
+                  | dict2items | rejectattr('key', 'in', ['plugins', 'backup', 'externalClusters']) | items2dict
+                  | combine({'instances': 1, 'bootstrap': dataplatform_pg_restore_bootstrap,
+                             'externalClusters': dataplatform_pg_restore_external})} | to_json }}
+  changed_when: true
+
+- name: Wait until the scratch cluster has recovered
+  ansible.builtin.shell: |
+    set -o pipefail
+    k="{{ dataplatform_pg_restore_kubectl }} -n {{ dataplatform_pg_restore_namespace }}"
+    end=$((SECONDS + {{ dataplatform_pg_restore_timeout }}))
+    while :; do
+      s=$($k get clusters.postgresql.cnpg.io {{ dataplatform_pg_restore_scratch }} -o 'jsonpath={.status.phase}|{.status.readyInstances}')
+      [ "$s" = "Cluster in healthy state|1" ] && exit 0
+      if [ $SECONDS -ge $end ]; then echo "not recovered: $s"; exit 1; fi
+      sleep 15
+    done
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Rows in the live database
+  ansible.builtin.include_tasks: counts.yml
+  vars:
+    dataplatform_pg_restore_count_pod: "{{ dataplatform_pg_restore_primary }}"
+    dataplatform_pg_restore_count_db: "{{ dataplatform_pg_restore_initdb.database }}"
+
+- name: Keep them
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_live_counts: "{{ dataplatform_pg_restore_counts }}"
+
+- name: Rows in the restored database
+  ansible.builtin.include_tasks: counts.yml
+  vars:
+    dataplatform_pg_restore_count_pod: "{{ dataplatform_pg_restore_scratch }}-1"
+    dataplatform_pg_restore_count_db: "{{ dataplatform_pg_restore_initdb.database }}"
+
+- name: Compare
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_missing: >-
+      {{ dataplatform_pg_restore_live_counts.keys() | difference(dataplatform_pg_restore_counts.keys()) }}
+    dataplatform_pg_restore_report: |-
+      {%- set out = [] -%}
+      {%- for t, n in dataplatform_pg_restore_live_counts.items() -%}
+      {%-   if t in dataplatform_pg_restore_counts and dataplatform_pg_restore_counts[t] != n -%}
+      {%-     set _ = out.append(t ~ ' live ' ~ n ~ ' restored ' ~ dataplatform_pg_restore_counts[t]) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: The switch back to the initdb bootstrap is accepted (replace mode relies on it)
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - -n
+      - "{{ dataplatform_pg_restore_namespace }}"
+      - patch
+      - clusters.postgresql.cnpg.io
+      - "{{ dataplatform_pg_restore_scratch }}"
+      - --type=json
+      - -p
+      - >-
+        {{ [{'op': 'replace', 'path': '/spec/bootstrap', 'value': dataplatform_pg_restore_orig.spec.bootstrap},
+            {'op': 'remove', 'path': '/spec/externalClusters'}] | to_json }}
+  changed_when: true
+
+- name: Delete the scratch cluster (its volume goes with it)
+  ansible.builtin.shell: |
+    set -o pipefail
+    k="{{ dataplatform_pg_restore_kubectl }} -n {{ dataplatform_pg_restore_namespace }}"
+    $k delete clusters.postgresql.cnpg.io {{ dataplatform_pg_restore_scratch }} --wait=true
+    end=$((SECONDS + 300))
+    while [ -n "$($k get pods,pvc -l cnpg.io/cluster={{ dataplatform_pg_restore_scratch }} -o name)" ]; do
+      if [ $SECONDS -ge $end ]; then echo "pods or volumes of {{ dataplatform_pg_restore_scratch }} still there"; exit 1; fi
+      sleep 5
+    done
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+- name: The backups restore
+  ansible.builtin.assert:
+    that:
+      - dataplatform_pg_restore_counts | length > 0
+      - dataplatform_pg_restore_missing | length == 0
+    fail_msg: >-
+      {{ dataplatform_pg_restore_cluster }}: the restored database has
+      {{ dataplatform_pg_restore_counts | length }} tables; missing: {{ dataplatform_pg_restore_missing | join(', ') }}
+    success_msg: >-
+      {{ dataplatform_pg_restore_cluster }}: restored along timeline {{ dataplatform_pg_restore_tli }}
+      {{ ('to ' ~ dataplatform_pg_restore_target_time) if dataplatform_pg_restore_target_time | length > 0 else 'to the last archived WAL' }},
+      {{ dataplatform_pg_restore_counts | length }} tables, all present;
+      {{ ('rows differ (live writes since the last archived WAL, or the point in time): ' ~ dataplatform_pg_restore_report | join('; '))
+         if dataplatform_pg_restore_report | length > 0 else 'same rows in every table' }}

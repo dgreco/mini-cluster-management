@@ -1,0 +1,85 @@
+# Hourly purge of finished Spark jobs (spark_cleanup.py): SparkApplications
+# that ended more than 24 hours ago (their ConfigMaps go with them) and the
+# spark-token-<job> Secrets that no unfinished job mounts (30 minutes after
+# they were written: the job follows its token). Logs stay in VictoriaLogs,
+# event logs in the Spark History Server.
+#
+# Its account may list Secrets in compute (RBAC cannot grant names only): the
+# script asks for metadata only, and nothing else runs as this account.
+# Submitters can already mount any Secret of compute by name in a job.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spark-cleanup
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spark-cleanup
+rules:
+  - apiGroups: [spark.stackable.tech]
+    resources: [sparkapplications]
+    verbs: [list, delete]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [list, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spark-cleanup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spark-cleanup
+subjects:
+  - kind: ServiceAccount
+    name: spark-cleanup
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: spark-cleanup
+spec:
+  schedule: "41 * * * *"
+  # only the latest missed run starts after a power-on
+  startingDeadlineSeconds: 3600
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: spark-cleanup
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: cleanup
+              image: docker.io/library/python:3.13-alpine@sha256:79e7a9b9ff1cbceff819f856fb374477792a5967759d94df266de7b7b4120e6f
+              command: [python3, -u, /app/spark_cleanup.py]
+              env:
+                - {name: NAMESPACE, value: compute}
+                - {name: RETENTION_HOURS, value: "24"}
+                - {name: TOKEN_GRACE_MINUTES, value: "30"}  # a token Secret is written just before its job
+                - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+                limits: {memory: 128Mi}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - {name: script, mountPath: /app, readOnly: true}
+          volumes:
+            - name: script
+              configMap:
+                name: spark-cleanup-script

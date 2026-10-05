@@ -1,0 +1,6 @@
+# Kubernetes object state (deployments, pods, PVCs...) for the dashboards;
+# the Service is annotated so the OTel collector scrapes it.
+prometheusScrape: true
+resources:
+  requests: {cpu: 10m, memory: 64Mi}
+  limits: {memory: 192Mi}

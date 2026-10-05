@@ -1,0 +1,5 @@
+---
+- name: Monitoring stack (Prometheus, Alertmanager, Grafana, node/ceph exporters)
+  hosts: ceph_mons[0]
+  roles:
+    - ceph_monitoring

@@ -1,0 +1,94 @@
+---
+# Runs on every ceph_osds host. Only LVM logical volumes listed in
+# ceph_osd_devices are ever touched; everything else on the node (the PV, the
+# VG, other LVs, raw disks) is out of bounds. Orchestrator commands are
+# delegated to the admin host.
+#
+# Device states:
+#   osd      already an OSD of this cluster (LVM tags, the cluster's fsid) -> nothing to do
+#   not-lv   not an LVM logical volume              -> refused
+#   mounted  mounted somewhere                      -> refused
+#   dirty    carries a signature (old BlueStore...) -> refused unless ceph_osd_zap_devices
+#   free     empty LV                               -> becomes an OSD
+- name: The cluster's fsid
+  ansible.builtin.command: cephadm shell -- ceph fsid
+  delegate_to: "{{ ceph_admin_host }}"
+  register: ceph_osds_fsid
+  changed_when: false
+  run_once: true
+
+# An OSD volume of another cluster (an earlier install, the same fsid tag
+# missing) is dirty: it holds data this cluster cannot use.
+- name: Classify each configured volume
+  ansible.builtin.shell: |
+    set -o pipefail
+    dev="{{ item }}"
+    if ! lvs --noheadings -o lv_name "$dev" >/dev/null 2>&1; then echo not-lv; exit 0; fi
+    tags=$(lvs --noheadings -o lv_tags "$dev")
+    if grep -q 'ceph.osd_id' <<<"$tags"; then
+      grep -q 'ceph.cluster_fsid={{ ceph_osds_fsid.stdout | trim }}' <<<"$tags" && { echo osd; exit 0; }
+      echo dirty; exit 0
+    fi
+    if findmnt -rn -S "$(readlink -f "$dev")" >/dev/null 2>&1; then echo mounted; exit 0; fi
+    if [ -n "$(wipefs -n "$dev" 2>/dev/null)" ]; then echo dirty; exit 0; fi
+    echo free
+  args:
+    executable: /bin/bash
+  loop: "{{ ceph_osd_devices }}"
+  register: ceph_osds_device_state
+  changed_when: false
+
+- name: Signatures on dirty volumes
+  ansible.builtin.shell: |
+    set -o pipefail
+    wipefs -n {{ item.item }}
+    lvs --noheadings -o lv_tags {{ item.item }} | tr ',' '\n' | grep -E 'ceph.(cluster_fsid|osd_id)=' || true
+  args:
+    executable: /bin/bash
+  loop: "{{ ceph_osds_device_state.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  register: ceph_osds_device_sig
+  changed_when: false
+  when: item.stdout == 'dirty'
+
+- name: Refuse anything that is not an empty, unmounted logical volume
+  ansible.builtin.fail:
+    msg: >-
+      {{ item.item }} on {{ inventory_hostname }}:
+      {% if item.stdout == 'not-lv' %}not an LVM logical volume. Only LVs (e.g. /dev/vg_data/lv_data) are accepted.
+      {% elif item.stdout == 'mounted' %}is mounted. Unmount it and remove it from /etc/fstab first.
+      {% else %}carries existing signatures:
+      {{ ceph_osds_device_sig.results | selectattr('item.item', 'equalto', item.item) | map(attribute='stdout') | first }}
+      Set ceph_osd_zap_devices=true to wipe the volume contents (data loss; the LV itself is kept).
+      {% endif %}
+  loop: "{{ ceph_osds_device_state.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: >-
+    item.stdout in ['not-lv', 'mounted']
+    or (item.stdout == 'dirty' and not ceph_osd_zap_devices | bool)
+
+# `ceph-volume lvm zap` WITHOUT --destroy: wipes the contents, keeps the LV.
+# Never use `ceph orch device zap` here: it adds --destroy and would remove the LV.
+- name: Zap dirty volumes
+  ansible.builtin.command: cephadm --image {{ ceph_image }} ceph-volume -- lvm zap {{ item.item }}
+  loop: "{{ ceph_osds_device_state.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - item.stdout == 'dirty'
+    - ceph_osd_zap_devices | bool
+  changed_when: true
+
+- name: Create OSDs
+  ansible.builtin.command: >-
+    cephadm shell -- ceph orch daemon add osd
+    {{ ansible_facts['nodename'] }}:{{ item.item }}
+  loop: "{{ ceph_osds_device_state.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  delegate_to: "{{ ceph_admin_host }}"
+  throttle: 1
+  when: item.stdout in ['free', 'dirty']
+  changed_when: true

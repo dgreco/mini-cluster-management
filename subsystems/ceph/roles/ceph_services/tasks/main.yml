@@ -1,0 +1,28 @@
+---
+- name: Spec directory
+  ansible.builtin.file:
+    path: /etc/ceph/specs
+    state: directory
+    mode: "0750"
+
+- name: Render mon/mgr/crash spec
+  ansible.builtin.template:
+    src: base.yml.j2
+    dest: /etc/ceph/specs/base.yml
+    mode: "0640"
+  register: ceph_services_base_spec
+
+- name: Apply base spec
+  ansible.builtin.command: cephadm shell --mount /etc/ceph/specs -- ceph orch apply -i /mnt/specs/base.yml
+  when: ceph_services_base_spec.changed or (ceph_force_apply | default(false) | bool)
+  changed_when: true
+
+- name: Cluster-wide configuration
+  ansible.builtin.include_role:
+    name: ceph_config
+  vars:
+    ceph_config_entries: >-
+      {{ [
+           {'who': 'global', 'name': 'public_network',  'value': ceph_public_network},
+           {'who': 'global', 'name': 'cluster_network', 'value': ceph_cluster_network}
+         ] + ceph_extra_config }}

@@ -1,0 +1,16 @@
+---
+- name: Bootstrap the first monitor
+  hosts: ceph_mons[0]
+  roles:
+    - ceph_bootstrap
+
+- name: Trust the orchestrator SSH key on every ceph host
+  hosts: ceph
+  gather_facts: false
+  tasks:
+    - name: Authorize cephadm key for root
+      ansible.builtin.lineinfile:
+        path: /root/.ssh/authorized_keys
+        line: "{{ hostvars[groups['ceph_mons'][0]]['ceph_bootstrap_ssh_pubkey'] }}"
+        create: true
+        mode: "0600"

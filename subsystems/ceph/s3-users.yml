@@ -1,0 +1,50 @@
+---
+# List S3 users with display name, caps, bucket count and whether local
+# credential files exist in .secrets/.
+#   make ceph-s3-users
+- name: S3 users
+  hosts: ceph_mons[0]
+  gather_facts: false
+  tasks:
+    - name: S3 must be enabled
+      ansible.builtin.assert:
+        that: ceph_rgw_enabled | bool
+        fail_msg: "set ceph_rgw_enabled=true in inventory/group_vars/ceph/ and run make ceph-s3"
+
+    - name: List user ids
+      ansible.builtin.command: cephadm shell -- radosgw-admin user list
+      register: user_list
+      changed_when: false
+
+    - name: Read each user
+      ansible.builtin.command: cephadm shell -- radosgw-admin user info --uid={{ item }}
+      loop: "{{ user_list.stdout | from_json }}"
+      register: user_infos
+      changed_when: false
+      no_log: true
+
+    - name: Count buckets per user
+      ansible.builtin.command: cephadm shell -- radosgw-admin bucket list --uid={{ item }}
+      loop: "{{ user_list.stdout | from_json }}"
+      register: user_buckets
+      changed_when: false
+      no_log: true
+
+    - name: Build the table
+      ansible.builtin.set_fact:
+        s3_users_table: >-
+          {{ (s3_users_table | default([])) + [
+               '%-16s %-24s buckets=%-3s caps=%s  local=%s' | format(
+                 (item.0.stdout | from_json).user_id,
+                 (item.0.stdout | from_json).display_name,
+                 item.1.stdout | from_json | length,
+                 ((item.0.stdout | from_json).caps | map(attribute='type') | list | join(',')) or '-',
+                 lookup('ansible.builtin.fileglob', secrets_dir ~ '/s3-' ~ (item.0.stdout | from_json).user_id ~ '.*') | length > 0
+               ) ] }}
+      loop: "{{ user_infos.results | zip(user_buckets.results) | list }}"
+      loop_control:
+        label: "{{ item.0.item }}"
+
+    - name: S3 users ({{ user_list.stdout | from_json | length }})
+      ansible.builtin.debug:
+        msg: "{{ s3_users_table | default(['no users']) }}"

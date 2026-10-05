@@ -1,0 +1,23 @@
+---
+- name: Gather facts from every ceph host
+  hosts: ceph
+  tasks: []
+
+- name: Local keepalived image for the ingress (arm64-safe)
+  hosts: ceph_ingress
+  serial: 1   # a rebuilt image restarts keepalived: one holder of the virtual IP at a time
+  roles:
+    - role: ceph_ingress_image
+      when: ceph_rgw_enabled | bool and ceph_rgw_ingress_enabled | bool
+
+- name: Let's Encrypt certificate for the S3 endpoint
+  hosts: ceph_mons[0]
+  roles:
+    - role: ceph_acme
+      when: ceph_rgw_enabled | bool and ceph_rgw_acme_active | bool
+
+- name: RGW (S3), STS, ingress and admin user
+  hosts: ceph_mons[0]
+  roles:
+    - role: ceph_rgw
+      when: ceph_rgw_enabled | bool

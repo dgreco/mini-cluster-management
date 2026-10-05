@@ -1,0 +1,196 @@
+---
+# Ceph RGW trusts the realm: the OIDC provider in the platform's IAM account
+# (make dataplatform-ceph made the account and its users), and the platform's
+# own STS roles (the admin groups', Meta Catalog's provisioner's). Every other
+# role is Meta Catalog's: authorize and reject make them from the grants an
+# administrator approved (record governance/metacatalog-grants), iam-reconcile
+# keeps them so every hour; they may not touch these two. RGW
+# fetches the realm's JWKS at every web-identity call and checks the signing
+# certificate's SHA-1, so every RGW host must reach Keycloak and the
+# thumbprint follows the realm key (this converges it).
+- name: Every RGW host reaches Keycloak (hosts resolve the public name to the gateway nodes)
+  ansible.builtin.uri:
+    url: "{{ dataplatform_keycloak_issuer }}/protocol/openid-connect/certs"
+    timeout: 10
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['ceph_rgws'] }}"
+
+- name: Key of the account's root user
+  ansible.builtin.command: cephadm shell -- radosgw-admin user info --uid={{ dataplatform_account_root_uid }}
+  register: dataplatform_iam_owner
+  changed_when: false
+  no_log: true
+
+- name: The account exists
+  ansible.builtin.assert:
+    that: (dataplatform_iam_owner.stdout | from_json).account_id | default('') == dataplatform_rgw_account_id
+    fail_msg: "the RGW user {{ dataplatform_account_root_uid }} is not in the account {{ dataplatform_rgw_account_id }}: run make dataplatform-ceph first"
+    quiet: true
+
+- name: OIDC provider in the account (client IDs, JWKS thumbprint)
+  ansible.builtin.command: >-
+    {{ ansible_playbook_python }} {{ dataplatform_gitops_dir }}/../../ceph/files/oidc_provider.py
+    --endpoint {{ dataplatform_s3_endpoint }}
+    --region {{ dataplatform_s3_region }}
+    --account-id {{ dataplatform_rgw_account_id }}
+    --url {{ dataplatform_keycloak_issuer }}
+    {% for c in dataplatform_iam_client_ids %}--client-id {{ c }} {% endfor %}
+  environment:   # the keys stay off the command line (visible in ps on the control node)
+    AWS_ACCESS_KEY_ID: "{{ (dataplatform_iam_owner.stdout | from_json)['keys'][0].access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ (dataplatform_iam_owner.stdout | from_json)['keys'][0].secret_key }}"
+  delegate_to: localhost
+  become: false
+  register: dataplatform_iam_provider
+  changed_when: (dataplatform_iam_provider.stdout | from_json).changed
+  no_log: true
+
+- name: Provider
+  ansible.builtin.debug:
+    msg: "{{ dataplatform_iam_provider.stdout | from_json }}"
+
+- name: The platform's settings (gitops/iam/access.yaml)
+  ansible.builtin.set_fact:
+    dataplatform_iam_access: "{{ lookup('ansible.builtin.file', dataplatform_gitops_dir ~ '/iam/access.yaml') | from_yaml }}"
+
+# The RGW user metacatalog-iam may not touch these roles: its policy (make
+# dataplatform-ceph) names them from the inventory
+- name: The platform settings in access.yaml agree with the inventory
+  ansible.builtin.assert:
+    that:
+      - dataplatform_iam_access.bucket == dataplatform_bucket
+      - dataplatform_iam_access.admins.groups | sort == dataplatform_iam_admin_groups | sort
+      - dataplatform_iam_access.metacatalog.provisioner == dataplatform_metacatalog_provisioner
+    fail_msg: >-
+      gitops/iam/access.yaml and inventory/group_vars/dataplatform.yml disagree (bucket, admin groups,
+      Meta Catalog's provisioner): make them name the same, then run make dataplatform-ceph and this again.
+    quiet: true
+
+- name: The platform's roles - the admin groups', Meta Catalog's provisioner's
+  ansible.builtin.command:
+    argv: >-
+      {{ [ansible_playbook_python, role_path ~ '/files/platform_roles.py',
+          '--endpoint', dataplatform_s3_endpoint, '--region', dataplatform_s3_region,
+          '--account-id', dataplatform_rgw_account_id, '--idp', dataplatform_iam_idp, '--trino-user', dataplatform_trino_uid,
+          '--bucket', dataplatform_bucket, '--prefix', dataplatform_iam_access.metacatalog.prefix,
+          '--provisioner', dataplatform_metacatalog_provisioner,
+          '--max-session', dataplatform_sts_max_session_duration | string]
+         + (dataplatform_iam_admin_groups | map('regex_replace', '^', '--admin-group=') | list)
+         + (['--check'] if ansible_check_mode else []) }}
+  environment:   # the keys stay off the command line
+    AWS_ACCESS_KEY_ID: "{{ (dataplatform_iam_owner.stdout | from_json)['keys'][0].access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ (dataplatform_iam_owner.stdout | from_json)['keys'][0].secret_key }}"
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  register: dataplatform_iam_platform_roles
+  changed_when: (dataplatform_iam_platform_roles.stdout | from_json).changed and not ansible_check_mode
+
+- name: The platform's roles
+  ansible.builtin.debug:
+    msg: "{{ (dataplatform_iam_platform_roles.stdout | from_json).actions or 'unchanged' }}"
+
+- name: Roles in the account
+  ansible.builtin.command: cephadm shell -- radosgw-admin role list --account-id={{ dataplatform_rgw_account_id }} --format json
+  register: dataplatform_iam_roles
+  changed_when: false
+
+- name: Roles
+  ansible.builtin.debug:
+    msg: "{{ dataplatform_iam_roles.stdout | from_json | map(attribute='RoleName') | sort | join(', ') }}"
+
+# ---------------------------------------------------------------- the model before the account ----
+# Only with -e dataplatform_iam_prune=true: the account-less roles grp-<g>
+# and OIDC provider of the per-group-bucket model, and its buckets (<g>-data,
+# shared-data: those the platform's user owned, now the account's) when
+# empty. A bucket with objects is kept and named; nothing else is touched.
+- name: Account-less roles
+  ansible.builtin.command: cephadm shell -- radosgw-admin role list --format json
+  register: dataplatform_iam_roles_old
+  changed_when: false
+  when: dataplatform_iam_prune | bool
+
+- name: Roles of the earlier model
+  ansible.builtin.set_fact:
+    dataplatform_iam_stale_roles: >-
+      {{ dataplatform_iam_roles_old.stdout | from_json | map(attribute='Arn')
+         | select('match', '^arn:aws:iam:::role/' ~ (dataplatform_iam_group_role_prefix | regex_escape))
+         | map('regex_replace', '^arn:aws:iam:::role/', '') | list }}
+  when: dataplatform_iam_prune | bool
+
+- name: Detach the policies of the stale roles
+  ansible.builtin.command: cephadm shell -- radosgw-admin role-policy rm --role-name={{ item }} --policy-name=access
+  loop: "{{ dataplatform_iam_stale_roles | default([]) }}"
+  failed_when: false
+  changed_when: true
+  when: dataplatform_iam_prune | bool
+
+- name: Delete the stale roles
+  ansible.builtin.command: cephadm shell -- radosgw-admin role delete --role-name={{ item }}
+  loop: "{{ dataplatform_iam_stale_roles | default([]) }}"
+  changed_when: true
+  when: dataplatform_iam_prune | bool
+
+- name: Delete the account-less OIDC provider
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -c
+      - |
+        import boto3, botocore, os
+        iam = boto3.client("iam", endpoint_url=os.environ["ENDPOINT"], region_name=os.environ["REGION"])
+        arn = "arn:aws:iam:::oidc-provider/" + os.environ["IDP"]
+        try:
+            iam.delete_open_id_connect_provider(OpenIDConnectProviderArn=arn)
+            print("deleted")
+        except botocore.exceptions.ClientError as e:
+            print("absent" if "NoSuchEntity" in str(e) else str(e))
+  environment:
+    ENDPOINT: "{{ dataplatform_s3_endpoint }}"
+    REGION: "{{ dataplatform_s3_region }}"
+    IDP: "{{ dataplatform_iam_idp }}"
+    AWS_ACCESS_KEY_ID: "{{ dataplatform_iam_s3admin.access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ dataplatform_iam_s3admin.secret_key }}"
+  delegate_to: localhost
+  become: false
+  register: dataplatform_iam_old_provider
+  changed_when: dataplatform_iam_old_provider.stdout == 'deleted'
+  when: dataplatform_iam_prune | bool
+
+- name: Buckets of the earlier model
+  ansible.builtin.command: cephadm shell -- radosgw-admin bucket stats --format json
+  register: dataplatform_iam_buckets_all
+  changed_when: false
+  when: dataplatform_iam_prune | bool
+
+- name: Delete the group buckets that are empty
+  amazon.aws.s3_bucket:
+    name: "{{ item }}"
+    state: absent
+    force: false
+    ceph: true
+    endpoint_url: "{{ dataplatform_s3_endpoint }}"
+    region: "{{ dataplatform_s3_region }}"
+    access_key: "{{ (dataplatform_iam_owner.stdout | from_json)['keys'][0].access_key }}"
+    secret_key: "{{ (dataplatform_iam_owner.stdout | from_json)['keys'][0].secret_key }}"
+  loop: >-
+    {{ (dataplatform_iam_buckets_all.stdout | default('[]') | from_json)
+       | selectattr('owner', 'equalto', dataplatform_rgw_account_id) | map(attribute='bucket')
+       | select('match', '^(.*-data|shared-data)$') | reject('equalto', dataplatform_bucket) | sort }}
+  register: dataplatform_iam_stale_buckets
+  failed_when: false
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  when: dataplatform_iam_prune | bool
+
+- name: Pruned
+  ansible.builtin.debug:
+    msg: >-
+      {{ (dataplatform_iam_stale_roles | default([]) | map('regex_replace', '^(.*)$', 'role \1 deleted') | list)
+         + ['old OIDC provider: ' ~ dataplatform_iam_old_provider.stdout | default('')]
+         + (dataplatform_iam_stale_buckets.results | default([])
+            | map(attribute='item') | zip(dataplatform_iam_stale_buckets.results | default([]) | map(attribute='failed'))
+            | map('join', ': ') | map('regex_replace', ': True$', ': bucket kept (not empty)')
+            | map('regex_replace', ': False$', ': bucket deleted') | list) }}
+  when: dataplatform_iam_prune | bool

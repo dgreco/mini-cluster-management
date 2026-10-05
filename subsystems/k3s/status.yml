@@ -1,0 +1,30 @@
+---
+- name: Show the k3s status
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  tasks:
+    - name: Collect
+      ansible.builtin.command: /usr/local/bin/k3s kubectl {{ item }}
+      loop:
+        - get nodes -o wide
+        - get pods -A -o wide
+        - get storageclass
+        - get pv
+        - get pvc -A
+        - get helmcharts -A
+      loop_control:
+        label: "kubectl {{ item }}"
+      register: k3s_status
+      changed_when: false
+      failed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ ['$ kubectl ' ~ item.item] + item.stdout_lines + item.stderr_lines }}"
+      loop: "{{ k3s_status.results }}"
+      loop_control:
+        label: "kubectl {{ item.item }}"
+
+    - name: Access
+      ansible.builtin.debug:
+        msg: "export KUBECONFIG={{ k3s_kubeconfig | realpath }}  (make k3s-kubeconfig refreshes it)"

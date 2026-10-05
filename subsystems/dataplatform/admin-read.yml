@@ -1,0 +1,13 @@
+---
+# The S3 browser's view of all of Ceph, alone (make dataplatform-ceph does it
+# too): the admin role's read statement in every bucket outside the
+# platform's account, and the bucket index the browser shows.
+#   make dataplatform-admin-read
+- name: Admin read access to every bucket, and the index
+  hosts: "{{ groups['ceph_mons'][0] }}"
+  gather_facts: false
+  tasks:
+    - name: Grants and index
+      ansible.builtin.include_role:
+        name: dataplatform_ceph
+        tasks_from: admin_read

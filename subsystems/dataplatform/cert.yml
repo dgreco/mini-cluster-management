@@ -1,0 +1,9 @@
+---
+# Let's Encrypt wildcard certificate *.<dataplatform_domain> with its renewal
+# timer; every new certificate is stored in OpenBao for the Gateway.
+#   make dataplatform-cert ARGS="-e dataplatform_cert_force=true"   renew now
+- name: Wildcard certificate
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: true
+  roles:
+    - dataplatform_cert

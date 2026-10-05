@@ -1,0 +1,104 @@
+---
+# What the data platform needs before anything is installed: k3s with the
+# ceph-rbd storage class, Ceph S3 with STS behind a publicly trusted
+# certificate, the Git key Argo CD pulls with, and the GoDaddy token.
+# hosts.ini's node_ip of every node is the address it uses: the gitops tree's
+# network policies and scrape targets are rendered from it.
+- name: Each node's node_ip is its address
+  hosts: nodes
+  gather_facts: false
+  tasks:
+    - name: The node's addresses
+      ansible.builtin.setup:
+        gather_subset: [network]
+
+    - name: The inventory's node_ip is the node's default IPv4 address
+      ansible.builtin.assert:
+        that: ansible_facts['default_ipv4']['address'] | default('') == node_ip
+        fail_msg: >-
+          {{ inventory_hostname }} uses {{ ansible_facts['default_ipv4']['address'] | default('no address') }},
+          inventory/hosts.ini says node_ip={{ node_ip }}: correct hosts.ini, then make configure.
+        quiet: true
+
+- name: Data platform preflight
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  vars:
+    _ceph: "{{ hostvars[groups['ceph_mons'][0]] }}"
+  tasks:
+    # Argo CD deploys what is in Git: the files rendered from the site's
+    # settings must be current before anything is installed
+    - name: The files rendered from the site's settings are current
+      ansible.builtin.include_role:
+        name: dataplatform_configure
+        apply:
+          check_mode: true
+      vars:
+        dataplatform_configure_check: true
+
+    - name: Ceph S3 with STS behind the Let's Encrypt certificate
+      ansible.builtin.assert:
+        that:
+          - _ceph.ceph_rgw_enabled | bool
+          - _ceph.ceph_rgw_sts_enabled | bool
+          - _ceph.ceph_rgw_acme_active | bool
+        fail_msg: >-
+          The data platform needs S3 (ceph_rgw_enabled), STS (ceph_rgw_sts_enabled) and a publicly
+          trusted S3 certificate (ceph_rgw_acme_enabled with the ingress and SSL) in
+          inventory/group_vars/ceph/: Keycloak, Trino and Spark trust only public CAs, and every
+          data access goes through STS.
+        quiet: true
+
+    - name: The platform's S3 endpoint is Ceph's
+      ansible.builtin.assert:
+        that: dataplatform_s3_endpoint == _ceph.ceph_rgw_endpoint
+        fail_msg: >-
+          dataplatform_s3_endpoint ({{ dataplatform_s3_endpoint }}) is not ceph_rgw_endpoint
+          ({{ _ceph.ceph_rgw_endpoint }}): the platform's S3 is served by subsystems/ceph.
+        quiet: true
+
+    - name: Every k3s node is Ready
+      ansible.builtin.command: /usr/local/bin/k3s kubectl wait node --all --for=condition=Ready --timeout=30s
+      changed_when: false
+
+    - name: Storage class {{ dataplatform_storage_class }}
+      ansible.builtin.command: /usr/local/bin/k3s kubectl get storageclass {{ dataplatform_storage_class }} -o name
+      changed_when: false
+
+    - name: The Git key is readable - {{ dataplatform_git_ssh_key_file }}
+      ansible.builtin.stat:
+        path: "{{ dataplatform_git_ssh_key_file }}"
+      delegate_to: localhost
+      become: false
+      register: dataplatform_preflight_key
+      failed_when: not dataplatform_preflight_key.stat.exists
+
+    # clone: false only asks the server for the branch (git ls-remote)
+    - name: The Git key can read {{ dataplatform_git_repo }}
+      ansible.builtin.git:
+        repo: "{{ dataplatform_git_repo }}"
+        dest: /tmp/dataplatform-git-check
+        version: "{{ dataplatform_git_revision }}"
+        clone: false
+        update: false
+        key_file: "{{ dataplatform_git_ssh_key_file }}"
+        # the pinned host keys, as Argo CD uses them
+        ssh_opts: "-o UserKnownHostsFile={{ dataplatform_gitops_dir }}/bootstrap/known_hosts -o StrictHostKeyChecking=yes"
+      delegate_to: localhost
+      become: false
+      register: dataplatform_preflight_git
+      changed_when: false
+
+    - name: GoDaddy token for DNS and certificates
+      ansible.builtin.assert:
+        that: dataplatform_godaddy_pat | length > 0
+        fail_msg: >-
+          Put a GoDaddy personal access token with the domains.dns:update scope in
+          {{ secrets_dir }}/godaddy.env as GODADDY_PAT=<token> (make ceph-s3-cert uses the same file).
+        quiet: true
+
+    - name: Ready
+      ansible.builtin.debug:
+        msg:
+          - "Argo CD will sync {{ dataplatform_git_repo }} @ {{ dataplatform_git_revision }}"
+          - "Web UIs: https://<name>.{{ dataplatform_domain }} through {{ groups['dataplatform_gateway'] | join(', ') }}"

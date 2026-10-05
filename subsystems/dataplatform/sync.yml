@@ -1,0 +1,77 @@
+---
+# Make Argo CD pick up the latest pushed commit now (hard refresh of every
+# Application) and wait until every Application is Synced and Healthy.
+#   make dataplatform-sync ARGS="-e sync_timeout=3600"
+- name: Sync the data platform
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  vars:
+    sync_timeout: 2400
+  tasks:
+    - name: Hard refresh of every Application
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl -n argocd annotate applications --all --overwrite argocd.argoproj.io/refresh=hard
+      changed_when: false
+
+    # Values may have just been stored in OpenBao (certificate, S3 keys): the
+    # ExternalSecrets that failed before fetch them now instead of backing off.
+    - name: Every ExternalSecret fetches its values now
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl annotate externalsecrets --all-namespaces --all --overwrite
+        force-sync={{ now(utc=true, fmt='%s') }}
+      changed_when: false
+      failed_when: false
+
+    # A sync whose retries ran out (e.g. while OpenBao waited to be
+    # initialised) is not retried for the same commit: start it again. The
+    # operation must carry the Application's sync options: without
+    # ServerSideApply=true the large CRDs are applied client-side and refused.
+    - name: Sync again the Applications whose last sync failed
+      ansible.builtin.shell: |
+        set -o pipefail
+        k="/usr/local/bin/k3s kubectl -n argocd"
+        for a in $($k get applications -o 'jsonpath={range .items[*]}{.metadata.name}={.status.operationState.phase}{"\n"}{end}' \
+                   | awk -F= '$2 == "Failed" || $2 == "Error" {print $1}'); do
+          opts=$($k get application "$a" -o 'jsonpath={.spec.syncPolicy.syncOptions}')
+          $k patch application "$a" --type merge \
+            -p '{"operation":{"initiatedBy":{"username":"make dataplatform-sync"},"sync":{"syncOptions":'"${opts:-[]}"'}}}'
+          echo "$a"
+        done
+      args:
+        executable: /bin/bash
+      register: sync_restarted
+      changed_when: sync_restarted.stdout | length > 0
+
+    # One task that loops on the host, printing nothing until it is done.
+    - name: Wait until every Application is Synced and Healthy (-e sync_timeout=<s>)
+      ansible.builtin.shell: |
+        set -o pipefail
+        end=$((SECONDS + {{ sync_timeout }}))
+        while :; do
+          pending=$(/usr/local/bin/k3s kubectl -n argocd get applications \
+            -o 'jsonpath={range .items[*]}{.metadata.name} {.status.sync.status} {.status.health.status}{"\n"}{end}' \
+            | awk '$2 != "Synced" || $3 != "Healthy"')
+          [ -z "$pending" ] && [ -n "$(/usr/local/bin/k3s kubectl -n argocd get applications -o name)" ] && exit 0
+          if [ $SECONDS -ge $end ]; then
+            echo "Not Synced/Healthy after {{ sync_timeout }} s:"
+            echo "$pending"
+            exit 1
+          fi
+          sleep 15
+        done
+      args:
+        executable: /bin/bash
+      register: sync_wait
+      changed_when: false
+
+    - name: Applications
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl -n argocd get applications
+        -o 'custom-columns=NAME:.metadata.name,WAVE:.metadata.annotations.argocd\.argoproj\.io/sync-wave,SYNC:.status.sync.status,HEALTH:.status.health.status'
+        --sort-by=.metadata.name
+      register: sync_apps
+      changed_when: false
+
+    - name: Show the Applications
+      ansible.builtin.debug:
+        msg: "{{ sync_apps.stdout_lines }}"

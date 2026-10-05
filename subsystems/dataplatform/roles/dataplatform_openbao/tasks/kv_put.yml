@@ -1,0 +1,31 @@
+---
+# Store values in OpenBao, for other roles:
+#   include_role: {name: dataplatform_openbao, tasks_from: kv_put}
+#   vars: {dataplatform_openbao_kv_path: compute/trino-s3, dataplatform_openbao_kv_data: {...}}
+# The path is under secret/dataplatform/. Keys not given are kept; nothing is
+# written when every given key already has its value. Needs tasks_from: client first.
+- name: Read secret/dataplatform/{{ dataplatform_openbao_kv_path }}
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/secret/data/dataplatform/{{ dataplatform_openbao_kv_path }}"
+    headers:
+      X-Vault-Token: "{{ dataplatform_openbao_token }}"
+    status_code: [200, 404]
+  delegate_to: "{{ groups['k3s_servers'][0] }}"
+  register: dataplatform_openbao_kv_current
+  no_log: true
+
+- name: Write secret/dataplatform/{{ dataplatform_openbao_kv_path }}
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/secret/data/dataplatform/{{ dataplatform_openbao_kv_path }}"
+    method: POST
+    headers:
+      X-Vault-Token: "{{ dataplatform_openbao_token }}"
+    body_format: json
+    body:
+      data: "{{ _current | combine(dataplatform_openbao_kv_data) }}"
+  vars:
+    _current: "{{ dataplatform_openbao_kv_current.json.data.data if dataplatform_openbao_kv_current.status == 200 else {} }}"
+  when: _current | combine(dataplatform_openbao_kv_data) != _current
+  delegate_to: "{{ groups['k3s_servers'][0] }}"
+  changed_when: true
+  no_log: true

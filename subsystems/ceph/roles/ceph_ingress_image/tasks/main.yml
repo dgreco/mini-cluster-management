@@ -1,0 +1,52 @@
+---
+# Prepare an ingress host: kernel settings for haproxy/keepalived and the local
+# keepalived image used by the ingress service (arm64-safe).
+
+# haproxy binds the virtual IP on every ingress host, including those where
+# keepalived does not hold it. cephadm writes these to its own sysctl.d file
+# when it deploys haproxy, but does not restore that file if it goes missing;
+# haproxy then fails with "cannot bind socket" on the backup hosts.
+- name: Kernel setting for the ingress
+  ansible.posix.sysctl:
+    name: "{{ item }}"
+    value: "1"
+    sysctl_file: /etc/sysctl.d/90-ceph-ingress.conf
+    reload: true
+  loop:
+    - net.ipv4.ip_nonlocal_bind
+
+- name: Build context
+  ansible.builtin.file:
+    path: /etc/ceph/build/keepalived
+    state: directory
+    mode: "0750"
+
+- name: Containerfile
+  ansible.builtin.template:
+    src: Containerfile.j2
+    dest: /etc/ceph/build/keepalived/Containerfile
+    mode: "0640"
+  register: ceph_ingress_image_containerfile
+
+- name: Does the image exist?
+  ansible.builtin.command: podman image exists {{ ceph_ingress_keepalived_image }}
+  register: ceph_ingress_image_exists
+  changed_when: false
+  failed_when: false
+
+- name: Build {{ ceph_ingress_keepalived_image }}
+  ansible.builtin.command: podman build --pull -t {{ ceph_ingress_keepalived_image }} /etc/ceph/build/keepalived
+  when: ceph_ingress_image_exists.rc != 0 or ceph_ingress_image_containerfile.changed
+  # cephadm's units start the container from the local tag: restarting them
+  # runs the new image (no unit yet on a fresh host: nothing to restart).
+  notify: Restart keepalived
+  changed_when: true
+
+- name: Smoke test the image
+  ansible.builtin.command: podman run --rm --entrypoint /usr/sbin/keepalived {{ ceph_ingress_keepalived_image }} --version
+  register: ceph_ingress_image_keepalived_version
+  changed_when: false
+
+- name: Show the keepalived version
+  ansible.builtin.debug:
+    msg: "{{ ceph_ingress_image_keepalived_version.stderr_lines[0] | default(ceph_ingress_image_keepalived_version.stdout_lines[0] | default('')) }}"

@@ -1,0 +1,35 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Stackable's Spark operator, from its chart (Argo CD renders it with
+# kustomize --enable-helm: argocd-cm kustomize.buildOptions), with one change.
+#
+# The operator binds every job's service account (named after the
+# SparkApplication) to the ClusterRole spark-k8s-clusterrole in the job's
+# namespace; the chart gives it every verb on secrets and
+# persistentvolumeclaims there. In compute, where every job runs next to
+# Trino, that let any job's driver read Trino's S3 key, the catalog owner's
+# login and the other users' tokens, or clone a volume. Spark needs neither
+# (the job's secrets are mounted; nothing makes PVCs), so the patch keeps the
+# pods, services and configmaps the driver manages and drops the rest. The
+# operator names that ClusterRole itself, so it cannot be another one.
+# spark-fence.yaml (manifests/compute/spark) holds the admission policies
+# around the same jobs.
+helmCharts:
+  - name: spark-k8s-operator
+    repo: oci://oci.stackable.tech/sdp-charts
+    version: 26.7.0
+    # the release name and namespace of the earlier helm source: same labels
+    releaseName: stackable-spark-k8s-operator
+    namespace: operators
+    includeCRDs: true
+patches:
+  - target:
+      kind: ClusterRole
+      name: spark-k8s-clusterrole
+    patch: |-
+      - op: replace
+        path: /rules
+        value:
+          - apiGroups: [""]
+            resources: [configmaps, pods, services]
+            verbs: [create, delete, deletecollection, get, list, patch, update, watch]

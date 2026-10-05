@@ -1,0 +1,17 @@
+# S3 (warp) — {{ bench_run }}
+
+{{ ansible_play_hosts | length }} warp clients ({{ ansible_play_hosts | join(', ') }}), target `{{ _bench.s3_target }}`
+({{ hostvars[_admin].bench_s3_hosts | join(', ') }}), {{ _bench.s3_obj_size }} objects,
+{{ _bench.s3_concurrent }} concurrent ops per client, {{ _bench.duration }} s per op.
+Full output in `warp-<op>.txt`; `warp analyze <op>.json.zst` replays the data.
+
+{% for op in _bench.s3_ops %}
+## {{ op }}
+
+```
+{% for line in s3_results[op].splitlines() if line is search('^Report:|^ \* (Average|Reqs|Errors|50% Median)') %}
+{{ line }}
+{% endfor %}
+```
+
+{% endfor %}

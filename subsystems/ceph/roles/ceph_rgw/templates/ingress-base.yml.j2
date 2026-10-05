@@ -1,0 +1,12 @@
+# Managed by Ansible. haproxy + keepalived in front of rgw.{{ ceph_rgw_service_id }}.
+# ceph-ingress-apply adds the certificate (ssl_cert) and writes ingress.yml.
+service_type: ingress
+service_id: rgw.{{ ceph_rgw_service_id }}
+placement:
+  label: ingress
+  count: {{ ceph_rgw_ingress_count }}
+spec:
+  backend_service: rgw.{{ ceph_rgw_service_id }}
+  virtual_ip: {{ ceph_rgw_ingress_virtual_ip }}
+  frontend_port: {{ ceph_rgw_ingress_port }}
+  monitor_port: {{ ceph_rgw_ingress_monitor_port }}

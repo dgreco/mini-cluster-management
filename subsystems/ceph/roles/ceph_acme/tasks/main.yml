@@ -1,0 +1,85 @@
+---
+# Let's Encrypt certificate of the S3 ingress, on the admin host: public DNS
+# records, lego, the certificate and its daily renewal timer. The ceph_rgw role
+# serves it; every renewal serves the new one through ceph-s3-cert-deploy.
+- name: Let's Encrypt settings and the GoDaddy token are in place
+  ansible.builtin.assert:
+    that:
+      - ceph_rgw_acme_active | bool
+      - ceph_rgw_acme_domain.endswith('.' ~ ceph_rgw_acme_zone)
+      - ceph_rgw_acme_email is search('^[^@ ]+@[^@ ]+$')
+      - ceph_acme_godaddy_pat | length > 0
+    fail_msg: >-
+      Needs ceph_rgw_acme_enabled, ceph_rgw_ingress_enabled and ceph_rgw_ingress_ssl true,
+      ceph_rgw_acme_domain inside ceph_rgw_acme_zone, ceph_rgw_acme_email (inventory/group_vars/ceph/),
+      and a GoDaddy personal access token with the domains.dns:update scope in
+      {{ secrets_dir }}/godaddy.env as GODADDY_PAT=<token>.
+    quiet: true
+
+# ---------------------------------------------------------------- public DNS ----
+- name: Public DNS records to the ingress VIP
+  when: ceph_rgw_acme_public_dns | bool
+  delegate_to: localhost
+  become: false
+  block:
+    - name: Read the public A records
+      ansible.builtin.uri:
+        url: "{{ ceph_acme_godaddy_api }}/{{ ceph_rgw_acme_zone }}/records/A/{{ item }}"
+        headers:
+          Authorization: "Bearer {{ ceph_acme_godaddy_pat }}"
+        return_content: true
+      loop: ["{{ ceph_acme_record }}", "*.{{ ceph_acme_record }}"]
+      register: ceph_acme_a_records
+      failed_when: false
+      no_log: true
+
+    - name: GoDaddy accepts the token
+      ansible.builtin.assert:
+        that: ceph_acme_a_records.results | map(attribute='status') | reject('equalto', 200) | list | length == 0
+        fail_msg: >-
+          GoDaddy API refused the request (HTTP {{ ceph_acme_a_records.results | map(attribute='status') | join(', ') }}:
+          {{ ceph_acme_a_records.results | map(attribute='content') | map('default', '') | join(' ') | truncate(300) }}).
+          Check the token in {{ secrets_dir }}/godaddy.env, its expiry and its domains.dns:update scope.
+        quiet: true
+
+    - name: Point the name and its wildcard to the ingress VIP - {{ ceph_rgw_acme_domain ~ ' -> ' ~ ceph_rgw_vip }}
+      ansible.builtin.uri:
+        url: "{{ ceph_acme_godaddy_api }}/{{ ceph_rgw_acme_zone }}/records/A/{{ item.item }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ ceph_acme_godaddy_pat }}"
+        body_format: json
+        body: [{"data": "{{ ceph_rgw_vip }}", "ttl": 3600}]
+      loop: "{{ ceph_acme_a_records.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.json | default([]) | map(attribute='data') | list != [ceph_rgw_vip]
+      changed_when: true
+      no_log: true
+
+# ---------------------------------------------------------------- deploy hook ----
+- name: Deploy hook (serves a new certificate on the ingress)
+  ansible.builtin.template:
+    src: ceph-s3-cert-deploy.sh.j2
+    dest: /usr/local/sbin/ceph-s3-cert-deploy
+    mode: "0755"
+
+# ---------------------------------------------------------------- lego ----
+- name: Lego, the renewal program and timer, the certificate
+  ansible.builtin.include_role:
+    name: acme_lego
+  vars:
+    acme_lego_version: "{{ ceph_acme_lego_version }}"
+    acme_lego_dir: "{{ ceph_acme_dir }}"
+    acme_lego_domains: ["{{ ceph_rgw_acme_domain }}", "*.{{ ceph_rgw_acme_domain }}"]
+    acme_lego_email: "{{ ceph_rgw_acme_email }}"
+    acme_lego_staging: "{{ ceph_rgw_acme_staging }}"
+    acme_lego_zone: "{{ ceph_rgw_acme_zone }}"
+    acme_lego_godaddy_api: "{{ ceph_acme_godaddy_api }}"
+    acme_lego_godaddy_pat: "{{ ceph_acme_godaddy_pat }}"
+    acme_lego_wrapper: /usr/local/sbin/ceph-s3-cert
+    acme_lego_deploy_hook: /usr/local/sbin/ceph-s3-cert-deploy
+    acme_lego_unit: ceph-s3-cert
+    acme_lego_unit_description: "Renew the Let's Encrypt certificate of the S3 endpoint ({{ ceph_rgw_acme_domain }})"
+    acme_lego_timer_calendar: "*-*-* 04:00:00"
+    acme_lego_force: "{{ ceph_acme_force }}"

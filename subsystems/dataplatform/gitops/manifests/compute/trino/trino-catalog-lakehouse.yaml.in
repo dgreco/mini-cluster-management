@@ -1,0 +1,46 @@
+# Catalog lakehouse: Iceberg tables whose catalog is the JDBC catalog in
+# PostgreSQL (governance/iceberg-catalog) and whose files are on Ceph S3.
+#
+# Trino never reads data with its own key: the S3 security mapping (file
+# written by iam-sync from gitops/iam/access.yaml) maps a user and a file's
+# directory to the user's STS role granted that directory (usr-<user> or a
+# group's grp-<group>), elsewhere to their default (their own, else their
+# first group's), and Trino assumes it for that user at RGW's STS (session
+# name = the user). RGW then decides with that role's policy. A user with no
+# grant matches no rule and gets no S3 access at all.
+#
+# iceberg.metadata-cache.enabled=false: the metadata cache is shared between
+# users and would let one user's cached manifests serve another user without
+# RGW deciding.
+apiVersion: trino.stackable.tech/v1alpha1
+kind: TrinoCatalog
+metadata:
+  name: lakehouse
+  namespace: compute
+  labels:
+    trino: trino
+spec:
+  connector:
+    generic:
+      connectorName: iceberg
+      properties:
+        iceberg.catalog.type: {value: jdbc}
+        iceberg.jdbc-catalog.driver-class: {value: org.postgresql.Driver}
+        iceberg.jdbc-catalog.connection-url: {value: "jdbc:postgresql://iceberg-catalog-rw.governance.svc:5432/iceberg"}
+        iceberg.jdbc-catalog.connection-user: {valueFromSecret: {name: iceberg-catalog, key: username}}
+        iceberg.jdbc-catalog.connection-password: {valueFromSecret: {name: iceberg-catalog, key: password}}
+        iceberg.jdbc-catalog.catalog-name: {value: lakehouse}
+        iceberg.jdbc-catalog.default-warehouse-dir: {value: "s3://<%= dataplatform_bucket %>/warehouse/"}
+        iceberg.metadata-cache.enabled: {value: "false"}
+        fs.native-s3.enabled: {value: "true"}
+        s3.endpoint: {value: "https://<%= site_s3_host %>"}
+        s3.region: {value: <%= dataplatform_s3_region %>}
+        s3.path-style-access: {value: "true"}
+        s3.aws-access-key: {valueFromSecret: {name: trino-s3, key: accessKey}}
+        s3.aws-secret-key: {valueFromSecret: {name: trino-s3, key: secretKey}}
+        s3.sts.endpoint: {value: "https://<%= site_s3_host %>"}
+        s3.sts.region: {value: <%= dataplatform_s3_region %>}
+        s3.security-mapping.enabled: {value: "true"}
+        s3.security-mapping.config-file: {value: /stackable/mount/iam/s3-security-mapping.json}
+        s3.security-mapping.refresh-period: {value: 30s}
+        s3.security-mapping.iam-role-credential-name: {value: s3_role}

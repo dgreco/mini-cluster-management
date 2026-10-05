@@ -1,0 +1,130 @@
+---
+# Argo CD and what it needs before it can sync the platform from Git, on the
+# first k3s server. Argo CD itself is a k3s HelmChart (like ceph-csi); every
+# other component is an Argo CD Application under gitops/apps.
+# The Git server's host keys are pinned in gitops/bootstrap/known_hosts; the
+# server must still present them (a changed key is verified by a person, not
+# accepted by a scan: Argo CD applies whatever that server serves).
+- name: Pinned SSH host keys of the Git server - {{ dataplatform_git_host }}
+  ansible.builtin.set_fact:
+    dataplatform_argocd_known_hosts: >-
+      {{ lookup('ansible.builtin.file', dataplatform_gitops_dir ~ '/bootstrap/known_hosts').splitlines()
+         | select('match', '^' ~ (dataplatform_git_host | regex_escape) ~ ' ') | sort }}
+
+- name: The pinned keys name the Git server
+  ansible.builtin.assert:
+    that: dataplatform_argocd_known_hosts | length > 0
+    fail_msg: >-
+      gitops/bootstrap/known_hosts has no key for {{ dataplatform_git_host }}: add the output of
+      ssh-keyscan {{ dataplatform_git_host }} after checking it
+    quiet: true
+
+- name: Host keys the Git server presents now
+  ansible.builtin.command: ssh-keyscan -T 10 {{ dataplatform_git_host }}
+  delegate_to: localhost
+  become: false
+  register: dataplatform_argocd_keyscan
+  changed_when: false
+  failed_when: false
+
+- name: The Git server presents the pinned keys
+  ansible.builtin.assert:
+    that: dataplatform_argocd_known_hosts | difference(dataplatform_argocd_keyscan.stdout_lines | select('match', '^[^#]') | list) | length == 0
+    fail_msg: >-
+      {{ dataplatform_git_host }} does not present the keys pinned in gitops/bootstrap/known_hosts. Either the
+      server's keys changed, or something else answers for it. Verify out of band (the server's
+      /etc/ssh/ssh_host_*_key.pub), then replace the file with `ssh-keyscan {{ dataplatform_git_host }} | grep -v '^#' | sort`.
+    quiet: true
+
+# Sorted, so the chart values only change when a key does.
+- name: Chart manifest
+  ansible.builtin.template:
+    src: argocd.yaml.j2
+    dest: /var/lib/rancher/k3s/server/manifests/dataplatform-argocd.yaml
+    mode: "0600"
+  vars:
+    dataplatform_argocd_values: >-
+      {{ lookup('ansible.builtin.file', dataplatform_gitops_dir ~ '/bootstrap/argocd-values.yaml') | from_yaml
+         | combine({'configs': {'ssh': {'extraHosts': dataplatform_argocd_known_hosts | join(dataplatform_argocd_lf)}}},
+           recursive=true) }}
+    dataplatform_argocd_lf: "\n"
+
+- name: Wait for Argo CD {{ dataplatform_argocd_chart_version }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    end=$((SECONDS + 600))
+    until [ "$(/usr/local/bin/k3s kubectl -n argocd get deploy argocd-server \
+               -o 'jsonpath={.metadata.labels.helm\.sh/chart}' 2>/dev/null)" = "argo-cd-{{ dataplatform_argocd_chart_version }}" ] \
+          && /usr/local/bin/k3s kubectl -n argocd rollout status deploy/argocd-server --timeout=10s >/dev/null 2>&1 \
+          && /usr/local/bin/k3s kubectl -n argocd rollout status deploy/argocd-repo-server --timeout=10s >/dev/null 2>&1 \
+          && /usr/local/bin/k3s kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=10s >/dev/null 2>&1; do
+      if [ $SECONDS -ge $end ]; then
+        /usr/local/bin/k3s kubectl -n argocd get pods
+        exit 1
+      fi
+      sleep 5
+    done
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+# ---------------------------------------------------------------- bootstrap secrets ----
+# The only Secrets not kept in OpenBao: Argo CD needs the Git key before it can
+# install OpenBao, and OpenBao needs its seal key to start.
+- name: Git repository credentials
+  ansible.builtin.command:
+    cmd: /usr/local/bin/k3s kubectl apply -f -
+    stdin: "{{ _secret | to_json }}"
+  vars:
+    _secret:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: dataplatform-repo
+        namespace: argocd
+        labels:
+          argocd.argoproj.io/secret-type: repository
+      data:
+        type: "{{ 'git' | b64encode }}"
+        url: "{{ dataplatform_git_repo | b64encode }}"
+        sshPrivateKey: "{{ (lookup('ansible.builtin.file', dataplatform_git_ssh_key_file) ~ '\n') | b64encode }}"
+  register: dataplatform_argocd_repo
+  changed_when: dataplatform_argocd_repo.stdout_lines | reject('search', ' unchanged$') | list | length > 0
+  no_log: true
+
+# The namespace is Argo CD's afterwards (namespaces app): only create it.
+- name: Namespace of OpenBao
+  ansible.builtin.shell: |
+    set -o pipefail
+    /usr/local/bin/k3s kubectl get namespace {{ dataplatform_openbao_namespace }} -o name >/dev/null 2>&1 && exit 0
+    /usr/local/bin/k3s kubectl create namespace {{ dataplatform_openbao_namespace }} && echo created
+  args:
+    executable: /bin/bash
+  register: dataplatform_argocd_ns
+  changed_when: "'created' in dataplatform_argocd_ns.stdout"
+
+- name: OpenBao seal key
+  ansible.builtin.command:
+    cmd: /usr/local/bin/k3s kubectl apply -f -
+    stdin: "{{ _secret | to_json }}"
+  vars:
+    _secret:
+      apiVersion: v1
+      kind: Secret  # gitleaks:allow (no value here: the key is a variable)
+      metadata:
+        name: openbao-seal
+        namespace: "{{ dataplatform_openbao_namespace }}"
+      data:
+        seal.key: "{{ dataplatform_openbao_seal_key | b64encode }}"
+  register: dataplatform_argocd_seal
+  changed_when: "' unchanged' not in dataplatform_argocd_seal.stdout"
+  no_log: true
+
+# ---------------------------------------------------------------- root application ----
+- name: Project and root application (gitops/app-of-apps)
+  ansible.builtin.command:
+    cmd: /usr/local/bin/k3s kubectl apply -f -
+    stdin: "{{ lookup('ansible.builtin.file', dataplatform_gitops_dir ~ '/app-of-apps/' ~ item) }}"
+  loop: [project.yaml, root-app.yaml]
+  register: dataplatform_argocd_root
+  changed_when: dataplatform_argocd_root.stdout_lines | reject('search', ' unchanged$') | list | length > 0

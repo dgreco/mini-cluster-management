@@ -1,0 +1,10 @@
+---
+# The IAM model: Keycloak realm converged from Git, Ceph RGW trusting it with
+# one STS role and bucket per Keycloak group, OpenBao logins through Keycloak,
+# the GitLab trigger token the cluster starts the hourly IAM pipeline with.
+# Re-run after adding a group in Keycloak (make dataplatform-iam).
+- name: Identity and access
+  hosts: "{{ groups['ceph_mons'][0] }}"
+  gather_facts: false
+  roles:
+    - dataplatform_iam

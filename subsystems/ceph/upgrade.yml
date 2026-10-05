@@ -1,0 +1,110 @@
+---
+# Rolling upgrade driven by the orchestrator.
+#   make ceph-upgrade ARGS="-e ceph_image=quay.io/ceph/ceph:v19.2.3"
+# The image must name a full version (vX.Y.Z), never the floating minor tag of
+# group_vars; the cluster must be healthy with every PG active+clean; a lower
+# version than the running one is refused. Remember to bump ceph_image (and
+# ceph_release) in inventory/group_vars/ceph/ afterwards.
+- name: Upgrade Ceph
+  hosts: ceph_mons[0]
+  gather_facts: false
+  tasks:
+    - name: The image names a full version
+      ansible.builtin.assert:
+        that: ceph_image is match('^[^:]+:v[0-9]+\.[0-9]+\.[0-9]+$')
+        fail_msg: >-
+          pass -e ceph_image=<registry/ceph:vX.Y.Z>: got '{{ ceph_image }}' (the floating tag of group_vars
+          would upgrade to whatever is current)
+        quiet: true
+
+    - name: Current state
+      ansible.builtin.command: cephadm shell -- {{ item }}
+      loop:
+        - ceph health --format json
+        - ceph pg stat
+        - ceph versions --format json
+        - ceph orch upgrade status --format json
+      register: ceph_upgrade_state
+      changed_when: false
+      check_mode: false
+
+    - name: Current versions
+      ansible.builtin.debug:
+        msg: "{{ ceph_upgrade_versions.overall }}"
+      vars:
+        ceph_upgrade_versions: "{{ ceph_upgrade_state.results[2].stdout | from_json }}"
+
+    - name: Healthy, every PG active+clean, no upgrade running, one version
+      ansible.builtin.assert:
+        that:
+          - ceph_upgrade_health.status == 'HEALTH_OK'
+          - ceph_upgrade_state.results[1].stdout is match(ceph_upgrade_clean_re)
+          - not ceph_upgrade_progress.in_progress
+          - ceph_upgrade_versions.overall | length == 1
+        fail_msg: >-
+          Not upgrading: want HEALTH_OK, every PG active+clean, no upgrade in progress and one running
+          version. Found {{ ceph_upgrade_health.status }}, {{ ceph_upgrade_state.results[1].stdout }},
+          versions {{ ceph_upgrade_versions.overall }}
+          (make ceph-status; a paused upgrade: ceph orch upgrade resume / stop)
+        quiet: true
+      vars:
+        ceph_upgrade_clean_re: '^([0-9]+) pgs: \1 active\+clean;'   # every PG active+clean
+        ceph_upgrade_health: "{{ ceph_upgrade_state.results[0].stdout | from_json }}"
+        ceph_upgrade_versions: "{{ ceph_upgrade_state.results[2].stdout | from_json }}"
+        ceph_upgrade_progress: "{{ ceph_upgrade_state.results[3].stdout | from_json }}"
+
+    - name: The image exists
+      ansible.builtin.command: cephadm shell -- ceph orch upgrade check --image {{ ceph_image }}
+      register: ceph_upgrade_check
+      changed_when: false
+      check_mode: false
+
+    - name: The image is a newer version than the running one
+      ansible.builtin.assert:
+        that: ceph_upgrade_target is version(ceph_upgrade_current, '>')
+        fail_msg: "{{ ceph_image }} is {{ ceph_upgrade_target }}, the cluster runs {{ ceph_upgrade_current }}: not an upgrade"
+        quiet: true
+      vars:
+        ceph_upgrade_target: >-
+          {{ (ceph_upgrade_check.stdout | from_json).target_version | regex_search('[0-9]+\.[0-9]+\.[0-9]+') }}
+        ceph_upgrade_current: >-
+          {{ (ceph_upgrade_state.results[2].stdout | from_json).overall.keys() | first | regex_search('[0-9]+\.[0-9]+\.[0-9]+') }}
+
+    - name: Start upgrade to {{ ceph_image }}
+      ansible.builtin.command: cephadm shell -- ceph orch upgrade start --image {{ ceph_image }}
+      register: ceph_upgrade_start
+      changed_when: "'Initiating' in ceph_upgrade_start.stdout"
+
+    # The loop runs on the host (no "FAILED - RETRYING" lines); an error or a
+    # pause stops it at once instead of waiting the whole timeout.
+    - name: Wait for the upgrade to finish
+      ansible.builtin.shell: |
+        set -o pipefail
+        end=$((SECONDS + {{ ceph_upgrade_timeout }}))
+        while :; do
+          s=$(cephadm shell -- ceph orch upgrade status --format json 2>/dev/null)
+          rc=0
+          python3 -c '
+        import json, sys
+        s = json.loads(sys.argv[1])
+        msg = s.get("message") or ""
+        if s.get("is_paused") or msg.startswith("Error") or "UPGRADE_" in msg:
+            print("upgrade stopped: " + msg); sys.exit(2)
+        sys.exit(0 if not s.get("in_progress") else 1)' "$s" || rc=$?
+          [ $rc -eq 0 ] && exit 0
+          [ $rc -eq 2 ] && exit 1
+          if [ $SECONDS -ge $end ]; then echo "still in progress after {{ ceph_upgrade_timeout }} s: $s"; exit 1; fi
+          sleep 30
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Versions after upgrade
+      ansible.builtin.command: cephadm shell -- ceph versions --format json
+      register: ceph_upgrade_after
+      changed_when: false
+
+    - name: After
+      ansible.builtin.debug:
+        msg: "{{ (ceph_upgrade_after.stdout | from_json).overall }}"

@@ -1,0 +1,32 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: governance
+resources:
+  - metacatalog-secrets.yaml
+  - metacatalog-db.yaml
+  - metacatalog-db-objectstore.yaml
+  - metacatalog-backup.yaml
+  - metacatalog-grants.yaml
+  - metacatalog.yaml
+  - iam-reconcile.yaml
+  - metacatalog-proxy.yaml
+  - metacatalog-httproute.yaml
+# The scripts of Meta Catalog's `script` provisioning task (the medallion
+# lakehouses). A fixed name: the task reads them at each run and the kubelet
+# refreshes the mounted files within a minute, so no restart is needed; a
+# name hash would leave the old ConfigMaps behind (the app does not prune).
+configMapGenerator:
+  - name: metacatalog-provisioning
+    options:
+      disableNameSuffixHash: true
+    files:
+      - provisioning/medallion.sh
+      - provisioning/lib-trino.sh
+      - provisioning/lib-grants.sh
+      - provisioning/lib-iam.sh
+      - provisioning/reconcile.sh
+  # The gate's nginx.conf (metacatalog-proxy.yaml). With the name hash: a
+  # change rolls the proxy's pod, which mounts it as a single file.
+  - name: metacatalog-gate
+    files:
+      - gate.conf

@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: compute
+resources:
+  - spark-cleanup.yaml
+# The program; a change rolls into the next run (name hash).
+configMapGenerator:
+  - name: spark-cleanup-script
+    files:
+      - spark_cleanup.py

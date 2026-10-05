@@ -1,0 +1,18 @@
+---
+# Ends the play for a node that does not answer on SSH (already off), probed
+# from the control node, so no UNREACHABLE error is produced. Included first
+# by the plays that may run against nodes that are down (shutdown, the
+# pre-shutdown and post-startup hooks).
+- name: Is the node reachable over SSH?
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: 22
+    timeout: 5
+  delegate_to: localhost
+  become: false
+  register: ssh_probe
+  failed_when: false
+
+- name: Node is down, nothing to do
+  ansible.builtin.meta: end_host
+  when: ssh_probe.state is not defined

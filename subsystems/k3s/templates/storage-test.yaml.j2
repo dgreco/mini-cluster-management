@@ -1,0 +1,62 @@
+# Rendered by subsystems/k3s/storage-test.yml; deleted when the test ends.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ _ns }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rbd
+  namespace: {{ _ns }}
+spec:
+  storageClassName: {{ k3s_rbd_storage_class }}
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cephfs
+  namespace: {{ _ns }}
+spec:
+  storageClassName: {{ k3s_cephfs_storage_class }}
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rbd
+  namespace: {{ _ns }}
+spec:
+  containers:
+    - name: test
+      image: {{ _image }}
+      command: [sh, -c, "echo rbd-ok > /data/check && sync && sleep 3600"]
+      volumeMounts: [{ name: data, mountPath: /data }]
+  volumes:
+    - name: data
+      persistentVolumeClaim: { claimName: rbd }
+{% for node in _nodes %}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cephfs-{{ loop.index }}
+  namespace: {{ _ns }}
+spec:
+  nodeName: {{ node }}
+  containers:
+    - name: test
+      image: {{ _image }}
+      command: [sh, -c, "echo {{ node }} > /data/written-by-{{ loop.index }} && sleep 3600"]
+      volumeMounts: [{ name: data, mountPath: /data }]
+  volumes:
+    - name: data
+      persistentVolumeClaim: { claimName: cephfs }
+{% endfor %}

@@ -1,0 +1,30 @@
+---
+# Task-file hook included by cluster/rolling-reboot.yml for each node before
+# the k3s drain. Spark drivers are pods no controller recreates, so the drain
+# would refuse them (or, forced, kill the job): wait until the drivers running
+# on the node have finished. Jobs submitted meanwhile may land on it again;
+# this only waits for the ones found, up to dataplatform_drain_spark_timeout.
+- name: Find a k3s server that answers
+  ansible.builtin.include_tasks: ../../k3s/hooks/pick-server.yml
+  when: inventory_hostname in groups['k3s'] | default([])
+
+- name: Spark drivers running on {{ ansible_facts['nodename'] | default(inventory_hostname) }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    node={{ ansible_facts['nodename'] | default(inventory_hostname ~ '.' ~ cluster_domain) }}
+    end=$((SECONDS + {{ dataplatform_drain_spark_timeout }}))
+    while :; do
+      drivers=$(/usr/local/bin/k3s kubectl get pods -A -l spark-role=driver --field-selector spec.nodeName=$node,status.phase=Running \
+                -o 'jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}{" "}{end}' 2>/dev/null || true)
+      [ -z "$drivers" ] && exit 0
+      if [ $SECONDS -ge $end ]; then
+        echo "still running after {{ dataplatform_drain_spark_timeout }} s: $drivers" >&2
+        exit 1
+      fi
+      sleep 20
+    done
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ k3s_maint_server }}"
+  changed_when: false
+  when: k3s_maint_member | default(false)

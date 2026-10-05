@@ -1,0 +1,30 @@
+# Ceph S3 (RGW behind the ingress VIP, Let's Encrypt certificate) and the
+# bucket of Spark's event logs: the platform bucket, whose directory
+# system/spark-events/ (spark-template.yaml, spark-history.yaml) only the RGW
+# user spark reaches.
+apiVersion: s3.stackable.tech/v1alpha1
+kind: S3Connection
+metadata:
+  name: ceph
+spec:
+  host: s3.example.org
+  port: 443
+  accessStyle: Path
+  region:
+    name: us-east-1
+  credentials:
+    secretClass: s3-spark
+  tls:
+    verification:
+      server:
+        caCert:
+          webPki: {}
+---
+apiVersion: s3.stackable.tech/v1alpha1
+kind: S3Bucket
+metadata:
+  name: spark-logs
+spec:
+  bucketName: dataplatform
+  connection:
+    reference: ceph

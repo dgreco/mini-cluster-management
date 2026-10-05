@@ -1,0 +1,8 @@
+---
+# Argo CD (k3s HelmChart), the Git credentials, the OpenBao seal key and the
+# root application (gitops/app-of-apps). From here Argo CD installs gitops/apps.
+- name: Argo CD
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  roles:
+    - dataplatform_argocd

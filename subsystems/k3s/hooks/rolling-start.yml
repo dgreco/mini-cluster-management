@@ -1,0 +1,76 @@
+---
+# Task-file hook included once by cluster/rolling-reboot.yml before the first
+# node. Refuses to start unless every k3s node is Ready and schedulable and the
+# API server is healthy, then takes an etcd snapshot as a restore point.
+# Asks for the agents (no etcd member) to be rebooted first.
+- name: Is k3s installed?
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  delegate_to: "{{ k3s_first_server }}"
+  register: k3s_rolling_bin
+
+# The checks and the snapshot run on the first server that answers, not
+# necessarily the first of the inventory (it may be the one that is down).
+- name: Which server answers?
+  ansible.builtin.command: /usr/local/bin/k3s kubectl get --raw /readyz --request-timeout=10s
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['k3s_servers'] }}"
+  register: k3s_rolling_servers
+  changed_when: false
+  failed_when: false
+  ignore_unreachable: true
+  when: k3s_rolling_bin.stat.exists
+
+- name: The server to use
+  ansible.builtin.set_fact:
+    k3s_rolling_server: >-
+      {{ k3s_rolling_servers.results | default([]) | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0)
+         | map(attribute='item') | first | default(k3s_first_server) }}
+
+- name: Check k3s and take an etcd snapshot
+  when: k3s_rolling_bin.stat.exists
+  block:
+    - name: Read the k3s nodes
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl get nodes
+        -o 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.conditions[?(@.type=="Ready")].status}{" "}{.spec.unschedulable}{"\n"}{end}'
+      delegate_to: "{{ k3s_rolling_server }}"
+      register: k3s_rolling_nodes
+      changed_when: false
+
+    - name: Every k3s node is Ready and not cordoned
+      ansible.builtin.assert:
+        that:
+          - k3s_rolling_nodes.stdout_lines | length == groups['k3s'] | length
+          - k3s_rolling_nodes.stdout_lines | reject('match', '^\S+ True\s*$') | list | length == 0
+        fail_msg: >-
+          k3s is not healthy, not starting. Want {{ groups['k3s'] | length }} nodes, all Ready and
+          none cordoned; found {{ k3s_rolling_nodes.stdout_lines | length }}. Not ready or cordoned
+          (name, Ready, cordoned): {{ k3s_rolling_nodes.stdout_lines | reject('match', '^\S+ True\s*$') | map('trim') | join('; ') }}
+        quiet: true
+
+    - name: The API server is healthy
+      ansible.builtin.command: /usr/local/bin/k3s kubectl get --raw /readyz
+      delegate_to: "{{ k3s_rolling_server }}"
+      register: k3s_rolling_readyz
+      changed_when: false
+      failed_when: k3s_rolling_readyz.rc != 0 or k3s_rolling_readyz.stdout != 'ok'
+
+    - name: Take an etcd snapshot
+      ansible.builtin.command: /usr/local/bin/k3s etcd-snapshot save --name rolling-reboot
+      delegate_to: "{{ k3s_rolling_server }}"
+      register: k3s_rolling_snapshot
+      changed_when: true
+
+    - name: Snapshot
+      ansible.builtin.debug:
+        msg: >-
+          etcd snapshot {{ (k3s_rolling_snapshot.stderr ~ k3s_rolling_snapshot.stdout)
+          | regex_search('rolling-reboot-\S+-[0-9]+') | default('rolling-reboot', true) }} saved on {{ k3s_rolling_server }}
+          (/var/lib/rancher/k3s/server/db/snapshots{{ ', and in s3://' ~ k3s_etcd_s3_bucket ~ '/' ~ k3s_etcd_s3_folder if k3s_etcd_s3_enabled | bool else '' }})
+
+    - name: Reboot the k3s agents first
+      ansible.builtin.set_fact:
+        rolling_first: "{{ hostvars['localhost']['rolling_first'] | default([]) + groups['k3s_agents'] | default([]) }}"
+      delegate_to: localhost
+      delegate_facts: true

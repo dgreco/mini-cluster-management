@@ -1,0 +1,31 @@
+---
+# Power state from the Turing Pi BMC plus SSH reachability of every node.
+- name: BMC power status
+  hosts: bmc
+  gather_facts: false
+  tasks:
+    - name: Query tpi power status
+      ansible.builtin.raw: tpi power status
+      register: tpi_status
+      changed_when: false
+
+    - name: Show power status
+      ansible.builtin.debug:
+        msg: "{{ tpi_status.stdout_lines }}"
+
+- name: Node reachability
+  hosts: nodes
+  gather_facts: false
+  ignore_unreachable: true
+  tasks:
+    - name: Ping
+      ansible.builtin.ping:
+
+    - name: Uptime
+      ansible.builtin.command: uptime -p
+      changed_when: false
+      register: node_uptime
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ node_uptime.stdout }}"

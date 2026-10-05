@@ -1,0 +1,18 @@
+---
+# The admin API of Keycloak is called inside the cluster, through its Service,
+# from the first k3s server (as OpenBao's is): the platform Gateway redirects
+# the master realm's console and API away, and no admin call of ours needs to
+# go through it. Sets dataplatform_iam_kc_admin_base and dataplatform_iam_kc_host.
+- name: Keycloak service address
+  ansible.builtin.command: >-
+    /usr/local/bin/k3s kubectl -n {{ dataplatform_iam_keycloak_namespace }} get service {{ dataplatform_iam_keycloak_service }}
+    -o 'jsonpath={.spec.clusterIP}'
+  delegate_to: "{{ groups['k3s_servers'][0] }}"
+  register: dataplatform_iam_kc_svc
+  changed_when: false
+  failed_when: dataplatform_iam_kc_svc.rc != 0 or dataplatform_iam_kc_svc.stdout | length == 0
+
+- name: Admin API base
+  ansible.builtin.set_fact:
+    dataplatform_iam_kc_admin_base: "http://{{ dataplatform_iam_kc_svc.stdout }}:8080"
+    dataplatform_iam_kc_host: "{{ groups['k3s_servers'][0] }}"

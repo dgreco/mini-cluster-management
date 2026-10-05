@@ -1,0 +1,10 @@
+---
+ceph_acme_godaddy_api: https://api.godaddy.com/v1/domains
+# GODADDY_PAT=<token> from .secrets/godaddy.env ('' when missing).
+ceph_acme_godaddy_pat: >-
+  {{ (lookup('ansible.builtin.file', secrets_dir ~ '/godaddy.env', errors='ignore') | default('', true)
+      | regex_findall('(?m)^GODADDY_PAT=(\S+)') + [''])[0] }}
+# Record names relative to the zone: s3 and *.s3 for s3.<zone>.
+ceph_acme_record: "{{ ceph_rgw_acme_domain | regex_replace('\\.' ~ (ceph_rgw_acme_zone | regex_escape) ~ '$', '') }}"
+# -e ceph_acme_force=true: renew now even when not due
+ceph_acme_force: false

@@ -1,0 +1,151 @@
+---
+# Safe rolling reboot, one node at a time. Imported by cluster/reboot.yml and
+# cluster/update.yml, which first set the localhost fact `rolling_candidates`:
+# the inventory names of the nodes to reboot (empty: nothing to do).
+#
+# 1. Pre-flight, once: every node answers on SSH, and each subsystem's
+#    hooks/rolling-start.yml refuses to start unless it is healthy. The hooks may
+#    ask for nodes to go first (localhost fact rolling_first) or last
+#    (rolling_last).
+# 2. Order: reboot_order=smart (default) honours those requests; inventory
+#    keeps the order of inventory/hosts.ini.
+# 3. Per node, stopping at the first failure: the node-enter hooks (data
+#    platform, k3s, then Ceph; cluster/tasks/node-enter.yml), reboot, the
+#    node-exit hooks (Ceph, k3s, then the data platform; tasks/node-exit.yml).
+#    The exit hooks wait until their subsystem is fully healthy again before
+#    the next node goes.
+# 4. Summary: each subsystem's hooks/rolling-end.yml, kernel and boot time of
+#    the rebooted nodes.
+
+- name: Pre-flight checks before the rolling reboot
+  hosts: "{{ hostvars['localhost']['rolling_candidates'] | default([]) }}"
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Every node answers on SSH
+      ansible.builtin.ping:
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['nodes'] }}"
+      run_once: true
+
+    - name: Clear the order requests of an earlier run
+      ansible.builtin.set_fact:
+        rolling_first: []
+        rolling_last: []
+      delegate_to: localhost
+      delegate_facts: true
+      run_once: true
+
+    # ---- subsystem pre-flight hooks (add one per subsystem) ----
+    - name: Check the data platform
+      ansible.builtin.include_tasks: ../subsystems/dataplatform/hooks/rolling-start.yml
+      run_once: true
+      when: groups['dataplatform'] | default([]) | length > 0
+
+    - name: Check k3s
+      ansible.builtin.include_tasks: ../subsystems/k3s/hooks/rolling-start.yml
+      run_once: true
+      when: groups['k3s'] | default([]) | length > 0
+
+    - name: Check Ceph
+      ansible.builtin.include_tasks: ../subsystems/ceph/hooks/rolling-start.yml
+      run_once: true
+      when: groups['ceph'] | default([]) | length > 0
+
+- name: Reboot order
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Choose the order
+      ansible.builtin.set_fact:
+        rolling_order: >-
+          {{ rolling_candidates if (reboot_order | default('smart')) == 'inventory' else
+             (rolling_candidates | select('in', rolling_first) | list)
+             + (rolling_candidates | reject('in', rolling_first + rolling_last) | list)
+             + (rolling_last | unique | select('in', rolling_candidates) | reject('in', rolling_first) | list) }}
+      when: rolling_candidates | length > 0
+
+    - name: Order
+      ansible.builtin.debug:
+        msg: >-
+          Rebooting {{ rolling_order | join(', ') }}, one at a time
+          (about {{ rolling_order | length * 3 }} minutes, more if Ceph has data to recover).
+      when: rolling_candidates | length > 0
+
+- name: Rolling reboot
+  hosts: "{{ hostvars['localhost']['rolling_order'] | default([]) }}"
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Reboot {{ inventory_hostname }}
+      block:
+        - name: Not rebooted yet
+          ansible.builtin.set_fact:
+            rolling_rebooted: false
+
+        # The subsystems' node-enter hooks (tasks/node-enter.yml): the data
+        # platform, then k3s, then Ceph.
+        - name: Take the node out of service
+          ansible.builtin.include_tasks: tasks/node-enter.yml
+
+        - name: Reboot
+          ansible.builtin.reboot:
+            reboot_timeout: "{{ node_reboot_timeout }}"
+            post_reboot_delay: 15
+
+        - name: Rebooted
+          ansible.builtin.set_fact:
+            rolling_rebooted: true
+
+        # The node-exit hooks in reverse order (tasks/node-exit.yml); each
+        # waits until its subsystem is healthy again.
+        - name: Put the node back into service
+          ansible.builtin.include_tasks: tasks/node-exit.yml
+
+      rescue:
+        # Failed before the reboot: undo the enter hooks (the exit hooks are
+        # safe on a node that did not go down), so the node serves again.
+        - name: Put the node back into service
+          ansible.builtin.include_tasks: tasks/node-exit.yml
+          when: not rolling_rebooted
+
+        - name: Stop the rolling reboot
+          ansible.builtin.fail:
+            msg: >-
+              Stopped at {{ inventory_hostname }}, step "{{ ansible_failed_task.name | default('?') }}" (the
+              error is shown above).
+              {{ 'The node was rebooted but is not healthy yet; check it, then run make cluster-reboot again.'
+                 if rolling_rebooted else 'The node was not rebooted and is back in service.' }}
+              Nodes after it were not touched.
+
+- name: Rolling reboot summary
+  hosts: "{{ hostvars['localhost']['rolling_order'] | default([]) }}"
+  gather_facts: false
+  tasks:
+    - name: Kernel and boot time
+      ansible.builtin.shell: echo "kernel $(uname -r), up since $(uptime -s)"
+      register: rolling_boot
+      changed_when: false
+
+    # ---- subsystem summary hooks ----
+    - name: Show k3s
+      ansible.builtin.include_tasks: ../subsystems/k3s/hooks/rolling-end.yml
+      run_once: true
+      when: groups['k3s'] | default([]) | length > 0
+
+    - name: Show Ceph
+      ansible.builtin.include_tasks: ../subsystems/ceph/hooks/rolling-end.yml
+      run_once: true
+      when: groups['ceph'] | default([]) | length > 0
+
+    - name: Show the data platform
+      ansible.builtin.include_tasks: ../subsystems/dataplatform/hooks/rolling-end.yml
+      run_once: true
+      when: groups['dataplatform'] | default([]) | length > 0
+
+    - name: Rebooted nodes
+      ansible.builtin.debug:
+        msg: >-
+          {{ ansible_play_hosts | zip(ansible_play_hosts | map('extract', hostvars, ['rolling_boot', 'stdout']))
+             | map('join', ': ') | list }}
+      run_once: true

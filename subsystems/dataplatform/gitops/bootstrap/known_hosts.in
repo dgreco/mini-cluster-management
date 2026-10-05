@@ -1,0 +1,3 @@
+<% for key in site_git_host_keys %>
+<%= key %>
+<% endfor %>

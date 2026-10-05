@@ -1,0 +1,86 @@
+---
+# Operating-system baseline for every node. Safe to re-run at any time.
+- name: Node baseline
+  hosts: "{{ target | default('nodes') }}"
+  tasks:
+    # Never rewrite the hostname: cephadm registers hosts under the name they
+    # report at install time and would lose track of a renamed node.
+    - name: Reported hostname must be the inventory name, short or fully qualified
+      ansible.builtin.assert:
+        that: ansible_facts['nodename'] in [inventory_hostname, inventory_hostname ~ '.' ~ cluster_domain]
+        fail_msg: "{{ inventory_hostname }} reports hostname '{{ ansible_facts['nodename'] }}'; fix the inventory or /etc/hostname"
+
+    - name: Refresh apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install baseline packages
+      ansible.builtin.apt:
+        name: "{{ baseline_packages }}"
+        state: present
+
+    - name: Apply safe upgrades
+      ansible.builtin.apt:
+        upgrade: safe
+      when: baseline_apt_upgrade | bool
+
+    # Separate from the upgrade: --auto-remove there only applies to install and remove.
+    - name: Remove packages no longer needed
+      ansible.builtin.apt:
+        autoremove: true
+      when: baseline_apt_upgrade | bool
+
+    - name: Ensure time synchronisation is running
+      ansible.builtin.service:
+        name: chrony
+        state: started
+        enabled: true
+
+    # The boards' image forced cgroup v1 (systemd.unified_cgroup_hierarchy=0 in
+    # the u-boot environment). Kubernetes >= 1.35 refuses cgroup v1, so boot
+    # with the unified (v2) hierarchy. Takes effect after the next reboot.
+    - name: The u-boot environment (Rockchip Ubuntu images)
+      ansible.builtin.stat:
+        path: /boot/firmware/ubuntuEnv.txt
+      register: baseline_uboot_env
+      tags: [cgroup]
+
+    # /boot/firmware is FAT: Ansible's own backup names (with ':' and '@') are
+    # not valid there, so keep one copy of the original under a plain name.
+    - name: Keep the original u-boot environment
+      ansible.builtin.copy:
+        src: /boot/firmware/ubuntuEnv.txt
+        dest: /boot/firmware/ubuntuEnv.txt.orig
+        remote_src: true
+        force: false
+        mode: preserve
+      when: baseline_uboot_env.stat.exists
+      tags: [cgroup]
+
+    - name: Boot with cgroup v2
+      ansible.builtin.replace:
+        path: /boot/firmware/ubuntuEnv.txt
+        regexp: "\\s*systemd\\.unified_cgroup_hierarchy=0"
+        replace: ""
+      register: baseline_cgroup
+      when: baseline_uboot_env.stat.exists
+      tags: [cgroup]
+
+    - name: Flag the reboot the cgroup change needs
+      ansible.builtin.file:
+        path: /var/run/reboot-required
+        state: touch
+        mode: "0644"
+      when: baseline_cgroup is changed  # noqa: no-handler (the next task reads the flag)
+      tags: [cgroup]
+
+    - name: Check whether a reboot is pending
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot pending
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} needs a reboot (run: make cluster-reboot ARGS='-e target={{ inventory_hostname }}')"
+      when: reboot_required.stat.exists

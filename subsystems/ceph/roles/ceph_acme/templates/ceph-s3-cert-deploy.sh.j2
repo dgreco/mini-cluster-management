@@ -1,0 +1,6 @@
+#!/bin/bash
+# Managed by Ansible (ceph_acme). lego deploy hook: serve the new certificate
+# on the S3 ingress (nothing to do before the ceph_rgw role has set it up).
+set -euo pipefail
+[ -x /usr/local/sbin/ceph-ingress-apply ] && [ -f /etc/ceph/specs/ingress-base.yml ] || exit 0
+/usr/local/sbin/ceph-ingress-apply {{ ceph_acme_cert_file }} {{ ceph_acme_key_file }}

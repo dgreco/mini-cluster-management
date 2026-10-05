@@ -1,0 +1,355 @@
+---
+# Ceph side of the data platform, on the Ceph admin host: the platform's RGW
+# IAM account, its service users with what they may do, and the buckets.
+# Keys never go to .secrets (they are stored in OpenBao,
+# dataplatform_s3_users[].openbao, where the platform's ExternalSecrets read
+# them), except those of users with secrets_file, which go to
+# .secrets/<secrets_file>.{json,env}. The STS roles are Meta Catalog's (from
+# the grants administrators authorize there; user metacatalog-iam) and the
+# IAM role's (the platform's own, with the OIDC provider: make dataplatform-iam).
+- name: S3 with STS must be enabled
+  ansible.builtin.assert:
+    that:
+      - ceph_rgw_enabled | bool
+      - ceph_rgw_sts_enabled | bool
+    fail_msg: "the data platform needs S3 with STS: ceph_rgw_enabled and ceph_rgw_sts_enabled in group_vars/ceph/, then make ceph-s3"
+    quiet: true
+
+# ---------------------------------------------------------------- account ----
+# Every identity of the platform lives in one RGW IAM account (Squid): roles
+# get ARNs with the account id, users get IAM policies, and the IAM API has
+# what roles need (managed policies and instance profiles are still missing:
+# a role has one inline policy, `access`).
+- name: Look up the account
+  ansible.builtin.command: cephadm shell -- radosgw-admin account get --account-id={{ dataplatform_rgw_account_id }}
+  register: dataplatform_ceph_account
+  changed_when: false
+  failed_when: false
+
+- name: Create the account
+  ansible.builtin.command: >-
+    cephadm shell -- radosgw-admin account create --account-id={{ dataplatform_rgw_account_id }}
+    --account-name={{ dataplatform_rgw_account_name }}
+  when: dataplatform_ceph_account.rc != 0
+  changed_when: true
+
+# ---------------------------------------------------------------- users ----
+- name: Look up the service users
+  ansible.builtin.command: cephadm shell -- radosgw-admin user info --uid={{ item.uid }}
+  loop: "{{ dataplatform_s3_users }}"
+  loop_control:
+    label: "{{ item.uid }}"
+  register: dataplatform_ceph_user_lookup
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+# --max-buckets: -1 = may not create buckets, 0 would mean no limit. An
+# account user's display name is its IAM user name: no spaces.
+- name: Create the service users in the account
+  ansible.builtin.command: >-
+    cephadm shell -- radosgw-admin user create --uid={{ item.item.uid }}
+    --display-name={{ item.item.display_name | quote }}
+    --max-buckets={{ item.item.max_buckets }}
+    --account-id={{ dataplatform_rgw_account_id }}
+    {{ '--account-root' if item.item.account_root | default(false) else '' }}
+  loop: "{{ dataplatform_ceph_user_lookup.results }}"
+  loop_control:
+    label: "{{ item.item.uid }}"
+  when: item.rc != 0
+  changed_when: true
+  no_log: true
+
+# A user of an earlier install (account-less) is adopted into the account
+# with its buckets; its keys stay. It has no permission until its policy
+# below (or account root) says so. Its display name becomes its IAM user
+# name, which allows no spaces: the one of dataplatform_s3_users is set.
+- name: Adopt the users of an earlier install into the account
+  ansible.builtin.command: >-
+    cephadm shell -- radosgw-admin user modify --uid={{ item.item.uid }}
+    --display-name={{ item.item.display_name | quote }}
+    --account-id={{ dataplatform_rgw_account_id }}
+    {{ '--account-root' if item.item.account_root | default(false) else '' }}
+  loop: "{{ dataplatform_ceph_user_lookup.results }}"
+  loop_control:
+    label: "{{ item.item.uid }}"
+  when:
+    - item.rc == 0
+    - (item.stdout | from_json).account_id | default('') != dataplatform_rgw_account_id
+  changed_when: true
+  no_log: true
+
+- name: Keep the bucket limits and the root flag
+  ansible.builtin.command: >-
+    cephadm shell -- radosgw-admin user modify --uid={{ item.item.uid }} --max-buckets={{ item.item.max_buckets }}
+    {{ '--account-root' if item.item.account_root | default(false) else '' }}
+  loop: "{{ dataplatform_ceph_user_lookup.results }}"
+  loop_control:
+    label: "{{ item.item.uid }}"
+  when:
+    - item.rc == 0
+    - (item.stdout | from_json).account_id | default('') == dataplatform_rgw_account_id
+    - (item.stdout | from_json).max_buckets | int != item.item.max_buckets | int
+      or ((item.stdout | from_json).type | default('rgw') == 'root') != (item.item.account_root | default(false) | bool)
+  changed_when: true
+  no_log: true
+
+- name: Read the service users
+  ansible.builtin.command: cephadm shell -- radosgw-admin user info --uid={{ item.uid }}
+  loop: "{{ dataplatform_s3_users }}"
+  loop_control:
+    label: "{{ item.uid }}"
+  register: dataplatform_ceph_user_info
+  changed_when: false
+  no_log: true
+
+- name: Publish the S3 keys
+  ansible.builtin.set_fact:
+    dataplatform_ceph_s3_keys: >-
+      {{ dict(dataplatform_ceph_user_info.results | map(attribute='item.uid')
+              | zip(dataplatform_ceph_user_info.results | map(attribute='stdout') | map('from_json')
+                    | map(attribute='keys') | map('first'))) }}
+  no_log: true
+
+# RGW lets a non-root account user list the account's roles only with the
+# admin capability roles=read, whatever its IAM policy says: metacatalog-iam
+# needs the list to delete the roles no grant names any more. read changes
+# nothing: every write still needs the user policy (caps, as type=perm).
+- name: Admin capabilities of the service users
+  ansible.builtin.command: cephadm shell -- radosgw-admin caps add --uid={{ item.item.uid }} --caps={{ item.item.caps }}
+  loop: "{{ dataplatform_ceph_user_info.results | selectattr('item.caps', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.item.uid }}: {{ item.item.caps }}"
+  when: >-
+    item.item.caps not in ((item.stdout | from_json).caps | map(attribute='type')
+                           | zip((item.stdout | from_json).caps | map(attribute='perm')) | map('join', '=') | list)
+  changed_when: true
+  no_log: true
+
+# ---------------------------------------------------------------- user policies ----
+# What a non-root user may do in the account (IAM user policy, through the
+# IAM API as the account's root user dataplatform). Compare-and-set.
+- name: Current user policies
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -c
+      - |
+        import boto3, botocore, json, os, sys
+        iam = boto3.client("iam", endpoint_url=os.environ["ENDPOINT"], region_name=os.environ["REGION"])
+        try:
+            doc = iam.get_user_policy(UserName=sys.argv[1], PolicyName="access")["PolicyDocument"]
+            print(json.dumps(json.loads(doc) if isinstance(doc, str) else doc))
+        except botocore.exceptions.ClientError:
+            print("null")
+      - "{{ item.uid }}"
+  environment:
+    ENDPOINT: "{{ dataplatform_s3_endpoint }}"
+    REGION: "{{ dataplatform_s3_region }}"
+    AWS_ACCESS_KEY_ID: "{{ dataplatform_ceph_s3_keys['dataplatform'].access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ dataplatform_ceph_s3_keys['dataplatform'].secret_key }}"
+  loop: "{{ dataplatform_s3_users | selectattr('policy', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.uid }}"
+  delegate_to: localhost
+  become: false
+  register: dataplatform_ceph_user_policies
+  changed_when: false
+
+- name: Put the user policies
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -c
+      - |
+        import boto3, os, sys
+        iam = boto3.client("iam", endpoint_url=os.environ["ENDPOINT"], region_name=os.environ["REGION"])
+        iam.put_user_policy(UserName=sys.argv[1], PolicyName="access", PolicyDocument=sys.argv[2])
+      - "{{ item.item.uid }}"
+      - "{{ _policy | to_json }}"
+  environment:
+    ENDPOINT: "{{ dataplatform_s3_endpoint }}"
+    REGION: "{{ dataplatform_s3_region }}"
+    AWS_ACCESS_KEY_ID: "{{ dataplatform_ceph_s3_keys['dataplatform'].access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ dataplatform_ceph_s3_keys['dataplatform'].secret_key }}"
+  loop: "{{ dataplatform_ceph_user_policies.results }}"
+  loop_control:
+    label: "{{ item.item.uid }}"
+  vars:
+    _policy: {Version: "2012-10-17", Statement: "{{ item.item.policy }}"}
+  when: (item.stdout | from_json) != _policy
+  delegate_to: localhost
+  become: false
+  changed_when: true
+
+# ---------------------------------------------------------------- users that are gone ----
+- name: Look up the removed service users
+  ansible.builtin.command: cephadm shell -- radosgw-admin user info --uid={{ item.uid }}
+  loop: "{{ dataplatform_s3_users_removed | default([]) }}"
+  loop_control:
+    label: "{{ item.uid }}"
+  register: dataplatform_ceph_removed_lookup
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+# Without --purge-data: what such a user wrote belongs to the bucket (the
+# account's), and stays.
+- name: Delete them from RGW
+  ansible.builtin.command: cephadm shell -- radosgw-admin user rm --uid={{ item.item.uid }}
+  loop: "{{ dataplatform_ceph_removed_lookup.results }}"
+  loop_control:
+    label: "{{ item.item.uid }}"
+  when: item.rc == 0
+  changed_when: true
+
+- name: And their key files from the control node
+  ansible.builtin.file:
+    path: "{{ secrets_dir }}/{{ item.0.secrets_file }}.{{ item.1 }}"
+    state: absent
+  loop: "{{ dataplatform_s3_users_removed | default([]) | selectattr('secrets_file', 'defined') | product(['json', 'env']) | list }}"
+  loop_control:
+    label: ".secrets/{{ item.0.secrets_file }}.{{ item.1 }}"
+  delegate_to: localhost
+  become: false
+
+# ---------------------------------------------------------------- keys kept on the control node ----
+# Users with secrets_file (none at present).
+- name: Keys kept on the control node
+  ansible.builtin.copy:
+    dest: "{{ secrets_dir }}/{{ item.secrets_file }}.json"
+    content: "{{ dataplatform_ceph_s3_keys[item.uid] | to_nice_json }}\n"
+    mode: "0600"
+  loop: "{{ dataplatform_s3_users | selectattr('secrets_file', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.uid }} -> .secrets/{{ item.secrets_file }}.json"
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: Same keys for the shell, headed by the user's secrets_note
+  ansible.builtin.copy:
+    dest: "{{ secrets_dir }}/{{ item.secrets_file }}.env"
+    content: |
+      # RGW key of {{ item.uid }}:
+      {% for line in item.secrets_note | default([]) %}
+      # {{ line }}
+      {% endfor %}
+      export AWS_ACCESS_KEY_ID={{ dataplatform_ceph_s3_keys[item.uid].access_key }}
+      export AWS_SECRET_ACCESS_KEY={{ dataplatform_ceph_s3_keys[item.uid].secret_key }}
+    mode: "0600"
+  loop: "{{ dataplatform_s3_users | selectattr('secrets_file', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.uid }} -> .secrets/{{ item.secrets_file }}.env"
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+# ---------------------------------------------------------------- buckets ----
+# Through the S3 API as the owner (radosgw-admin cannot create buckets). The
+# platform bucket belongs to the account (created by its root user).
+- name: Buckets
+  amazon.aws.s3_bucket:
+    name: "{{ item.bucket }}"
+    state: present
+    ceph: true
+    endpoint_url: "{{ dataplatform_s3_endpoint }}"
+    region: "{{ dataplatform_s3_region }}"
+    access_key: "{{ dataplatform_ceph_s3_keys[item.owner].access_key }}"
+    secret_key: "{{ dataplatform_ceph_s3_keys[item.owner].secret_key }}"
+    validate_certs: "{{ ceph_rgw_acme_active | bool }}"
+  loop:
+    - {bucket: "{{ dataplatform_bucket }}", owner: dataplatform}
+  loop_control:
+    label: "{{ item.owner }}: {{ item.bucket }}"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+# Spark writes its event logs to s3a://<bucket>/<dataplatform_spark_events_prefix>
+# and refuses to start when that "directory" does not exist. Made with the
+# spark user's own key: this also proves its policy reaches it.
+- name: Directory of the Spark event logs
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -c
+      - |
+        import boto3, botocore, os
+        s3 = boto3.client("s3", endpoint_url=os.environ["ENDPOINT"], region_name=os.environ["REGION"])
+        try:
+            s3.head_object(Bucket=os.environ["BUCKET"], Key=os.environ["PREFIX"])
+            print("present")
+        except botocore.exceptions.ClientError:
+            s3.put_object(Bucket=os.environ["BUCKET"], Key=os.environ["PREFIX"], Body=b"")
+            print("created")
+  environment:
+    ENDPOINT: "{{ dataplatform_s3_endpoint }}"
+    REGION: "{{ dataplatform_s3_region }}"
+    BUCKET: "{{ dataplatform_bucket }}"
+    PREFIX: "{{ dataplatform_spark_events_prefix }}"
+    AWS_ACCESS_KEY_ID: "{{ dataplatform_ceph_s3_keys['spark'].access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ dataplatform_ceph_s3_keys['spark'].secret_key }}"
+  delegate_to: localhost
+  become: false
+  register: dataplatform_ceph_eventlogs
+  changed_when: dataplatform_ceph_eventlogs.stdout == 'created'
+
+# ---------------------------------------------------------------- keys to OpenBao ----
+- name: OpenBao client
+  ansible.builtin.include_role:
+    name: dataplatform_openbao
+    tasks_from: client
+
+# The backup user of subsystems/ceph (ceph_rgw_backup_uid) owns the backup
+# bucket; its keys are in .secrets and go to OpenBao for the PostgreSQL
+# backups and the OpenBao snapshots (gitops/manifests/governance/backup).
+- name: Keys of the backup S3 user
+  ansible.builtin.set_fact:
+    dataplatform_ceph_backup_key: >-
+      {{ lookup('ansible.builtin.file', secrets_dir ~ '/s3-' ~ ceph_rgw_backup_uid ~ '.json', errors='ignore')
+         | default('{}', true) | from_json }}
+  no_log: true
+  when: ceph_rgw_backup_enabled | bool
+
+- name: The backup S3 user exists
+  ansible.builtin.assert:
+    that: dataplatform_ceph_backup_key.access_key is defined
+    fail_msg: "{{ secrets_dir }}/s3-{{ ceph_rgw_backup_uid }}.json is missing: run make ceph-s3 first"
+    quiet: true
+  when: ceph_rgw_backup_enabled | bool
+
+- name: Store the S3 keys in OpenBao
+  ansible.builtin.include_role:
+    name: dataplatform_openbao
+    tasks_from: kv_put
+  loop: "{{ dataplatform_s3_users | selectattr('openbao', 'defined') | list | subelements('openbao') }}"
+  loop_control:
+    label: "{{ item.0.uid }} -> secret/dataplatform/{{ item.1 }}"
+  vars:
+    dataplatform_openbao_kv_path: "{{ item.1 }}"
+    dataplatform_openbao_kv_data:
+      access-key: "{{ dataplatform_ceph_s3_keys[item.0.uid].access_key }}"
+      secret-key: "{{ dataplatform_ceph_s3_keys[item.0.uid].secret_key }}"
+
+- name: Store the backup key in OpenBao
+  ansible.builtin.include_role:
+    name: dataplatform_openbao
+    tasks_from: kv_put
+  vars:
+    dataplatform_openbao_kv_path: "{{ dataplatform_backup_kv_path }}"
+    dataplatform_openbao_kv_data:
+      access-key: "{{ dataplatform_ceph_backup_key.access_key }}"
+      secret-key: "{{ dataplatform_ceph_backup_key.secret_key }}"
+  when: ceph_rgw_backup_enabled | bool
+
+- name: Admin read access to every bucket, and the S3 browser's index
+  ansible.builtin.include_tasks: admin_read.yml
+
+- name: Account
+  ansible.builtin.debug:
+    msg: >-
+      account {{ dataplatform_rgw_account_id }} ({{ dataplatform_rgw_account_name }}):
+      users {{ dataplatform_s3_users | map(attribute='uid') | join(', ') }};
+      bucket s3://{{ dataplatform_bucket }}

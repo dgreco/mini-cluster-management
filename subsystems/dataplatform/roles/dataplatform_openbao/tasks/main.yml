@@ -1,0 +1,448 @@
+---
+# OpenBao after Argo CD has started it (wave -3; the root app waits there until
+# this has run once). Initialise it once, then converge the secrets engine, the
+# Kubernetes auth method, one read-only policy and role per SecretStore
+# namespace, and the values Ansible generates. Every call goes to the HTTP API
+# from the first k3s server, which reaches pod and Service addresses.
+# The StatefulSet starts its pods in order: openbao-1 and -2 only appear once
+# openbao-0 is ready, which it is after the initialisation below.
+- name: Wait for openbao-0 to start
+  ansible.builtin.shell: |
+    set -o pipefail
+    end=$((SECONDS + {{ dataplatform_openbao_timeout }}))
+    until [ "$(/usr/local/bin/k3s kubectl -n {{ dataplatform_openbao_namespace }} get pod openbao-0 \
+               -o 'jsonpath={.status.containerStatuses[0].started}' 2>/dev/null)" = true ]; do
+      if [ $SECONDS -ge $end ]; then
+        echo "openbao-0 has not started; is Argo CD past wave -3? kubectl -n argocd get applications" >&2
+        exit 1
+      fi
+      sleep 10
+    done
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Address of openbao-0
+  ansible.builtin.command: >-
+    /usr/local/bin/k3s kubectl -n {{ dataplatform_openbao_namespace }} get pod openbao-0
+    -o 'jsonpath={.status.podIP}'
+  register: dataplatform_openbao_pod0
+  changed_when: false
+
+- name: Initialisation status
+  ansible.builtin.uri:
+    url: http://{{ dataplatform_openbao_pod0.stdout }}:8200/v1/sys/init
+  register: dataplatform_openbao_init_status
+  retries: 30
+  delay: 5
+  until: dataplatform_openbao_init_status.status == 200
+
+- name: Saved initialisation - {{ dataplatform_openbao_init_file }}
+  ansible.builtin.stat:
+    path: "{{ dataplatform_openbao_init_file }}"
+  delegate_to: localhost
+  become: false
+  register: dataplatform_openbao_init_saved
+
+- name: The initialisation keys belong to this OpenBao
+  ansible.builtin.assert:
+    that: dataplatform_openbao_init_status.json.initialized == dataplatform_openbao_init_saved.stat.exists
+    fail_msg: >-
+      {{ 'OpenBao is initialised but ' ~ dataplatform_openbao_init_file ~ ' is missing: restore it (it holds the root token)'
+         if dataplatform_openbao_init_status.json.initialized else
+         'OpenBao is not initialised but ' ~ dataplatform_openbao_init_file ~ ' exists: it belongs to an earlier
+         installation. Move it away (its keys are useless now) and re-run.' }}
+    quiet: true
+
+# With the static seal, init returns recovery keys and the root token, and
+# openbao-0 unseals itself; the other pods join the Raft cluster (retry_join)
+# and unseal the same way.
+- name: Initialise OpenBao
+  when: not dataplatform_openbao_init_status.json.initialized
+  block:
+    - name: Initialise openbao-0
+      ansible.builtin.uri:
+        url: http://{{ dataplatform_openbao_pod0.stdout }}:8200/v1/sys/init
+        method: POST
+        body_format: json
+        body:
+          recovery_shares: "{{ dataplatform_openbao_recovery_shares }}"
+          recovery_threshold: "{{ dataplatform_openbao_recovery_threshold }}"
+      register: dataplatform_openbao_init
+      changed_when: true
+      no_log: true
+
+    - name: Save the recovery keys and the root token
+      ansible.builtin.copy:
+        content: "{{ dataplatform_openbao_init.json | to_nice_json }}\n"
+        dest: "{{ dataplatform_openbao_init_file }}"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+- name: Wait until every OpenBao pod is unsealed and ready
+  ansible.builtin.shell: |
+    set -o pipefail
+    end=$((SECONDS + {{ dataplatform_openbao_timeout }}))
+    until [ "$(/usr/local/bin/k3s kubectl -n {{ dataplatform_openbao_namespace }} get statefulset openbao \
+               -o 'jsonpath={.status.readyReplicas}/{.spec.replicas}' 2>/dev/null)" = 3/3 ]; do
+      if [ $SECONDS -ge $end ]; then
+        /usr/local/bin/k3s kubectl -n {{ dataplatform_openbao_namespace }} get pods -l app.kubernetes.io/name=openbao >&2
+        exit 1
+      fi
+      sleep 10
+    done
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Client settings
+  ansible.builtin.include_tasks: client.yml
+
+# ---------------------------------------------------------------- engines and auth ----
+- name: Secrets engines
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/sys/mounts"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+  register: dataplatform_openbao_mounts
+  no_log: true
+
+- name: KV version 2 at secret/
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/sys/mounts/secret"
+    method: POST
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    body_format: json
+    body: {type: kv, options: {version: "2"}, description: data platform secrets}
+    status_code: [200, 204]
+  when: "'secret/' not in dataplatform_openbao_mounts.json.data"
+  changed_when: true
+  no_log: true
+
+- name: Auth methods
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/sys/auth"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+  register: dataplatform_openbao_auths
+  no_log: true
+
+- name: Kubernetes auth method
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/sys/auth/kubernetes"
+    method: POST
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    body_format: json
+    body: {type: kubernetes, description: service accounts of the SecretStores}
+    status_code: [200, 204]
+  when: "'kubernetes/' not in dataplatform_openbao_auths.json.data"
+  changed_when: true
+  no_log: true
+
+# In the cluster OpenBao reviews tokens with its own service account (the chart
+# binds it to system:auth-delegator) and the pod's CA.
+- name: Kubernetes auth configuration
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/auth/kubernetes/config"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    status_code: [200, 400, 404]
+  register: dataplatform_openbao_k8s_config
+  no_log: true
+
+- name: Point the Kubernetes auth method at the API server
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/auth/kubernetes/config"
+    method: POST
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    body_format: json
+    body: {kubernetes_host: "https://kubernetes.default.svc:443"}
+    status_code: [200, 204]
+  when: >-
+    dataplatform_openbao_k8s_config.status != 200
+    or dataplatform_openbao_k8s_config.json.data.kubernetes_host | default('') != 'https://kubernetes.default.svc:443'
+  changed_when: true
+  no_log: true
+
+# ---------------------------------------------------------------- the Ansible token ----
+# Everything the roles do, without being root: the secrets, the policies, the
+# auth methods, identity, the snapshot. Not sys/generate-root, not sys/init.
+- name: Policy of the Ansible token
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/sys/policies/acl/ansible"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    status_code: [200, 404]
+  register: dataplatform_openbao_ansible_policy
+  no_log: true
+
+- name: Policy ansible
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/sys/policies/acl/ansible"
+    method: PUT
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    body_format: json
+    body: {policy: "{{ _policy }}"}
+    status_code: [200, 204]
+  vars:
+    _policy: |
+      path "secret/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+      path "sys/policies/acl/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+      path "sys/auth" { capabilities = ["read", "list"] }
+      path "sys/auth/*" { capabilities = ["create", "read", "update", "delete", "sudo"] }
+      path "sys/mounts" { capabilities = ["read", "list"] }
+      path "sys/mounts/*" { capabilities = ["create", "read", "update", "delete", "sudo"] }
+      path "auth/kubernetes/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+      path "auth/oidc/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+      path "auth/token/create" { capabilities = ["create", "update"] }
+      path "auth/token/create-orphan" { capabilities = ["create", "update", "sudo"] }
+      path "auth/token/lookup-self" { capabilities = ["read"] }
+      path "auth/token/renew-self" { capabilities = ["update"] }
+      path "identity/*" { capabilities = ["create", "read", "update", "delete", "list"] }
+      path "sys/storage/raft/snapshot" { capabilities = ["read"] }
+  when: dataplatform_openbao_ansible_policy.status != 200 or dataplatform_openbao_ansible_policy.json.data.policy != _policy
+  changed_when: true
+  no_log: true
+
+# Once: with the root token, since the file does not exist yet.
+- name: Make the Ansible token
+  when: dataplatform_openbao_token_is_root
+  block:
+    - name: Create an orphan periodic token with the policy ansible
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/auth/token/create-orphan"
+        method: POST
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+        body_format: json
+        body:
+          policies: [ansible]
+          period: "{{ dataplatform_openbao_ansible_token_period }}"
+          display_name: ansible
+          no_default_policy: false
+      register: dataplatform_openbao_ansible_new
+      changed_when: true
+      no_log: true
+
+    - name: Save it - {{ dataplatform_openbao_ansible_token_file }}
+      ansible.builtin.copy:
+        content: "{{ dataplatform_openbao_ansible_new.json.auth.client_token }}\n"
+        dest: "{{ dataplatform_openbao_ansible_token_file }}"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Use it from now on
+      ansible.builtin.set_fact:
+        dataplatform_openbao_token: "{{ dataplatform_openbao_ansible_new.json.auth.client_token }}"
+        dataplatform_openbao_token_is_root: false
+      no_log: true
+
+# ---------------------------------------------------------------- per-namespace access ----
+- name: Policies of the SecretStores
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/sys/policies/acl/eso-{{ item }}"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    status_code: [200, 404]
+  loop: "{{ dataplatform_openbao_store_namespaces }}"
+  register: dataplatform_openbao_policies
+  no_log: true
+
+- name: Read-only policy per namespace - secret/dataplatform/<namespace>/*
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/sys/policies/acl/eso-{{ item.item }}"
+    method: PUT
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    body_format: json
+    body: {policy: "{{ _policy }}"}
+    status_code: [200, 204]
+  loop: "{{ dataplatform_openbao_policies.results }}"
+  loop_control:
+    label: eso-{{ item.item }}
+  vars:
+    _policy: |
+      path "secret/data/dataplatform/{{ item.item }}/*" {
+        capabilities = ["read"]
+      }
+      path "secret/metadata/dataplatform/{{ item.item }}/*" {
+        capabilities = ["read", "list"]
+      }
+  when: item.status != 200 or item.json.data.policy != _policy
+  changed_when: true
+  no_log: true
+
+- name: Kubernetes auth roles
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/auth/kubernetes/role/{{ item }}"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    status_code: [200, 404]
+  loop: "{{ dataplatform_openbao_store_namespaces }}"
+  register: dataplatform_openbao_roles
+  no_log: true
+
+- name: Role per namespace (its store's service account -> policy eso-<namespace>)
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/auth/kubernetes/role/{{ item.item }}"
+    method: POST
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    body_format: json
+    body: "{{ _role | combine({'token_ttl': 3600, 'token_max_ttl': 3600}) }}"
+    status_code: [200, 204]
+  loop: "{{ dataplatform_openbao_roles.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    _role:
+      bound_service_account_names: ["{{ dataplatform_openbao_store_sa }}"]
+      bound_service_account_namespaces: ["{{ item.item }}"]
+      token_policies: ["eso-{{ item.item }}"]
+    _current: >-
+      {{ {} if item.status != 200 else
+         {'bound_service_account_names': item.json.data.bound_service_account_names,
+          'bound_service_account_namespaces': item.json.data.bound_service_account_namespaces,
+          'token_policies': item.json.data.token_policies} }}
+  when: _current != _role
+  changed_when: true
+  no_log: true
+
+# ---------------------------------------------------------------- snapshots ----
+# The nightly snapshot job (gitops/manifests/governance/openbao-snapshot) logs in with
+# its service account and may only read a Raft snapshot.
+- name: Policy of the snapshot job
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/sys/policies/acl/openbao-snapshot"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    status_code: [200, 404]
+  register: dataplatform_openbao_snapshot_policy
+  no_log: true
+
+- name: Read-only policy on the Raft snapshot
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/sys/policies/acl/openbao-snapshot"
+    method: PUT
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    body_format: json
+    body: {policy: "{{ _policy }}"}
+    status_code: [200, 204]
+  vars:
+    _policy: |
+      path "sys/storage/raft/snapshot" {
+        capabilities = ["read"]
+      }
+  when: dataplatform_openbao_snapshot_policy.status != 200 or dataplatform_openbao_snapshot_policy.json.data.policy != _policy
+  changed_when: true
+  no_log: true
+
+- name: Kubernetes auth role of the snapshot job
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/auth/kubernetes/role/openbao-snapshot"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    status_code: [200, 404]
+  register: dataplatform_openbao_snapshot_role
+  no_log: true
+
+- name: Role openbao-snapshot (service account openbao-snapshot of {{ dataplatform_openbao_namespace }})
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/auth/kubernetes/role/openbao-snapshot"
+    method: POST
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    body_format: json
+    body: "{{ _role | combine({'token_ttl': 600, 'token_max_ttl': 600}) }}"
+    status_code: [200, 204]
+  vars:
+    _role:
+      bound_service_account_names: [openbao-snapshot]
+      bound_service_account_namespaces: ["{{ dataplatform_openbao_namespace }}"]
+      token_policies: [openbao-snapshot]
+    _current: >-
+      {{ {} if dataplatform_openbao_snapshot_role.status != 200 else
+         {'bound_service_account_names': dataplatform_openbao_snapshot_role.json.data.bound_service_account_names,
+          'bound_service_account_namespaces': dataplatform_openbao_snapshot_role.json.data.bound_service_account_namespaces,
+          'token_policies': dataplatform_openbao_snapshot_role.json.data.token_policies} }}
+  when: _current != _role
+  changed_when: true
+  no_log: true
+
+# ---------------------------------------------------------------- generated values ----
+- name: Read the generated secrets
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/secret/data/dataplatform/{{ item.key }}"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    status_code: [200, 404]
+  loop: "{{ dataplatform_openbao_generated | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: dataplatform_openbao_gen_current
+  no_log: true
+
+# Only missing keys are added: an existing value is never replaced. A path
+# without keys is still created, so an ExternalSecret can read it.
+- name: Add the missing values
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/secret/data/dataplatform/{{ item.item.key }}"
+    method: POST
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    body_format: json
+    body:
+      data: "{{ _current | combine(_missing) }}"
+  loop: "{{ dataplatform_openbao_gen_current.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+  vars:
+    _current: "{{ item.json.data.data if item.status == 200 else {} }}"
+    _missing: >-
+      {%- set out = {} -%}
+      {%- for k, v in item.item.value.items() if k not in _current -%}
+      {%- set _ = out.update({k: v if v is not none else
+                              lookup('ansible.builtin.password', '/dev/null', length=32, chars=['ascii_letters', 'digits'])}) -%}
+      {%- endfor -%}
+      {{ out }}
+  when: item.status == 404 or item.item.value.keys() | difference(_current.keys()) | length > 0
+  changed_when: true
+  no_log: true
+
+# ---------------------------------------------------------------- copies ----
+- name: Read the sources of the copies
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/secret/data/dataplatform/{{ item }}"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+  loop: >-
+    {{ dataplatform_openbao_copies.values() | map('dict2items') | flatten | map(attribute='value')
+       | map('split', '#') | map('first') | unique }}
+  register: dataplatform_openbao_sources
+  no_log: true
+
+- name: Read the copies
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/secret/data/dataplatform/{{ item.key }}"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    status_code: [200, 404]
+  loop: "{{ dataplatform_openbao_copies | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: dataplatform_openbao_copies_current
+  no_log: true
+
+- name: Keep the copies equal to their sources
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/secret/data/dataplatform/{{ item.item.key }}"
+    method: POST
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    body_format: json
+    body:
+      data: "{{ _current | combine(_wanted) }}"
+  loop: "{{ dataplatform_openbao_copies_current.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+  vars:
+    _sources: >-
+      {{ dict(dataplatform_openbao_sources.results | map(attribute='item')
+              | zip(dataplatform_openbao_sources.results | map(attribute='json') | map(attribute='data') | map(attribute='data'))) }}
+    _current: "{{ item.json.data.data if item.status == 200 else {} }}"
+    _wanted: >-
+      {%- set out = {} -%}
+      {%- for k, src in item.item.value.items() -%}
+      {%- set _ = out.update({k: _sources[src.split('#')[0]][src.split('#')[1]]}) -%}
+      {%- endfor -%}
+      {{ out }}
+  when: _current | combine(_wanted) != _current
+  changed_when: true
+  no_log: true

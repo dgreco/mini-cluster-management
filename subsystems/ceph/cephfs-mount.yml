@@ -1,0 +1,121 @@
+---
+# Kernel-mount CephFS through /etc/fstab. Part of install.yml: by default every
+# cluster node (group `ceph`) gets the mount. A subset:
+#   make ceph-cephfs-mount ARGS="-e cephfs_mount_hosts=node4"
+# Variables come from the admin host (group_vars/ceph/), so any target
+# pattern works. The fstab entry uses systemd automount + nofail so a
+# node boots even when the cluster is not up yet; the mount happens on first access.
+- name: Collect CephFS credentials
+  hosts: ceph_mons[0]
+  gather_facts: false
+  tasks:
+    - name: CephFS mounting is disabled
+      ansible.builtin.meta: end_play
+      when: not (ceph_cephfs_enabled | bool and ceph_cephfs_mount_nodes | bool)
+
+    - name: Client key
+      ansible.builtin.command: cephadm shell -- ceph auth get-key client.{{ ceph_cephfs_client_name }}
+      register: cephfs_key_raw
+      changed_when: false
+      no_log: true
+
+    - name: Monitor addresses
+      ansible.builtin.command: cephadm shell -- ceph mon dump --format json
+      register: mon_dump
+      changed_when: false
+
+    - name: Publish as facts
+      ansible.builtin.set_fact:
+        cephfs_client_key: "{{ cephfs_key_raw.stdout | trim }}"
+        cephfs_mon_addrs: >-
+          {{ (mon_dump.stdout | from_json).mons | map(attribute='addr') | map('regex_replace', '/\d+$', '') | join(',') }}
+      no_log: true
+
+- name: Mount CephFS
+  hosts: "{{ cephfs_mount_hosts | default('ceph') }}"
+  ignore_unreachable: true
+  vars:
+    _admin: "{{ groups['ceph_mons'][0] }}"
+    _enabled: "{{ hostvars[_admin]['ceph_cephfs_enabled'] | bool and hostvars[_admin]['ceph_cephfs_mount_nodes'] | bool }}"
+    _key: "{{ hostvars[_admin]['cephfs_client_key'] | default('') }}"
+    _mons: "{{ hostvars[_admin]['cephfs_mon_addrs'] | default('') }}"
+    _client: "{{ hostvars[_admin]['ceph_cephfs_client_name'] }}"
+    _mount_point: "{{ hostvars[_admin]['ceph_cephfs_mount_point'] }}"
+    _options: "{{ hostvars[_admin]['ceph_cephfs_mount_options'] }}"
+    _fstab: >-
+      {{ _mons }}:/  {{ _mount_point }}  ceph  name={{ _client }},secretfile=/etc/ceph/{{ _client }}.secret,{{ _options }}  0  0
+  tasks:
+    - name: CephFS mounting is disabled
+      ansible.builtin.meta: end_host
+      when: not _enabled
+
+    - name: Install ceph-common (mount.ceph helper)
+      ansible.builtin.apt:
+        name: ceph-common
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: /etc/ceph
+      ansible.builtin.file:
+        path: /etc/ceph
+        state: directory
+        mode: "0755"
+
+    - name: Secret file
+      ansible.builtin.copy:
+        content: "{{ _key }}\n"
+        dest: "/etc/ceph/{{ _client }}.secret"
+        mode: "0600"
+      no_log: true
+
+    - name: Mount point
+      ansible.builtin.file:
+        path: "{{ _mount_point }}"
+        state: directory
+        mode: "0755"
+
+    - name: The fstab entry
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: "^\\S+\\s+{{ _mount_point }}\\s+ceph\\s"
+        line: "{{ _fstab }}"
+      register: fstab
+
+    - name: Reload systemd units generated from fstab
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: fstab.changed  # noqa: no-handler (the mount units must be current for the next tasks)
+
+    - name: Automount unit name
+      ansible.builtin.command: systemd-escape -p --suffix=automount {{ _mount_point }}
+      register: automount_unit
+      changed_when: false
+
+    - name: Start the automount unit
+      ansible.builtin.systemd:
+        name: "{{ automount_unit.stdout }}"
+        state: started
+        enabled: true
+      when: "'x-systemd.automount' in _options"
+
+    - name: Is CephFS already mounted?
+      ansible.builtin.command: findmnt -rn -t ceph {{ _mount_point }}
+      register: cephfs_mounted
+      changed_when: false
+      failed_when: false
+
+    - name: Mount now
+      # The fstab entry is managed above; the mount module would rewrite it.
+      ansible.builtin.command: mount {{ _mount_point }}  # noqa: command-instead-of-module
+      when: cephfs_mounted.rc != 0
+      changed_when: true
+
+    - name: Verify
+      ansible.builtin.command: df -h {{ _mount_point }}
+      changed_when: false
+      register: df_out
+
+    - name: Mounted
+      ansible.builtin.debug:
+        msg: "{{ df_out.stdout_lines }}"

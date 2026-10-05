@@ -1,0 +1,113 @@
+# A Raft snapshot of OpenBao every night, kept in s3://<%= site_backup_bucket %>/openbao/
+# (the last OPENBAO_SNAPSHOT_KEEP). The job logs in to OpenBao with its service
+# account (Kubernetes auth role openbao-snapshot, made by make
+# dataplatform-openbao: it may only read sys/storage/raft/snapshot) and
+# uploads with the backup key (Secret backup-s3, app governance-backup).
+# Restore: subsystems/dataplatform/README.md, "Backups".
+#
+# A run the cluster missed while it was off starts as soon as k3s is back,
+# long before OpenBao may answer (it needs Ceph for its volume): the job waits
+# up to two hours for the active node, and its Application is in the last
+# wave so that a waiting or failed run holds no other Application back.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openbao-snapshot
+  namespace: governance
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openbao-snapshot
+  namespace: governance
+data:
+  snapshot.sh: |
+    #!/bin/sh
+    # Raft snapshot of the active OpenBao node to S3, then prune the oldest.
+    set -eu
+    # Wait for the active node: a run caught up after a power-on starts before
+    # OpenBao is up and unsealed (after Ceph), and a pod's network takes a
+    # moment after it starts.
+    i=0
+    until code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$BAO_ADDR/v1/sys/health") \
+          && [ "$code" = 200 ]; do
+      i=$((i + 1))
+      [ "$i" -lt "$WAIT_TRIES" ] || { echo "OpenBao not active (last answer: $code)" >&2; exit 1; }
+      [ $((i % 12)) -ne 0 ] || echo "waiting for OpenBao (answer: $code)"
+      sleep 5
+    done
+    jwt=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+    login=$(curl -sSf -X POST "$BAO_ADDR/v1/auth/kubernetes/login" \
+              -d "{\"role\":\"$BAO_ROLE\",\"jwt\":\"$jwt\"}")
+    token=$(printf '%s' "$login" | sed -n 's/.*"client_token":"\([^"]*\)".*/\1/p')
+    [ -n "$token" ] || { echo "no token from OpenBao: $login" >&2; exit 1; }
+    curl -sSf -H "X-Vault-Token: $token" -o /tmp/openbao.snap "$BAO_ADDR/v1/sys/storage/raft/snapshot"
+    name="openbao-$(date -u +%Y%m%dT%H%M%SZ).snap"
+    aws --endpoint-url "$S3_ENDPOINT" s3 cp /tmp/openbao.snap "s3://$S3_BUCKET/openbao/$name" --no-progress
+    echo "saved s3://$S3_BUCKET/openbao/$name ($(stat -c %s /tmp/openbao.snap) bytes)"
+    # keep the newest $KEEP, the names sort by date
+    aws --endpoint-url "$S3_ENDPOINT" s3 ls "s3://$S3_BUCKET/openbao/" | awk '{print $4}' | grep '^openbao-' | sort \
+      | head -n "-$KEEP" | while read -r old; do
+        [ -n "$old" ] || continue
+        aws --endpoint-url "$S3_ENDPOINT" s3 rm "s3://$S3_BUCKET/openbao/$old" --quiet && echo "pruned $old"
+      done
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: openbao-snapshot
+  namespace: governance
+spec:
+  schedule: "15 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      # the wait below (2 h) plus a retry of the snapshot itself
+      activeDeadlineSeconds: 10800
+      template:
+        spec:
+          serviceAccountName: openbao-snapshot
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: snapshot
+              image: docker.io/amazon/aws-cli:2.37.4
+              command: [/bin/sh, /etc/openbao-snapshot/snapshot.sh]
+              env:
+                - {name: BAO_ADDR, value: http://openbao-active.governance.svc:8200}
+                - {name: BAO_ROLE, value: openbao-snapshot}
+                - {name: S3_ENDPOINT, value: https://<%= site_s3_host %>}
+                - {name: S3_BUCKET, value: <%= site_backup_bucket %>}
+                - {name: KEEP, value: "14"}
+                - {name: WAIT_TRIES, value: "1440"}  # 5 s each: 2 hours
+                - {name: AWS_DEFAULT_REGION, value: <%= dataplatform_s3_region %>}
+                - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
+                - {name: HOME, value: /tmp}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom: {secretKeyRef: {name: backup-s3, key: access-key}}
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom: {secretKeyRef: {name: backup-s3, key: secret-key}}
+              resources:
+                requests: {cpu: 50m, memory: 128Mi}
+                limits: {memory: 512Mi}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - {name: script, mountPath: /etc/openbao-snapshot, readOnly: true}
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: script
+              configMap:
+                name: openbao-snapshot
+            - name: tmp
+              emptyDir: {}

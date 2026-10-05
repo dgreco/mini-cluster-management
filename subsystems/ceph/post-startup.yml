@@ -1,0 +1,201 @@
+---
+# Cluster hook: called by cluster/power-on.yml once the nodes answer on SSH,
+# for a whole-cluster power-on (single nodes of a running cluster leave
+# maintenance mode instead). Reverses pre-shutdown.yml: waits for quorum and
+# OSDs, clears the flags, brings CephFS, RGW and ingress back; also takes
+# hosts out of maintenance mode that a single-node shutdown left there.
+- name: Ceph post-startup
+  hosts: ceph_mons[0]
+  gather_facts: false
+  ignore_unreachable: true
+  tasks:
+    - name: Only for a whole-cluster power-on
+      ansible.builtin.meta: end_host
+      when: not hostvars['localhost']['power_on_whole'] | default(true)
+
+    - name: Skip a node that is off
+      ansible.builtin.include_tasks: ../../cluster/tasks/ssh-probe.yml
+
+    # The daemons start once chrony has set the clock, up to 180 s late when no
+    # time server answers (chrony-wait.service, ceph_preflight): 300 s cover it.
+    - name: Wait for monitor quorum
+      ansible.builtin.command: cephadm shell -- ceph -s --format json
+      register: ceph_s
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: ceph_s.rc == 0 and (ceph_s.stdout | from_json).quorum_names | length > 0
+
+    # nodown was set before the halt, so the map still shows every OSD up:
+    # clear it first, so the monitors mark the OSDs still booting down and the
+    # wait below means something. pause goes last, and always: while it is
+    # set no client I/O happens, k3s volumes included, and the k3s and data
+    # platform hooks after this one would hang.
+    - name: Bring the OSDs back
+      block:
+        - name: Let the monitors see which OSDs are down
+          ansible.builtin.command: cephadm shell -- ceph osd unset nodown
+          when: "'nodown' in ceph_shutdown_osd_flags"
+          changed_when: true
+
+        # The loop runs on the host so that waiting prints no "FAILED - RETRYING" lines.
+        - name: Wait for the OSDs to come up
+          ansible.builtin.shell: |
+            end=$((SECONDS + {{ ceph_startup_osd_timeout }}))
+            while :; do
+              st=$(cephadm shell -- ceph osd stat 2>/dev/null)
+              grep -Eq '^([0-9]+) osds: \1 up' <<<"$st" && { echo "$st"; exit 0; }
+              if [ $SECONDS -ge $end ]; then
+                echo "$st"
+                exit 1
+              fi
+              sleep 10
+            done
+          args:
+            executable: /bin/bash
+          register: ceph_startup_osds
+          changed_when: false
+          failed_when: false
+
+        - name: Not every OSD is up
+          ansible.builtin.debug:
+            msg: >-
+              {{ ceph_startup_osds.stdout }} after {{ ceph_startup_osd_timeout }} s: clearing the flags
+              anyway, so the cluster serves and recovers (check with make ceph-status).
+          when: ceph_startup_osds.rc != 0
+
+        - name: Clear the OSD flags
+          ansible.builtin.command: cephadm shell -- ceph osd unset {{ item }}
+          loop: "{{ ceph_shutdown_osd_flags | reject('in', ['nodown', 'pause']) | list }}"
+          changed_when: true
+      always:
+        - name: Resume client I/O
+          ansible.builtin.command: cephadm shell -- ceph osd unset pause
+          when: "'pause' in ceph_shutdown_osd_flags"
+          changed_when: true
+          failed_when: false
+
+    # A single-node shutdown (cluster/shutdown.yml -e target=...) followed by a
+    # whole-cluster power-on: the node is still in maintenance mode.
+    - name: Hosts in maintenance mode
+      ansible.builtin.command: cephadm shell -- ceph orch host ls --format json
+      register: ceph_startup_hosts
+      changed_when: false
+
+    - name: Leave maintenance mode
+      ansible.builtin.command: cephadm shell -- ceph orch host maintenance exit {{ item }}
+      loop: "{{ ceph_startup_hosts.stdout | from_json | selectattr('status', 'search', 'maintenance') | map(attribute='hostname') | list }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: true
+      failed_when: false
+
+    # Every OSD up does not mean Ceph serves: wait until every placement group
+    # is active, before the k3s and data platform hooks start pods on Ceph
+    # volumes. An OSD that the monitors marked down too often shuts itself down
+    # and exits 0, so systemd leaves it stopped: start it again through the
+    # orchestrator, twice at most (cephadm's units refuse a sixth start within
+    # 30 min). OSDs that stay up while their placement groups hang in peering
+    # need a restart by hand (the README's troubleshooting table).
+    - name: Wait until every placement group is active
+      ansible.builtin.shell: |
+        set -o pipefail
+        # Prints "<placement groups not active> <ids of the OSDs down>".
+        state='import json, sys
+        st, osd = (json.loads(l) for l in sys.stdin if l.startswith("{"))
+        bad = sum(p["count"] for p in st["pgmap"]["pgs_by_state"]
+                  if "active" not in p["state_name"].split("+") or "stale" in p["state_name"].split("+"))
+        print(bad, " ".join(str(o["osd"]) for o in osd["osds"] if not o["up"]))'
+        declare -A starts last
+        end=$((SECONDS + {{ ceph_startup_osd_timeout }}))
+        while :; do
+          read -r bad down < <(timeout 120 cephadm shell -- bash -c 'ceph status --format json; echo; ceph osd dump --format json' 2>/dev/null \
+                                 | python3 -c "$state" 2>/dev/null)
+          [ "$bad" = 0 ] && [ -z "$down" ] && { echo "every placement group active"; exit 0; }
+          for id in $down; do
+            n=${starts[$id]:-0}
+            if [ "$n" -lt 2 ] && [ $((SECONDS - ${last[$id]:--999})) -ge 120 ]; then
+              timeout 120 cephadm shell -- ceph orch daemon start "osd.$id" >/dev/null 2>&1
+              starts[$id]=$((n + 1))
+              last[$id]=$SECONDS
+              echo "started osd.$id"
+            fi
+          done
+          if [ $SECONDS -ge $end ]; then
+            echo "${bad:-?} placement groups not active, OSDs down: ${down:-none}"
+            exit 1
+          fi
+          sleep 10
+        done
+      args:
+        executable: /bin/bash
+      register: ceph_startup_pgs
+      changed_when: "'started osd.' in ceph_startup_pgs.stdout"
+      failed_when: false
+
+    - name: Not every placement group is active
+      ansible.builtin.debug:
+        msg: >-
+          {{ ceph_startup_pgs.stdout_lines | last | default('no answer from Ceph') }} after
+          {{ ceph_startup_osd_timeout }} s: pods on Ceph volumes will hang. Check with make ceph-status;
+          see the README's troubleshooting table.
+      when: ceph_startup_pgs.rc != 0
+
+    - name: Bring CephFS up
+      ansible.builtin.command: cephadm shell -- ceph fs set {{ ceph_cephfs_name }} down false
+      failed_when: false
+      when: ceph_cephfs_enabled | bool
+      changed_when: true
+
+    # Start, then check; start again while a daemon is not running (a stop
+    # left pending by an unclean halt can land after the first start).
+    - name: Start RGW and ingress
+      ansible.builtin.shell: |
+        set -o pipefail
+        # Started: no daemon listed, or all of them running.
+        check='import sys, json
+        s = sys.stdin.read().strip()
+        sys.exit(0 if not s.startswith("[") or all(d["status_desc"] == "running" for d in json.loads(s)) else 1)'
+        for i in $(seq 8); do
+          cephadm shell -- ceph orch start {{ item }} >/dev/null 2>&1
+          sleep 15
+          cephadm shell -- ceph orch ps --service_name {{ item }} --refresh --format json 2>/dev/null \
+            | python3 -c "$check" && exit 0
+        done
+        exit 1
+      args:
+        executable: /bin/bash
+      loop: "{{ ['rgw.' ~ ceph_rgw_service_id] + (['ingress.rgw.' ~ ceph_rgw_service_id] if ceph_rgw_ingress_enabled | bool else []) }}"
+      changed_when: true
+      failed_when: false
+      when: ceph_rgw_enabled | bool
+
+    # keepalived that started before the host had its address stays in FAULT
+    # and nobody holds the virtual IP: restart it once when the VIP is silent.
+    - name: The S3 virtual IP answers, else restart keepalived
+      ansible.builtin.shell: |
+        set -o pipefail
+        up() { timeout 3 bash -c '</dev/tcp/{{ ceph_rgw_vip }}/{{ ceph_rgw_ingress_port }}' 2>/dev/null; }
+        for i in $(seq 12); do up && exit 0; sleep 5; done
+        for d in $(cephadm shell -- ceph orch ps --daemon-type keepalived --format json 2>/dev/null \
+                   | python3 -c 'import json,sys; print(" ".join(x["daemon_name"] for x in json.load(sys.stdin)))'); do
+          cephadm shell -- ceph orch daemon restart "$d" >/dev/null 2>&1
+        done
+        for i in $(seq 24); do up && echo restarted && exit 0; sleep 5; done
+        echo "S3 virtual IP {{ ceph_rgw_vip }} still silent after restarting keepalived" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      register: ceph_vip_check
+      changed_when: "'restarted' in ceph_vip_check.stdout"
+      failed_when: false
+      when: ceph_rgw_enabled | bool and ceph_rgw_ingress_enabled | bool
+
+    - name: Status
+      ansible.builtin.command: cephadm shell -- ceph -s
+      register: ceph_s_text
+      changed_when: false
+
+    - name: Ceph
+      ansible.builtin.debug:
+        msg: "{{ ceph_s_text.stdout_lines }}"

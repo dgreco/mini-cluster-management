@@ -1,0 +1,166 @@
+---
+# Host prerequisites for cephadm: container runtime, LVM, time sync, cephadm binary.
+# cephadm registers each host under the name `hostname` reports and keeps
+# using it; the nodes currently report the FQDN (<node>.<cluster_domain>).
+- name: Reported hostname must be the inventory name, short or fully qualified
+  ansible.builtin.assert:
+    that: ansible_facts['nodename'] in [inventory_hostname, inventory_hostname ~ '.' ~ cluster_domain]
+    fail_msg: >-
+      Node reports hostname '{{ ansible_facts['nodename'] }}' but the inventory calls it
+      '{{ inventory_hostname }}'. Fix the inventory or /etc/hostname; never rename a node
+      after it joined the cluster.
+
+- name: Install cephadm prerequisites
+  ansible.builtin.apt:
+    name:
+      - podman
+      - lvm2
+      - chrony
+      - python3
+      - ca-certificates
+      - curl
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure chrony is running
+  ansible.builtin.service:
+    name: chrony
+    state: started
+    enabled: true
+
+# The boards start after a power-off with the clock fake-hwclock saved at
+# shutdown; chrony steps it to the real time some 25 s later. cephadm's units
+# start After= and Wants=time-sync.target, but on Ubuntu 22.04 nothing holds
+# that target back (chrony 4.2 has no chrony-wait.service), so the daemons ran
+# through a step of hours: the monitors saw the skew and kept marking OSDs
+# down until two of them shut themselves down, and the placement groups of
+# the others stayed in peering. This unit (upstream chrony's chrony-wait)
+# holds time-sync.target until chrony has set the clock, at most 180 s; with
+# no time server the daemons then start anyway. Only enabled here: started
+# by hand it could block the play for 180 s.
+- name: Unit that holds time-sync.target until chrony has set the clock
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/chrony-wait.service
+    content: |
+      # Managed by Ansible (subsystems/ceph/roles/ceph_preflight), after
+      # upstream chrony's examples/chrony-wait.service
+      [Unit]
+      Description=Wait for chrony to synchronize system clock
+      Documentation=man:chronyc(1)
+      After=chrony.service
+      Requires=chrony.service
+      Before=time-sync.target
+      Wants=time-sync.target
+
+      [Service]
+      Type=oneshot
+      # synchronised, and the remaining correction under 0.1 s
+      ExecStart=/usr/bin/chronyc waitsync 0 0.1 0.0 1
+      TimeoutStartSec=180
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Enable the clock wait at boot
+  ansible.builtin.systemd:
+    name: chrony-wait.service
+    enabled: true
+    daemon_reload: true
+
+- name: Download the cephadm binary ({{ ceph_release }})
+  ansible.builtin.get_url:
+    url: "{{ ceph_cephadm_url }}"
+    dest: /usr/local/bin/cephadm
+    mode: "0755"
+    force: "{{ ceph_cephadm_force_download | bool }}"
+    checksum: "sha256:{{ ceph_cephadm_sha256 }}"
+
+# cephadm logs every command line it runs, at debug level, to
+# /var/log/ceph/cephadm.log. Ansible keeps secrets off those command lines
+# (files under /etc/ceph/specs instead), and the log is root-only in any case.
+# cephadm writes /etc/logrotate.d/cephadm itself only when it is missing, so
+# this one stays.
+- name: Rotate cephadm.log as root-only
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/cephadm
+    content: |
+      # Managed by Ansible (subsystems/ceph/roles/ceph_preflight)
+      /var/log/ceph/cephadm.log {
+          rotate 7
+          daily
+          compress
+          missingok
+          notifempty
+          su root root
+          create 0600 root root
+      }
+    mode: "0644"
+
+- name: Existing cephadm logs readable by root only
+  ansible.builtin.shell: |
+    [ -d /var/log/ceph ] || exit 0
+    find /var/log/ceph -maxdepth 1 -name 'cephadm.log*' -perm /g+r,o+r -exec chmod 0600 {} \; -print
+  register: ceph_preflight_log_perms
+  changed_when: ceph_preflight_log_perms.stdout | length > 0
+
+- name: Verify host with cephadm check-host
+  ansible.builtin.command: cephadm check-host --expect-hostname {{ ansible_facts['nodename'] }}
+  changed_when: false
+
+# cephadm daemons run in containers that copy the host's /etc/resolv.conf and
+# bind addresses when they start. Started at boot before the network is up,
+# they keep an empty resolver (RGW then cannot reach an OIDC provider for STS)
+# or fail to bind (keepalived stays in FAULT and nobody holds the S3 VIP).
+# Every ceph-* service first waits (up to 120 s) for a global IPv4 address and
+# a nameserver: a systemd prefix drop-in, so it also covers the per-cluster
+# unit template cephadm creates later.
+- name: Wait-for-network program
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/ceph-wait-network
+    content: |
+      #!/bin/sh
+      # Managed by Ansible (subsystems/ceph/roles/ceph_preflight). Returns once
+      # the host has a global IPv4 address and a nameserver (at most 120 s).
+      for i in $(seq 120); do
+        ip -4 -o addr show scope global | grep -q inet && grep -q '^nameserver' /etc/resolv.conf && exit 0
+        sleep 1
+      done
+      exit 0
+    mode: "0755"
+
+- name: Directory of the ceph-* service drop-ins
+  ansible.builtin.file:
+    path: /etc/systemd/system/ceph-.service.d
+    state: directory
+    mode: "0755"
+
+- name: Ceph services wait for an address and a resolver at boot
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ceph-.service.d/10-wait-network.conf
+    content: |
+      # Managed by Ansible (subsystems/ceph/roles/ceph_preflight)
+      [Service]
+      ExecStartPre=/usr/local/sbin/ceph-wait-network
+    mode: "0644"
+  notify: Reload systemd
+
+# The first version of this drop-in (ingress hosts only, address only)
+- name: Earlier drop-ins
+  ansible.builtin.find:
+    paths: /etc/systemd/system
+    patterns: "10-wait-address.conf"
+    recurse: true
+  register: ceph_preflight_old_dropins
+
+- name: Remove the earlier drop-ins
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ ceph_preflight_old_dropins.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+  notify: Reload systemd

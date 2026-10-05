@@ -1,0 +1,241 @@
+# The fence around Spark jobs in compute, where they run next to Trino.
+#
+# A job is a SparkApplication <user>-<name>. The operator gives it a service
+# account of the same name (bound to spark-k8s-clusterrole: pods, services
+# and configmaps only, manifests/operators/spark-k8s-operator), and its pods
+# (spark-submit, driver, executors) run as that account. A job may use two
+# Secrets: the catalog login spark-catalog-logins and its own Keycloak token
+# spark-token-<job> (dp-spark-submit.sh writes it).
+#
+# dataplatform-spark-pods: every pod a job creates, or the Job controller
+# creates for it, uses only those Secrets, the event-log key of the
+# SecretClass s3-spark, configmaps, empty directories and its own service
+# account token, and runs as the job's own service account.
+# dataplatform-spark-submitter-jobs, -secrets, -code (one per kind: a
+# policy's expressions are type-checked against every kind it matches): a
+# Keycloak user (oidc:<user>) names jobs, tokens and job code after
+# themselves, may delete only those, writes plain Secrets only, and leaves
+# the service account and Spark's Kubernetes settings to the operator.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dataplatform-spark-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: compute}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+  variables:
+    # the service account that sends the request, when it is one of compute's
+    - name: creator
+      expression: >-
+        request.userInfo.username.startsWith('system:serviceaccount:compute:')
+        ? request.userInfo.username.substring(30) : ''
+    - name: sa
+      expression: "has(object.spec.serviceAccountName) ? object.spec.serviceAccountName : 'default'"
+    # the platform's own workloads in compute (Trino, the history server, the
+    # cleanup CronJob), made by their controllers from Git
+    - name: platform
+      expression: "variables.sa in ['trino-serviceaccount', 'spark-history-serviceaccount', 'spark-cleanup']"
+    - name: secrets
+      expression: "['spark-catalog-logins', 'spark-token-' + variables.sa]"
+  validations:
+    - expression: "variables.creator == '' || variables.sa == variables.creator"
+      messageExpression: "'a Spark job creates pods only under its own service account ' + variables.creator"
+      reason: Forbidden
+    - expression: >-
+        variables.platform || !has(object.spec.volumes) || object.spec.volumes.all(v,
+          has(v.emptyDir) || has(v.configMap) || has(v.downwardAPI)
+          || (has(v.secret) && has(v.secret.secretName) && v.secret.secretName in variables.secrets)
+          || (has(v.projected) && v.projected.sources.all(s,
+                has(s.serviceAccountToken) || has(s.configMap) || has(s.downwardAPI)))
+          || (has(v.ephemeral) && has(v.ephemeral.volumeClaimTemplate)
+              && has(v.ephemeral.volumeClaimTemplate.metadata)
+              && has(v.ephemeral.volumeClaimTemplate.metadata.annotations)
+              && 'secrets.stackable.tech/class' in v.ephemeral.volumeClaimTemplate.metadata.annotations
+              && v.ephemeral.volumeClaimTemplate.metadata.annotations['secrets.stackable.tech/class'] == 's3-spark'
+              && !has(v.ephemeral.volumeClaimTemplate.spec.dataSource)
+              && !has(v.ephemeral.volumeClaimTemplate.spec.dataSourceRef)))
+      messageExpression: >-
+        'a Spark job mounts only spark-catalog-logins, spark-token-' + variables.sa
+        + ', the s3-spark SecretClass, configmaps, empty directories and its service account token'
+      reason: Forbidden
+    - expression: >-
+        variables.platform || object.spec.containers.all(c,
+          (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef)
+                                       || e.valueFrom.secretKeyRef.name in variables.secrets))
+          && (!has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef) || e.secretRef.name in variables.secrets)))
+      message: a Spark job's containers take environment variables only from its own Secrets
+      reason: Forbidden
+    - expression: >-
+        variables.platform || !has(object.spec.initContainers) || object.spec.initContainers.all(c,
+          (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef)
+                                       || e.valueFrom.secretKeyRef.name in variables.secrets))
+          && (!has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef) || e.secretRef.name in variables.secrets)))
+      message: a Spark job's init containers take environment variables only from its own Secrets
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dataplatform-spark-pods
+spec:
+  policyName: dataplatform-spark-pods
+  validationActions: [Deny]
+---
+# A Keycloak user's Spark jobs: named after the user, under the operator's service account.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dataplatform-spark-submitter-jobs
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: compute}
+    resourceRules:
+      - apiGroups: [spark.stackable.tech]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [sparkapplications]
+  # the Keycloak users (spark-submitter, bound by iam-sync); the platform's
+  # own accounts are fenced by their roles
+  matchConditions:
+    - name: keycloak-users
+      expression: request.userInfo.username.startsWith('oidc:')
+  variables:
+    - name: user
+      expression: request.userInfo.username.substring(5)
+    - name: name
+      expression: "request.operation == 'DELETE' ? oldObject.metadata.name : object.metadata.name"
+  validations:
+    - expression: >-
+        variables.name.startsWith(variables.user + '-')
+        && !(variables.name in ['trino-serviceaccount', 'spark-history-serviceaccount', 'spark-cleanup',
+                                'external-secrets-store', 'default'])
+      messageExpression: "'a Spark job of ' + variables.user + ' is named ' + variables.user + '-<name>'"
+      reason: Forbidden
+    - expression: >-
+        request.operation == 'DELETE'
+        || (has(object.metadata.labels) && 'data.example.org/user' in object.metadata.labels
+            && object.metadata.labels['data.example.org/user'] == variables.user)
+      messageExpression: "'a Spark job carries the label data.example.org/user: ' + variables.user"
+      reason: Forbidden
+    - expression: >-
+        request.operation == 'DELETE' || !has(object.spec.sparkConf)
+        || object.spec.sparkConf.all(k, !k.startsWith('spark.kubernetes.'))
+      message: Spark's Kubernetes settings (spark.kubernetes.*) come from the operator, not from a job
+      reason: Forbidden
+    - expression: >-
+        request.operation == 'DELETE' || !has(object.spec.driver) || !has(object.spec.driver.podOverrides)
+        || !has(object.spec.driver.podOverrides.spec)
+        || (!has(object.spec.driver.podOverrides.spec.serviceAccountName)
+            && !has(object.spec.driver.podOverrides.spec.serviceAccount))
+      message: a Spark job's driver runs under the service account the operator makes for the job
+      reason: Forbidden
+    - expression: >-
+        request.operation == 'DELETE' || !has(object.spec.executor) || !has(object.spec.executor.podOverrides)
+        || !has(object.spec.executor.podOverrides.spec)
+        || (!has(object.spec.executor.podOverrides.spec.serviceAccountName)
+            && !has(object.spec.executor.podOverrides.spec.serviceAccount))
+      message: a Spark job's executor runs under the service account the operator makes for the job
+      reason: Forbidden
+    - expression: >-
+        request.operation == 'DELETE' || !has(object.spec.job) || !has(object.spec.job.podOverrides)
+        || !has(object.spec.job.podOverrides.spec)
+        || (!has(object.spec.job.podOverrides.spec.serviceAccountName)
+            && !has(object.spec.job.podOverrides.spec.serviceAccount))
+      message: a Spark job's job runs under the service account the operator makes for the job
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dataplatform-spark-submitter-jobs
+spec:
+  policyName: dataplatform-spark-submitter-jobs
+  validationActions: [Deny]
+---
+# A Keycloak user's Secrets: the tokens of their own jobs, plain.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dataplatform-spark-submitter-secrets
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: compute}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [secrets]
+  # the Keycloak users (spark-submitter, bound by iam-sync); the platform's
+  # own accounts are fenced by their roles
+  matchConditions:
+    - name: keycloak-users
+      expression: request.userInfo.username.startsWith('oidc:')
+  variables:
+    - name: user
+      expression: request.userInfo.username.substring(5)
+    - name: name
+      expression: "request.operation == 'DELETE' ? oldObject.metadata.name : object.metadata.name"
+  validations:
+    - expression: variables.name.startsWith('spark-token-' + variables.user + '-')
+      messageExpression: "'a Secret of ' + variables.user + ' is the token of one of their jobs: spark-token-' + variables.user + '-<name>'"
+      reason: Forbidden
+    - expression: "request.operation == 'DELETE' || !has(object.type) || object.type == 'Opaque'"
+      message: only plain (Opaque) Secrets
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dataplatform-spark-submitter-secrets
+spec:
+  policyName: dataplatform-spark-submitter-secrets
+  validationActions: [Deny]
+---
+# A Keycloak user's ConfigMaps: the code of their own jobs.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dataplatform-spark-submitter-code
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: compute}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [configmaps]
+  # the Keycloak users (spark-submitter, bound by iam-sync); the platform's
+  # own accounts are fenced by their roles
+  matchConditions:
+    - name: keycloak-users
+      expression: request.userInfo.username.startsWith('oidc:')
+  variables:
+    - name: user
+      expression: request.userInfo.username.substring(5)
+    - name: name
+      expression: "request.operation == 'DELETE' ? oldObject.metadata.name : object.metadata.name"
+  validations:
+    - expression: variables.name.startsWith('job-' + variables.user + '-')
+      messageExpression: "'a ConfigMap of ' + variables.user + ' is the code of one of their jobs: job-' + variables.user + '-<name>'"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dataplatform-spark-submitter-code
+spec:
+  policyName: dataplatform-spark-submitter-code
+  validationActions: [Deny]

@@ -1,0 +1,28 @@
+# https://metacatalog.<%= dataplatform_domain %> -> oauth2-proxy -> Meta Catalog (UI at /ui, API at
+# /metacatalog/v1, Swagger UI at /swagger-ui.html, SPARQL at /sparql)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: metacatalog
+spec:
+  parentRefs:
+    - name: main-gateway
+      namespace: core
+      sectionName: metacatalog-https
+  hostnames:
+    - metacatalog.<%= dataplatform_domain %>
+  rules:
+    # The bare address: the app answers / with 500 (Spring Boot serves the
+    # UI's index template as a welcome page, without the data /ui adds)
+    - matches:
+        - path: {type: Exact, value: /}
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            path: {type: ReplaceFullPath, replaceFullPath: /ui}
+            statusCode: 302
+    # everything else through oauth2-proxy: <%= site_admin_group %> and
+    # <%= site_engineer_group %> only (metacatalog-proxy.yaml)
+    - backendRefs:
+        - name: metacatalog-proxy
+          port: 80

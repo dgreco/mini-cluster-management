@@ -1,0 +1,87 @@
+# OpenBao 2.7: 3 replicas with Raft storage and the static seal.
+# - static seal: the pods unseal themselves at every start with the key in the
+#   Secret openbao-seal (created by Ansible from .secrets/openbao-seal.key,
+#   make dataplatform-argocd). Whoever can read that Secret and a Raft volume
+#   can decrypt OpenBao: that is the price of unattended restarts.
+# - Ansible initialises openbao-0 once (make dataplatform-openbao); the other
+#   pods join through retry_join and unseal the same way. No self-init
+#   (Raft bugs openbao#2274, #3652).
+# - every request is audited to stdout, collected with the other pod logs.
+global:
+  enabled: true
+  tlsDisable: true
+
+injector:
+  enabled: false
+
+server:
+  image:
+    tag: "2.7.0"          # the chart (0.29.6) still defaults to 2.6.3
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 512Mi}
+  dataStorage:
+    enabled: true
+    size: 5Gi
+    storageClass: ceph-rbd
+  volumes:
+    - name: seal
+      secret:
+        secretName: openbao-seal
+  volumeMounts:
+    - name: seal
+      mountPath: /openbao/unseal
+      readOnly: true
+  ha:
+    enabled: true
+    replicas: 3
+    raft:
+      enabled: true
+      setNodeId: true
+      config: |
+        ui = true
+
+        listener "tcp" {
+          tls_disable     = 1
+          address         = "[::]:8200"
+          cluster_address = "[::]:8201"
+          telemetry {
+            unauthenticated_metrics_access = true
+          }
+        }
+
+        storage "raft" {
+          path = "/openbao/data"
+          retry_join {
+            leader_api_addr = "http://openbao-0.openbao-internal:8200"
+          }
+          retry_join {
+            leader_api_addr = "http://openbao-1.openbao-internal:8200"
+          }
+          retry_join {
+            leader_api_addr = "http://openbao-2.openbao-internal:8200"
+          }
+        }
+
+        seal "static" {
+          current_key_id = "dataplatform-1"
+          current_key    = "file:///openbao/unseal/seal.key"
+        }
+
+        service_registration "kubernetes" {}
+
+        telemetry {
+          prometheus_retention_time = "60s"
+          disable_hostname          = true
+        }
+
+        audit "file" "to-stdout" {
+          description = "Every request, to the pod log"
+          options {
+            file_path = "stdout"
+          }
+        }
+
+ui:
+  enabled: true
+  serviceType: ClusterIP

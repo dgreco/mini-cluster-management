@@ -1,0 +1,66 @@
+# Offline checks on every push (nothing here touches the cluster):
+# ansible-lint, --syntax-check, the unit tests, gitops/iam/access.yaml, the
+# files rendered from the site's settings (make configure), and
+# every Argo CD Application rendered (kubectl kustomize, helm template) with
+# the collector's config validated by otelcol-contrib. Data grants are not
+# here: Meta Catalog applies them (make dataplatform-grants).
+stages: [check]
+
+ansible:
+  stage: check
+  image: python:3.13
+  script:
+    # the checkout is world-writable and Ansible ignores ansible.cfg there
+    - chmod o-w "$CI_PROJECT_DIR"
+    - pip install -q --root-user-action=ignore -r requirements.txt
+    - ansible-galaxy collection install -r requirements.yml
+    - make syntax-check
+    - make lint
+    - make test
+    - make dataplatform-iam-check
+    # every file rendered from the site's settings is current: render, then
+    # nothing may differ from the commit (a hand-edited output, a stale one)
+    - make configure
+    - git diff --exit-code
+    - test -z "$(git status --porcelain)" || { git status --porcelain; exit 1; }
+    # and no site value is written anywhere else
+    - make site-check
+    # and the public copy (the example site in place of this one) would hold
+    # none of this site's values (no Docker here: gitleaks runs at make publish)
+    - make publish-check ARGS="--no-gitleaks --no-syntax"
+
+render:
+  stage: check
+  image: alpine/k8s:1.33.4          # kubectl and helm
+  script:
+    - apk add --no-cache -q python3 py3-yaml make
+    - make dataplatform-render
+    # the collector's configuration as rendered, for the job below
+    - python3 subsystems/dataplatform/files/render.py --otel-config otel-cluster.yaml
+  # the report of the render (.render/report.html), kept even when it fails:
+  # the job's page, Job artifacts > Browse (or the merge request's link)
+  artifacts:
+    when: always
+    expose_as: render report
+    paths: [.render/report.html, otel-cluster.yaml]
+    expire_in: 1 week
+
+# The collector's image has no shell, so the release binary is used instead:
+# the version is the one the chart deploys (image tag in the render of
+# apps/observability-otel-cluster.yaml); bump it with the chart.
+otelcol:
+  stage: check
+  needs: [render]
+  image: alpine:3.22
+  variables:
+    OTELCOL_VERSION: "0.160.0"
+  script:
+    - case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "unsupported $(uname -m)"; exit 1 ;; esac
+    - f="otelcol-contrib_${OTELCOL_VERSION}_linux_${arch}.tar.gz"
+    - url="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}"
+    - wget -q "$url/$f" "$url/$f.sha256"
+    - echo "$(cat "$f.sha256")  $f" | sha256sum -c
+    - tar -xzf "$f" otelcol-contrib
+    # the config names the pod's service account files; validate wants them to exist
+    - sa=/var/run/secrets/kubernetes.io/serviceaccount; mkdir -p $sa; touch $sa/token $sa/ca.crt
+    - ./otelcol-contrib validate --config=otel-cluster.yaml

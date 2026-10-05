@@ -1,0 +1,66 @@
+# Every hour: Ceph's STS roles back to the record of grants
+# (metacatalog-grants.yaml; provisioning/reconcile.sh apply), and the record
+# copied to s3://<%= site_backup_bucket %>/metacatalog-grants/. It applies what was
+# authorized, never Meta Catalog's current policies, and runs in the cluster:
+# nothing runs while it is off, and the first run after a power-on repairs
+# what changed meanwhile. Meta Catalog's image: the scripts need bash, curl
+# and jq, and it has them.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: iam-reconcile
+spec:
+  schedule: "17 * * * *"
+  # only the latest missed run starts after a power-on
+  startingDeadlineSeconds: 3600
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1800
+      template:
+        spec:
+          serviceAccountName: iam-reconcile
+          automountServiceAccountToken: true
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: reconcile
+              image: ghcr.io/dgreco/metacatalog:29815bb@sha256:e3e8b2750f22386130ebdeff93147fa75ec2943c009803cade67b568a421f9ad
+              command: [bash, /opt/metacatalog/provisioning/reconcile.sh, apply]
+              envFrom:
+                - configMapRef: {name: metacatalog-iam}
+              env:
+                - {name: BACKUP_BUCKET, value: <%= site_backup_bucket %>}
+                - {name: BACKUP_KEY_DIR, value: /etc/metacatalog/backup}
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+                limits: {memory: 128Mi}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              volumeMounts:
+                - {name: tmp, mountPath: /tmp}
+                - {name: provisioning, mountPath: /opt/metacatalog/provisioning, readOnly: true}
+                - {name: iam, mountPath: /etc/metacatalog/iam, readOnly: true}
+                - {name: backup, mountPath: /etc/metacatalog/backup, readOnly: true}
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            - name: provisioning
+              configMap:
+                name: metacatalog-provisioning
+            - name: iam
+              secret:
+                secretName: metacatalog-iam
+            # the S3 user backup (governance/backup: backup-s3)
+            - name: backup
+              secret:
+                secretName: backup-s3

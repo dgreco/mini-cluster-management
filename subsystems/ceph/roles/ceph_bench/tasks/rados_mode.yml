@@ -1,0 +1,16 @@
+---
+# One `rados bench` mode on every host of the play at once. Each host uses its
+# own run name, so seq/rand read back the objects that host wrote.
+- name: Run rados bench {{ rados_mode }}
+  ansible.builtin.command: >-
+    cephadm shell -- rados bench -p {{ _bench.rados_pool }} {{ _bench.duration }} {{ rados_mode }}
+    -t {{ _bench.rados_threads }}
+    {{ ('-b ' ~ _bench.rados_block_size ~ ' --no-cleanup') if rados_mode == 'write' else '' }}
+    --run-name bench-{{ inventory_hostname }} --format json
+  register: ceph_bench_rados_out
+  changed_when: rados_mode == 'write'
+
+- name: Keep the results of rados bench {{ rados_mode }}
+  ansible.builtin.set_fact:
+    ceph_bench_rados_results: >-
+      {{ ceph_bench_rados_results | default({}) | combine({rados_mode: ceph_bench_rados_out.stdout | regex_search('\{.*\}', multiline=True) | from_json}) }}

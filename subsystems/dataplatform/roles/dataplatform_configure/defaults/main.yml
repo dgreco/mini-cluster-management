@@ -1,0 +1,11 @@
+---
+# Where the templates of files carrying a site value live: every <file>.in
+# under these directories renders to <file> next to it (kustomize's chart
+# downloads, charts/, are skipped)
+dataplatform_configure_dirs:
+  - "{{ inventory_dir }}/../subsystems/dataplatform/gitops"
+  - "{{ inventory_dir }}/../subsystems/dataplatform/files"
+  - "{{ inventory_dir }}/../subsystems/dataplatform/metacatalog"
+# true: render in check mode and fail on a stale file (preflight); default:
+# the play's own check mode (make configure-check)
+# dataplatform_configure_check: true

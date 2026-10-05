@@ -1,0 +1,1030 @@
+{
+  "uid": "logs-navigation",
+  "title": "Logs",
+  "tags": [
+    "logs",
+    "victorialogs"
+  ],
+  "description": "Browse the logs of both stores: pick the store, narrow down, search, drill into a pod.",
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 41,
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "templating": {
+    "list": [
+      {
+        "type": "datasource",
+        "name": "store",
+        "label": "Log store",
+        "query": "victoriametrics-logs-datasource",
+        "description": "VictoriaLogs: every pod's log and Kubernetes events. VictoriaLogs Stackable: Trino, Spark (Vector).",
+        "current": {
+          "text": "VictoriaLogs",
+          "value": "victorialogs"
+        },
+        "refresh": 1,
+        "regex": "",
+        "options": []
+      },
+      {
+        "type": "query",
+        "name": "namespace",
+        "label": "Namespace",
+        "description": "k8s.namespace.name",
+        "datasource": {
+          "type": "victoriametrics-logs-datasource",
+          "uid": "${store}"
+        },
+        "query": {
+          "type": "fieldValue",
+          "field": "k8s.namespace.name",
+          "query": "*",
+          "limit": 1000,
+          "refId": "VictoriaLogsVariableQueryEditor-VariableQuery"
+        },
+        "definition": "k8s.namespace.name (*)",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "regex": "/^.+$/",
+        "options": []
+      },
+      {
+        "type": "query",
+        "name": "service",
+        "label": "Service",
+        "description": "service.name: the product (trino, spark-history, a Spark job) or the app",
+        "datasource": {
+          "type": "victoriametrics-logs-datasource",
+          "uid": "${store}"
+        },
+        "query": {
+          "type": "fieldValue",
+          "field": "service.name",
+          "query": "k8s.namespace.name:in($namespace)",
+          "limit": 1000,
+          "refId": "VictoriaLogsVariableQueryEditor-VariableQuery"
+        },
+        "definition": "service.name (k8s.namespace.name:in($namespace))",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "regex": "/^.+$/",
+        "options": []
+      },
+      {
+        "type": "query",
+        "name": "role",
+        "label": "Stackable role",
+        "description": "coordinator, worker, node, driver, executor, submit (Stackable store only)",
+        "datasource": {
+          "type": "victoriametrics-logs-datasource",
+          "uid": "${store}"
+        },
+        "query": {
+          "type": "fieldValue",
+          "field": "stackable.role",
+          "query": "k8s.namespace.name:in($namespace) service.name:in($service)",
+          "limit": 1000,
+          "refId": "VictoriaLogsVariableQueryEditor-VariableQuery"
+        },
+        "definition": "stackable.role (k8s.namespace.name:in($namespace) service.name:in($service))",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "regex": "/^.+$/",
+        "options": []
+      },
+      {
+        "type": "query",
+        "name": "pod",
+        "label": "Pod",
+        "description": "k8s.pod.name",
+        "datasource": {
+          "type": "victoriametrics-logs-datasource",
+          "uid": "${store}"
+        },
+        "query": {
+          "type": "fieldValue",
+          "field": "k8s.pod.name",
+          "query": "k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role)",
+          "limit": 1000,
+          "refId": "VictoriaLogsVariableQueryEditor-VariableQuery"
+        },
+        "definition": "k8s.pod.name (k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role))",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "regex": "/^.+$/",
+        "options": []
+      },
+      {
+        "type": "query",
+        "name": "container",
+        "label": "Container",
+        "description": "k8s.container.name",
+        "datasource": {
+          "type": "victoriametrics-logs-datasource",
+          "uid": "${store}"
+        },
+        "query": {
+          "type": "fieldValue",
+          "field": "k8s.container.name",
+          "query": "k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role) k8s.pod.name:in($pod)",
+          "limit": 1000,
+          "refId": "VictoriaLogsVariableQueryEditor-VariableQuery"
+        },
+        "definition": "k8s.container.name (k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role) k8s.pod.name:in($pod))",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "regex": "/^.+$/",
+        "options": []
+      },
+      {
+        "type": "query",
+        "name": "level",
+        "label": "Level",
+        "description": "severity_text (set for the Stackable products' logs)",
+        "datasource": {
+          "type": "victoriametrics-logs-datasource",
+          "uid": "${store}"
+        },
+        "query": {
+          "type": "fieldValue",
+          "field": "severity_text",
+          "query": "k8s.namespace.name:in($namespace) service.name:in($service)",
+          "limit": 1000,
+          "refId": "VictoriaLogsVariableQueryEditor-VariableQuery"
+        },
+        "definition": "severity_text (k8s.namespace.name:in($namespace) service.name:in($service))",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "regex": "/^.+$/",
+        "options": []
+      },
+      {
+        "type": "query",
+        "name": "collector",
+        "label": "Collected by",
+        "description": "log.collector: vector (Stackable products, through the OTel collector), otel-agent (pod logs), otel-cluster (Kubernetes events)",
+        "datasource": {
+          "type": "victoriametrics-logs-datasource",
+          "uid": "${store}"
+        },
+        "query": {
+          "type": "fieldValue",
+          "field": "log.collector",
+          "query": "*",
+          "limit": 1000,
+          "refId": "VictoriaLogsVariableQueryEditor-VariableQuery"
+        },
+        "definition": "log.collector (*)",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "regex": "/^.+$/",
+        "options": []
+      },
+      {
+        "type": "textbox",
+        "name": "search",
+        "label": "Search (LogsQL filter)",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "description": "Any LogsQL filter, no pipes: timeout, \"connection refused\", i(error), scope.name:io.trino, _msg:~\"5\\d\\d\""
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Overview",
+      "collapsed": false,
+      "panels": [],
+      "id": 1,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Log lines",
+      "description": "Records matching the filters in the time range",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${store}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${store}"
+          },
+          "editorMode": "code",
+          "expr": "k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role) k8s.pod.name:in($pod) k8s.container.name:in($container) severity_text:in($level) log.collector:in($collector) $search | stats count() logs",
+          "queryType": "stats"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "id": 2,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Errors",
+      "description": "Level ERROR/FATAL, or the words error, exception, panic",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${store}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${store}"
+          },
+          "editorMode": "code",
+          "expr": "k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role) k8s.pod.name:in($pod) k8s.container.name:in($container) severity_text:in($level) log.collector:in($collector) $search (severity_text:in(ERROR,FATAL) or i(error) or i(exception) or i(panic)) | stats count() errors",
+          "queryType": "stats"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          },
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "id": 3,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Warnings",
+      "description": "Level WARN, or the words warn, warning",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${store}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${store}"
+          },
+          "editorMode": "code",
+          "expr": "k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role) k8s.pod.name:in($pod) k8s.container.name:in($container) severity_text:in($level) log.collector:in($collector) $search (severity_text:in(WARN,WARNING) or i(warn) or i(warning)) | stats count() warnings",
+          "queryType": "stats"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          },
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "id": 4,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Pods",
+      "description": "Pods that wrote a matching record",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${store}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${store}"
+          },
+          "editorMode": "code",
+          "expr": "k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role) k8s.pod.name:in($pod) k8s.container.name:in($container) severity_text:in($level) log.collector:in($collector) $search | stats count_uniq(k8s.pod.name) pods",
+          "queryType": "stats"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "id": 5,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Log volume by namespace",
+      "description": "Matching records per namespace",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${store}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${store}"
+          },
+          "editorMode": "code",
+          "expr": "k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role) k8s.pod.name:in($pod) k8s.container.name:in($container) severity_text:in($level) log.collector:in($collector) $search | stats by (k8s.namespace.name) count() logs",
+          "queryType": "statsRange",
+          "legendFormat": "{{k8s.namespace.name}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ],
+          "sortBy": "Total",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "id": 6,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Log volume by service",
+      "description": "Matching records per service.name (Stackable: the product)",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${store}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${store}"
+          },
+          "editorMode": "code",
+          "expr": "k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role) k8s.pod.name:in($pod) k8s.container.name:in($container) severity_text:in($level) log.collector:in($collector) $search | stats by (service.name) count() logs",
+          "queryType": "statsRange",
+          "legendFormat": "{{service.name}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ],
+          "sortBy": "Total",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "id": 7,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Errors and warnings",
+      "description": "Level ERROR/FATAL or the words error, exception, panic; level WARN or the words warn, warning",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${store}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${store}"
+          },
+          "editorMode": "code",
+          "expr": "k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role) k8s.pod.name:in($pod) k8s.container.name:in($container) severity_text:in($level) log.collector:in($collector) $search | stats count() if ((severity_text:in(ERROR,FATAL) or i(error) or i(exception) or i(panic))) errors, count() if ((severity_text:in(WARN,WARNING) or i(warn) or i(warning))) warnings",
+          "queryType": "statsRange",
+          "legendFormat": "{{__name__}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ],
+          "sortBy": "Total",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "none"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "errors"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "warnings"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "id": 8,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      }
+    },
+    {
+      "type": "table",
+      "title": "Most frequent errors",
+      "description": "Error lines with numbers, IPs, times and IDs collapsed, so repeats group together",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${store}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${store}"
+          },
+          "editorMode": "code",
+          "expr": "k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role) k8s.pod.name:in($pod) k8s.container.name:in($container) severity_text:in($level) log.collector:in($collector) $search (severity_text:in(ERROR,FATAL) or i(error) or i(exception) or i(panic)) | collapse_nums prettify | stats by (k8s.container.name, _msg) count() n | sort by (n desc) | limit 25",
+          "queryType": "stats"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value": "Count"
+            }
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Count",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Count"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 90
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "id": 9,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      }
+    },
+    {
+      "type": "row",
+      "title": "Where the logs come from",
+      "collapsed": false,
+      "panels": [],
+      "id": 10,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 21
+      }
+    },
+    {
+      "type": "table",
+      "title": "Top sources",
+      "description": "The pods and containers that log most. Click a pod to show only its logs.",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${store}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${store}"
+          },
+          "editorMode": "code",
+          "expr": "k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role) k8s.pod.name:in($pod) k8s.container.name:in($container) severity_text:in($level) log.collector:in($collector) $search | stats by (k8s.namespace.name, service.name, k8s.pod.name, k8s.container.name, log.collector) count() n | sort by (n desc) | limit 30",
+          "queryType": "stats"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value": "Lines"
+            }
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Lines",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Lines"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 90
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "k8s.pod.name"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Only this pod's logs",
+                    "url": "/d/logs-navigation/logs?${__url_time_range}&var-store=${store}&var-namespace=${__data.fields[\"k8s.namespace.name\"]}&var-pod=${__value.raw}&var-container=${__data.fields[\"k8s.container.name\"]}"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "id": 11,
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      }
+    },
+    {
+      "type": "row",
+      "title": "Logs",
+      "collapsed": false,
+      "panels": [],
+      "id": 12,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      }
+    },
+    {
+      "type": "logs",
+      "title": "Logs",
+      "description": "Newest first. Open a line for all its fields.",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${store}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${store}"
+          },
+          "editorMode": "code",
+          "expr": "k8s.namespace.name:in($namespace) service.name:in($service) stackable.role:in($role) k8s.pod.name:in($pod) k8s.container.name:in($container) severity_text:in($level) log.collector:in($collector) $search",
+          "queryType": "instant",
+          "maxLines": 1000
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending",
+        "enableInfiniteScrolling": true
+      },
+      "id": 13,
+      "gridPos": {
+        "h": 20,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      }
+    },
+    {
+      "type": "row",
+      "title": "Kubernetes warning events",
+      "collapsed": false,
+      "panels": [],
+      "id": 14,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      }
+    },
+    {
+      "type": "logs",
+      "title": "Warning events in the selected namespaces",
+      "description": "Kubernetes events of type Warning (store VictoriaLogs), for example failed probes, pulls or mounts",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "victorialogs"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "victorialogs"
+          },
+          "editorMode": "code",
+          "queryType": "instant",
+          "expr": "k8s.resource.name:=events object.type:=Warning k8s.namespace.name:in($namespace)",
+          "maxLines": 500
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "id": 15,
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 53
+      }
+    }
+  ],
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "title": "Explore",
+      "type": "link",
+      "url": "/explore",
+      "icon": "compass",
+      "targetBlank": false
+    }
+  ]
+}

@@ -1,0 +1,94 @@
+---
+# Bootstrap the first monitor/manager on the admin host (idempotent).
+- name: List daemons already managed by cephadm on this host
+  ansible.builtin.command: cephadm ls
+  register: ceph_bootstrap_cephadm_ls
+  changed_when: false
+
+- name: Determine whether a monitor already runs here
+  ansible.builtin.set_fact:
+    ceph_bootstrap_done: >-
+      {{ (ceph_bootstrap_cephadm_ls.stdout | from_json | selectattr('name', 'match', '^mon\.') | list | length) > 0 }}
+
+- name: Bootstrap the cluster
+  ansible.builtin.command: >-
+    cephadm --image {{ ceph_image }} bootstrap
+    --mon-ip {{ ceph_mon_ip }}
+    --cluster-network {{ ceph_cluster_network }}
+    --initial-dashboard-user {{ ceph_dashboard_user }}
+    --dashboard-password-noupdate
+    --ssh-user root
+    --allow-fqdn-hostname
+    --skip-monitoring-stack
+    {{ ceph_bootstrap_extra_args }}
+  register: ceph_bootstrap_result
+  failed_when: false
+  no_log: true
+  when: not ceph_bootstrap_done | bool
+  changed_when: true
+
+- name: Bootstrap failed
+  ansible.builtin.fail:
+    msg:
+      - "cephadm bootstrap failed (rc={{ ceph_bootstrap_result.rc }})"
+      - "{{ ceph_bootstrap_result.stdout_lines | default([]) | reject('search', 'Password') | list }}"
+      - "{{ ceph_bootstrap_result.stderr_lines | default([]) }}"
+  when:
+    - not ceph_bootstrap_done | bool
+    - ceph_bootstrap_result.rc != 0
+
+# The dashboard password never goes on a command line: cephadm logs every
+# command line it runs to /var/log/ceph/cephadm.log. Bootstrap made a random
+# one; ours replaces it from a root-only file, which is removed again.
+- name: Directory for files handed to cephadm shell
+  ansible.builtin.file:
+    path: /etc/ceph/specs
+    state: directory
+    mode: "0750"
+  when: not ceph_bootstrap_done | bool
+
+- name: Dashboard password file
+  ansible.builtin.copy:
+    content: "{{ ceph_dashboard_password }}"
+    dest: /etc/ceph/specs/dashboard.pw
+    mode: "0600"
+  no_log: true
+  when: not ceph_bootstrap_done | bool
+
+# The dashboard module may still be starting right after bootstrap.
+- name: Set the dashboard password of {{ ceph_dashboard_user }}
+  ansible.builtin.shell: |
+    for i in $(seq 12); do
+      cephadm shell --mount /etc/ceph/specs -- ceph dashboard ac-user-set-password \
+        {{ ceph_dashboard_user }} -i /mnt/specs/dashboard.pw --force-password >/dev/null 2>&1 && exit 0
+      sleep 10
+    done
+    exit 1
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: not ceph_bootstrap_done | bool
+
+- name: Remove the password file
+  ansible.builtin.file:
+    path: /etc/ceph/specs/dashboard.pw
+    state: absent
+  when: not ceph_bootstrap_done | bool
+
+- name: Bootstrap output
+  ansible.builtin.debug:
+    msg: >-
+      {{ (ceph_bootstrap_result.stdout_lines | select('search', 'URL:') | list)
+         + ['dashboard user ' ~ ceph_dashboard_user ~ ', password in ' ~ secrets_dir ~ '/ceph-dashboard.pw'] }}
+  when:
+    - not ceph_bootstrap_done | bool
+    - ceph_bootstrap_result.rc == 0
+
+- name: Read the orchestrator SSH public key
+  ansible.builtin.slurp:
+    src: /etc/ceph/ceph.pub
+  register: ceph_bootstrap_pub_slurp
+
+- name: Publish the key as a fact for the other hosts
+  ansible.builtin.set_fact:
+    ceph_bootstrap_ssh_pubkey: "{{ ceph_bootstrap_pub_slurp.content | b64decode | trim }}"

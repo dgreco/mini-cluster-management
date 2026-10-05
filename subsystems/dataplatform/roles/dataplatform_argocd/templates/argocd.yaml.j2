@@ -1,0 +1,17 @@
+# Managed by Ansible (subsystems/dataplatform/roles/dataplatform_argocd).
+# Installed by the k3s Helm controller. The values are
+# subsystems/dataplatform/gitops/bootstrap/argocd-values.yaml plus the SSH host
+# keys of the Git server: edit that file and re-run make dataplatform-argocd.
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: argo-cd
+  namespace: kube-system
+spec:
+  repo: {{ dataplatform_argocd_chart_repo }}
+  chart: argo-cd
+  version: {{ dataplatform_argocd_chart_version }}
+  targetNamespace: argocd
+  createNamespace: true
+  valuesContent: |-
+    {{ dataplatform_argocd_values | to_nice_yaml(indent=2, width=1000) | indent(4) }}

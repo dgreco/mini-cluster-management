@@ -1,0 +1,18 @@
+---
+# One fio job on every load host at once, each in its own directory. Files are
+# named bench.<n> so later jobs reuse what the first one laid out.
+- name: Run fio job {{ fio_job.name }}
+  ansible.builtin.command: >-
+    fio --name={{ fio_job.name }} --directory={{ _dir }}
+    --filename_format=bench.$jobnum --size={{ _bench.fio_size }}
+    --rw={{ fio_job.rw }} --bs={{ fio_job.bs }}
+    --iodepth={{ fio_job.iodepth }} --numjobs={{ fio_job.numjobs }}
+    --ioengine=libaio --direct=1 --time_based --runtime={{ _bench.duration }} --ramp_time=5
+    --group_reporting --output-format=json
+  register: ceph_bench_fio_out
+  changed_when: true
+
+- name: Keep the results of fio job {{ fio_job.name }}
+  ansible.builtin.set_fact:
+    ceph_bench_cephfs_results: >-
+      {{ ceph_bench_cephfs_results | default({}) | combine({fio_job.name: (ceph_bench_fio_out.stdout | from_json).jobs[0]}) }}

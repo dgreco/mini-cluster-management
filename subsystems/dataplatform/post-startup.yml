@@ -1,0 +1,44 @@
+---
+# Cluster hook: called by cluster/power-on.yml after the k3s post-startup hook,
+# for a whole-cluster power-on.
+# Everything starts by itself (OpenBao unseals with its static seal); wait
+# until every Argo CD Application is Healthy again and show the state.
+- name: The data platform post-startup hook
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  ignore_unreachable: true
+  tasks:
+    - name: Only for a whole-cluster power-on
+      ansible.builtin.meta: end_host
+      when: not hostvars['localhost']['power_on_whole'] | default(true)
+
+    - name: Is the data platform installed?
+      ansible.builtin.command: /usr/local/bin/k3s kubectl get namespace argocd -o name
+      register: dataplatform_startup_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Wait until every Application is Healthy
+      ansible.builtin.shell: |
+        set -o pipefail
+        end=$((SECONDS + {{ dataplatform_recover_timeout }}))
+        while :; do
+          bad=$(/usr/local/bin/k3s kubectl -n argocd get applications \
+                -o 'jsonpath={range .items[*]}{.metadata.name}={.status.health.status}{"\n"}{end}' | grep -v '=Healthy$' || true)
+          [ -z "$bad" ] && exit 0
+          if [ $SECONDS -ge $end ]; then echo "not healthy: $bad"; exit 1; fi
+          sleep 15
+        done
+      args:
+        executable: /bin/bash
+      register: dataplatform_startup_wait
+      changed_when: false
+      failed_when: false
+      when: dataplatform_startup_probe.rc | default(1) == 0
+
+    - name: Data platform
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'every Application is Healthy' if dataplatform_startup_wait.rc | default(1) == 0
+             else (dataplatform_startup_wait.stdout | default('not installed')) ~ ' (make dataplatform-status)' }}
+      when: dataplatform_startup_probe.rc | default(1) == 0

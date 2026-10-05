@@ -1,0 +1,31 @@
+#!/bin/bash
+# Managed by Ansible (acme_lego). lego "exec" DNS provider for GoDaddy with a
+# personal access token (Authorization: Bearer):
+#   godaddy-dns present|cleanup <fqdn>. <value>
+# A value is appended (PATCH), so values never overwrite each other, and
+# cleanup deletes the whole _acme-challenge set: lego solves the challenges of
+# this provider one at a time, so no other value is still needed then.
+set -euo pipefail
+action=$1 fqdn=${2%.} value=$3
+zone={{ acme_lego_zone }}
+name=${fqdn%."$zone"}
+api="{{ acme_lego_godaddy_api }}/$zone/records"
+# the token goes to curl through a file, never on its command line (visible in ps)
+hdr=$(mktemp)
+trap 'rm -f "$hdr"' EXIT
+printf 'Authorization: Bearer %s\n' "$GODADDY_PAT" > "$hdr"
+case $action in
+  present)
+    curl -sS --fail-with-body -o /dev/null -X PATCH -H @"$hdr" -H 'Content-Type: application/json' \
+      -d "[{\"type\": \"TXT\", \"name\": \"$name\", \"data\": \"$value\", \"ttl\": 600}]" "$api"
+    ;;
+  cleanup)
+    # 404 when an earlier cleanup already removed the set
+    code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H @"$hdr" "$api/TXT/$name")
+    case $code in 2*|404) ;; *) echo "GoDaddy DELETE $name TXT: HTTP $code" >&2; exit 1 ;; esac
+    ;;
+  *)
+    echo "usage: $0 present|cleanup <fqdn>. <value>" >&2
+    exit 2
+    ;;
+esac

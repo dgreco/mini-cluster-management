@@ -1,0 +1,32 @@
+# What a member of any Keycloak group may do in compute, where every Spark job
+# runs (iam-sync binds this ClusterRole here to every group oidc:<group>):
+# submit jobs with their code and their token, watch them, open the history
+# server with port-forward. Secrets can be created and deleted, never read: a
+# token stays its owner's. spark-fence.yaml narrows the writes to the user's
+# own names (<user>-<job>, job-<user>-..., spark-token-<user>-...) and to plain
+# Secrets. Jobs, pods and logs are visible to every submitter; the data is
+# Ceph's to refuse, with the token's groups.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dataplatform-spark-submitter
+rules:
+  - apiGroups: [spark.stackable.tech]
+    resources: [sparkapplications]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [spark.stackable.tech]
+    resources: [sparkapptemplates]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [configmaps, secrets]
+    verbs: [create, delete]
+  - apiGroups: [""]
+    resources: [pods, pods/log, services, events]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/portforward]
+    resourceNames: [spark-history-node-default-0]
+    verbs: [create]

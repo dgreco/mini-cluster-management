@@ -1,0 +1,159 @@
+---
+# Human logins to OpenBao through Keycloak: the oidc auth method (client
+# openbao), a role mapping the groups claim, and the external identity group
+# the admin group with full rights. The root token stays the break-glass login.
+- name: OpenBao client
+  ansible.builtin.include_role:
+    name: dataplatform_openbao
+    tasks_from: client
+
+- name: OpenBao calls from the first k3s server
+  delegate_to: "{{ groups['k3s_servers'][0] }}"
+  no_log: true
+  block:
+    - name: Auth methods
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/sys/auth"
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+      register: dataplatform_iam_bao_auths
+
+    - name: OIDC auth method
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/sys/auth/oidc"
+        method: POST
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+        body_format: json
+        body: {type: oidc, description: "Keycloak realm {{ dataplatform_keycloak_realm }}"}
+        status_code: [200, 204]
+      when: "'oidc/' not in dataplatform_iam_bao_auths.json.data"
+      changed_when: true
+
+    - name: Accessor of the OIDC auth method
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/sys/auth"
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+      register: dataplatform_iam_bao_auths2
+
+    - name: OIDC configuration
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/auth/oidc/config"
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+        status_code: [200, 404]
+      register: dataplatform_iam_bao_oidc
+
+    # The client secret cannot be read back: it is written with the rest when
+    # anything else differs, or with -e dataplatform_iam_force=true.
+    - name: Point the OIDC auth method at the realm
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/auth/oidc/config"
+        method: POST
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+        body_format: json
+        body:
+          oidc_discovery_url: "{{ dataplatform_keycloak_issuer }}"
+          oidc_client_id: openbao
+          oidc_client_secret: "{{ dataplatform_iam_realm.clients | selectattr('clientId', 'equalto', 'openbao') | map(attribute='secret') | first }}"
+          default_role: keycloak
+        status_code: [200, 204]
+      when: >-
+        dataplatform_iam_bao_oidc.status != 200
+        or dataplatform_iam_bao_oidc.json.data.oidc_discovery_url != dataplatform_keycloak_issuer
+        or dataplatform_iam_bao_oidc.json.data.oidc_client_id != 'openbao'
+        or dataplatform_iam_bao_oidc.json.data.default_role != 'keycloak'
+        or dataplatform_iam_force | default(false) | bool
+      changed_when: true
+
+    - name: Role keycloak
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/auth/oidc/role/keycloak"
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+        status_code: [200, 404]
+      register: dataplatform_iam_bao_role
+
+    - name: Every realm user may log in; rights come from the groups claim
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/auth/oidc/role/keycloak"
+        method: POST
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+        body_format: json
+        body: "{{ _role }}"
+        status_code: [200, 204]
+      vars:
+        _role:
+          role_type: oidc
+          user_claim: preferred_username
+          groups_claim: groups
+          oidc_scopes: [openid, profile, email]
+          bound_audiences: [openbao]
+          allowed_redirect_uris:
+            - https://openbao.{{ dataplatform_domain }}/ui/vault/auth/oidc/oidc/callback
+            - http://localhost:8250/oidc/callback
+          token_policies: [default]
+          token_ttl: 28800
+      when: >-
+        dataplatform_iam_bao_role.status != 200
+        or (dataplatform_iam_bao_role.json.data | dict2items | selectattr('key', 'in', _role.keys()) | items2dict) != _role
+      changed_when: true
+
+    - name: Policy platform-admin
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/sys/policies/acl/platform-admin"
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+        status_code: [200, 404]
+      register: dataplatform_iam_bao_policy
+
+    - name: Full rights for the platform administrators
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/sys/policies/acl/platform-admin"
+        method: PUT
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+        body_format: json
+        body: {policy: "{{ _policy }}"}
+        status_code: [200, 204]
+      vars:
+        _policy: |
+          path "*" {
+            capabilities = ["create", "read", "update", "patch", "delete", "list", "sudo"]
+          }
+      when: dataplatform_iam_bao_policy.status != 200 or dataplatform_iam_bao_policy.json.data.policy != _policy
+      changed_when: true
+
+    - name: External group {{ dataplatform_iam_openbao_admin_group }}
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/identity/group/name/{{ dataplatform_iam_openbao_admin_group }}"
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+        status_code: [200, 204, 404]
+      register: dataplatform_iam_bao_group
+
+    - name: Create or update the external group
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/identity/group/name/{{ dataplatform_iam_openbao_admin_group }}"
+        method: POST
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+        body_format: json
+        body: {type: external, policies: [platform-admin]}
+        status_code: [200, 204]
+      when: >-
+        dataplatform_iam_bao_group.status != 200
+        or dataplatform_iam_bao_group.json.data.policies | default([]) != ['platform-admin']
+      changed_when: true
+
+    - name: Read the external group
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/identity/group/name/{{ dataplatform_iam_openbao_admin_group }}"
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+      register: dataplatform_iam_bao_group2
+
+    - name: The Keycloak group maps to it
+      ansible.builtin.uri:
+        url: "{{ dataplatform_openbao_addr }}/v1/identity/group-alias"
+        method: POST
+        headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+        body_format: json
+        body:
+          name: "{{ dataplatform_iam_openbao_admin_group }}"
+          mount_accessor: "{{ dataplatform_iam_bao_auths2.json.data['oidc/'].accessor }}"
+          canonical_id: "{{ dataplatform_iam_bao_group2.json.data.id }}"
+        status_code: [200, 204]
+      when: dataplatform_iam_bao_group2.json.data.alias | default({}, true) | length == 0
+      changed_when: true

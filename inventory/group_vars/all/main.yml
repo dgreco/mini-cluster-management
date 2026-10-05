@@ -1,0 +1,37 @@
+---
+# Cluster-wide settings (every host, every subsystem). The site's own values
+# (names, addresses, the Git repository, ...) are in site.yml next to this file.
+
+cluster_domain: "{{ site_lan_domain }}"
+
+# Local, git-ignored directory where generated secrets (dashboard password,
+# STS key, S3 keys) are stored on the Ansible control node.
+secrets_dir: "{{ inventory_dir }}/../.secrets"
+
+# Turing Pi BMC inventory host (see [bmc] in hosts.ini)
+bmc_host: turingpi
+
+# lego, the Let's Encrypt client of the S3 certificate (subsystems/ceph) and of
+# the data platform's wildcard certificate: one version for both
+lego_version: 5.5.2
+
+# cluster/ lifecycle timings (seconds)
+node_boot_timeout: 300        # wait for SSH after power-on
+node_halt_timeout: 180        # wait for SSH to disappear after `shutdown -h`
+node_power_settle: 10         # pause between OS halt and BMC power-off
+node_reboot_timeout: 600
+
+# Rolling reboot: make cluster-reboot, make cluster-update ARGS="-e reboot=true"
+# smart: k3s agents first, the S3 virtual IP holder and the active Ceph
+# manager last; inventory: the order of inventory/hosts.ini.
+reboot_order: smart
+reboot_drain_timeout: 300s    # per node; a blocked drain stops the reboot
+reboot_force_drain: false     # true: also delete pods that no controller recreates
+
+# cluster/baseline.yml
+baseline_apt_upgrade: true
+baseline_packages:
+  - chrony
+  - lvm2
+  - curl
+  - ca-certificates

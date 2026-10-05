@@ -1,0 +1,55 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: tools-jupyterhub
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: dataplatform
+  sources:
+    - repoURL: https://hub.jupyter.org/helm-chart/
+      chart: jupyterhub
+      targetRevision: "4.4.2"
+      helm:
+        releaseName: jupyterhub
+        valueFiles:
+          - $values/subsystems/dataplatform/gitops/helm-values/jupyterhub-values.yaml
+    - repoURL: git@github.com:your-account/mini-cluster-management.git
+      targetRevision: main
+      ref: values
+      path: subsystems/dataplatform/gitops/manifests/tools/jupyterhub
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: tools
+  ignoreDifferences:
+    # The chart makes the hub-to-proxy token at render time (its `lookup` of
+    # the live Secret is empty under Argo CD): keep the live one, and the
+    # hub's checksum of that Secret, or every sync would restart the hub with
+    # a token the proxy does not have.
+    - kind: Secret
+      name: hub
+      jsonPointers:
+        - /data/hub.config.ConfigurableHTTPProxy.auth_token
+    - group: apps
+      kind: Deployment
+      name: hub
+      jsonPointers:
+        - /spec/template/metadata/annotations/checksum~1secret
+  syncPolicy:
+    # No finalizer and no prune: deleting or renaming this Application in Git
+    # must not take the hub's database with it (the users' volumes are made by
+    # the hub, not by Argo CD, and stay anyway)
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+      - SkipDryRunOnMissingResource=true
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        maxDuration: 5m
+        factor: 2

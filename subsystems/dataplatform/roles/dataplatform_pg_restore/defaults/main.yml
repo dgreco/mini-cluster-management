@@ -1,0 +1,28 @@
+---
+# The CloudNativePG clusters pg-restore.yml knows, in the order -e pg_cluster=all
+# takes them: the least critical first, Keycloak (every login) last.
+dataplatform_pg_restore_clusters: [metacatalog-db, iceberg-catalog, keycloak-db]
+dataplatform_pg_restore_namespace: governance
+# check (scratch cluster, changes nothing) or replace (deletes and recreates)
+dataplatform_pg_restore_mode: check
+# all, or one name of dataplatform_pg_restore_clusters
+dataplatform_pg_restore_cluster_input: all
+# optional point in time ("2026-10-03 13:30:00+00"); empty: replay every archived WAL
+dataplatform_pg_restore_target_time: ""
+# optional timeline; empty: the timeline the live primary is on (Keycloak's
+# archive holds an abandoned timeline 2, which "latest" would follow and fail)
+dataplatform_pg_restore_target_tli: ""
+# a restore, a rollout, a backup or Argo CD (s)
+dataplatform_pg_restore_timeout: 1800
+# replace mode keeps the original Cluster and its timeline here until the end,
+# so an interrupted run resumes from them (git-ignored, like backups/ceph)
+dataplatform_pg_restore_state_dir: "{{ playbook_dir }}/../../backups/pg-restore"
+dataplatform_pg_restore_kubectl: /usr/local/bin/k3s kubectl
+dataplatform_pg_restore_plugin: barman-cloud.cloudnative-pg.io
+# Rows per table of the cluster's application database, as "schema.table|count"
+dataplatform_pg_restore_count_sql: >-
+  select table_schema || '.' || table_name,
+  (xpath('/row/c/text()', query_to_xml(format('select count(*) as c from %I.%I', table_schema, table_name), false, true, '')))[1]::text
+  from information_schema.tables
+  where table_type = 'BASE TABLE' and table_schema not in ('pg_catalog', 'information_schema')
+  order by 1

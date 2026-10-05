@@ -1,0 +1,56 @@
+---
+# Address and token of OpenBao, for the API calls of this role and of the
+# roles that store values in it (include_role tasks_from: client). The calls
+# run on the first k3s server, which reaches Service ClusterIPs and pod IPs.
+# The token is the periodic one of the policy `ansible`
+# (dataplatform_openbao_ansible_token_file, made right after initialisation
+# and renewed here); the root token of the initialisation is used only until
+# that file exists, and stays the break-glass login.
+- name: OpenBao active node address
+  ansible.builtin.command: >-
+    /usr/local/bin/k3s kubectl -n {{ dataplatform_openbao_namespace }} get service openbao-active
+    -o 'jsonpath={.spec.clusterIP}'
+  delegate_to: "{{ groups['k3s_servers'][0] }}"
+  register: dataplatform_openbao_svc
+  changed_when: false
+
+- name: The Ansible token file - {{ dataplatform_openbao_ansible_token_file }}
+  ansible.builtin.stat:
+    path: "{{ dataplatform_openbao_ansible_token_file }}"
+  delegate_to: localhost
+  become: false
+  register: dataplatform_openbao_ansible_token_stat
+
+- name: OpenBao client settings
+  ansible.builtin.set_fact:
+    dataplatform_openbao_addr: "http://{{ dataplatform_openbao_svc.stdout }}:8200"
+    dataplatform_openbao_token: >-
+      {{ lookup('ansible.builtin.file', dataplatform_openbao_ansible_token_file) | trim
+         if dataplatform_openbao_ansible_token_stat.stat.exists else
+         (lookup('ansible.builtin.file', dataplatform_openbao_init_file) | from_json).root_token }}
+    dataplatform_openbao_token_is_root: "{{ not dataplatform_openbao_ansible_token_stat.stat.exists }}"
+  no_log: true
+
+# A periodic token lives as long as it is renewed within its period.
+- name: Renew the Ansible token
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/auth/token/renew-self"
+    method: POST
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+    status_code: [200, 403]
+  delegate_to: "{{ groups['k3s_servers'][0] }}"
+  register: dataplatform_openbao_renew
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: not dataplatform_openbao_token_is_root
+
+- name: The Ansible token must be valid
+  ansible.builtin.assert:
+    that: dataplatform_openbao_renew.status == 200
+    fail_msg: >-
+      The token in {{ dataplatform_openbao_ansible_token_file }} is not accepted by OpenBao (expired or
+      revoked). Remove the file and run make dataplatform-openbao: it makes a new one with the root token
+      of {{ dataplatform_openbao_init_file }}.
+    quiet: true
+  when: not dataplatform_openbao_token_is_root

@@ -1,0 +1,43 @@
+---
+# A fresh admin token of the master realm: sets dataplatform_iam_kc_token and
+# dataplatform_iam_kc_token_via ('client' or 'bootstrap'). Ansible's own
+# client (dataplatform_iam_kc_client, secret dataplatform_iam_kc_client_secret)
+# whenever it works; the bootstrap admin (dataplatform_iam_kc_admin) only
+# before that client exists. Tokens there live 60 s.
+- name: Admin token of the master realm (client {{ dataplatform_iam_kc_client }})
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_admin_base }}/realms/master/protocol/openid-connect/token"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      grant_type: client_credentials
+      client_id: "{{ dataplatform_iam_kc_client }}"
+      client_secret: "{{ dataplatform_iam_kc_client_secret }}"
+    status_code: [200, 401, 400]
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_kc_login_client
+  no_log: true
+  when: dataplatform_iam_kc_client_secret | default('') | length > 0
+
+- name: Admin token of the master realm (bootstrap admin)
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_admin_base }}/realms/master/protocol/openid-connect/token"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      grant_type: password
+      client_id: admin-cli
+      username: "{{ dataplatform_iam_kc_admin.username }}"
+      password: "{{ dataplatform_iam_kc_admin.password }}"
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_kc_login
+  no_log: true
+  when: dataplatform_iam_kc_login_client.status | default(0) != 200
+
+- name: Keep the admin token
+  ansible.builtin.set_fact:
+    dataplatform_iam_kc_token: >-
+      {{ dataplatform_iam_kc_login_client.json.access_token
+         if dataplatform_iam_kc_login_client.status | default(0) == 200 else dataplatform_iam_kc_login.json.access_token }}
+    dataplatform_iam_kc_token_via: "{{ 'client' if dataplatform_iam_kc_login_client.status | default(0) == 200 else 'bootstrap' }}"
+  no_log: true

@@ -1,0 +1,68 @@
+# The template every job of dp-spark-submit.sh starts from (annotation
+# spark-application.template.0.name: lakehouse): the Iceberg JDBC catalog
+# lakehouse on the catalog database (login: spark_writer, Secret
+# spark-catalog-logins; it commits to existing tables, creates none), S3
+# through web identity (the job's Keycloak token, exchanged at Ceph STS for
+# the user's or group's role), event logs to system/spark-events/ of the
+# bucket, product logs through Vector. What differs per job (the token
+# Secret, the role, the warehouse directory, the code) is in the
+# SparkApplication the script writes.
+apiVersion: spark.stackable.tech/v1alpha1
+kind: SparkApplicationTemplate
+metadata:
+  name: lakehouse
+  namespace: compute
+spec:
+  mode: cluster
+  sparkImage:
+    productVersion: 4.1.2
+  mainApplicationFile: local:///stackable/jobs/job.py
+  deps:
+    packages:
+    - org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0
+    - org.postgresql:postgresql:42.7.7
+  sparkConf:
+    spark.sql.extensions: org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+    spark.sql.defaultCatalog: lakehouse
+    spark.sql.catalog.lakehouse: org.apache.iceberg.spark.SparkCatalog
+    spark.sql.catalog.lakehouse.type: jdbc
+    spark.sql.catalog.lakehouse.uri: jdbc:postgresql://iceberg-catalog-rw.governance.svc:5432/iceberg
+    spark.sql.catalog.lakehouse.jdbc.schema-version: V1
+    spark.sql.catalog.lakehouse.jdbc.user: spark_writer      # no DDL: Meta Catalog makes the tables
+    # the catalog's own bookkeeping tables exist (iceberg-catalog-db.yaml):
+    # never try to create them, which spark_writer may not
+    spark.sql.catalog.lakehouse.jdbc.init-catalog-tables: 'false'
+    spark.sql.catalog.lakehouse.warehouse: s3://<%= dataplatform_bucket %>/warehouse/
+    spark.sql.catalog.lakehouse.io-impl: org.apache.iceberg.aws.s3.S3FileIO
+    spark.sql.catalog.lakehouse.s3.endpoint: https://<%= site_s3_host %>
+    spark.sql.catalog.lakehouse.s3.path-style-access: 'true'
+    spark.sql.catalog.lakehouse.client.region: <%= dataplatform_s3_region %>
+    spark.sql.catalog.lakehouse.client.credentials-provider: software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider
+    spark.sql.iceberg.vectorization.enabled: 'false'
+  logFileDirectory:
+    s3:
+      prefix: system/spark-events/
+      bucket:
+        reference: spark-logs
+  driver:
+    config:
+      resources:
+        cpu:
+          min: 250m
+          max: '1'
+        memory:
+          limit: 1Gi
+      logging:
+        enableVectorAgent: true
+  executor:
+    replicas: 2
+    config:
+      resources:
+        cpu:
+          min: 250m
+          max: '1'
+        memory:
+          limit: 2Gi
+      logging:
+        enableVectorAgent: true
+  vectorAggregatorConfigMapName: vector-aggregator-discovery

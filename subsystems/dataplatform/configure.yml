@@ -1,0 +1,14 @@
+---
+# Renders every file that carries a site value from its *.in template
+# (roles/dataplatform_configure): after changing inventory/group_vars/all/
+# site.yml or a template, run it, commit the result and push. Runs on the
+# control node only (no node needs to be up); --check reports stale files
+# without writing them.
+#   make configure
+#   make configure-check
+- name: Files carrying the site's values
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  become: false
+  roles:
+    - dataplatform_configure

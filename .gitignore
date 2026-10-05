@@ -1,0 +1,34 @@
+# generated secrets (dashboard password, STS key, S3 keys)
+.secrets/
+
+# ansible runtime
+.ansible/
+*.retry
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# benchmark reports (make ceph-bench*)
+bench-results/
+
+# make ceph-backup output (keys inside)
+backups/
+
+# make dataplatform-render output
+.render/
+# encrypted copies of .secrets/ (make them elsewhere, never commit them)
+*.age
+
+# charts kustomize --enable-helm downloads next to a kustomization (make dataplatform-render)
+subsystems/dataplatform/gitops/manifests/**/charts/
+
+# nodeterm (the canvas app) keeps its workspace state here
+.nodeterm/

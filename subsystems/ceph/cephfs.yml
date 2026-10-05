@@ -1,0 +1,6 @@
+---
+- name: CephFS
+  hosts: ceph_mons[0]
+  roles:
+    - role: ceph_cephfs
+      when: ceph_cephfs_enabled | bool

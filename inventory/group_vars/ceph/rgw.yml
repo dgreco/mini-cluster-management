@@ -1,0 +1,84 @@
+---
+# Ceph subsystem: S3 (RGW), STS, the HA ingress and its Let's Encrypt
+# certificate. See main.yml for the rest of the group's settings.
+
+# ---------------------------------------------------------------- rgw / s3 ----
+# S3 object storage (RGW). Installed by install.yml (step rgw.yml / s3.yml)
+# when enabled: RGW daemons, HA ingress, STS, administrative S3 user.
+ceph_rgw_enabled: true
+ceph_rgw_service_id: s3
+ceph_rgw_port: 7480                    # per-daemon HTTP port
+ceph_rgw_config_section: client.rgw    # config-db section matching all RGW daemons
+# pg_num / pg_num_min for the small (non-bulk) RGW pools: .rgw.root, log,
+# control, meta, buckets.index. The autoscaler's built-in floor of 32 per pool
+# exhausts mon_max_pg_per_osd on 4 OSDs and stops the bulk data pool growing.
+# Pools RGW creates later get it on the next `make ceph-s3`.
+ceph_rgw_small_pool_pg_num: 8
+# zonegroup hostname for virtual-hosted style buckets: the public name with a
+# Let's Encrypt certificate (below), else s3.<cluster_domain>
+ceph_rgw_dns_name: "{{ ceph_rgw_acme_domain if ceph_rgw_acme_enabled | bool else 's3.' ~ cluster_domain }}"
+
+# HA endpoint: cephadm `ingress` service (haproxy + keepalived) with a virtual IP.
+ceph_rgw_ingress_enabled: true
+ceph_rgw_ingress_virtual_ip: "{{ site_s3_vip }}"   # MUST be a free address on the LAN
+ceph_rgw_ingress_port: 443
+ceph_rgw_ingress_monitor_port: 1967
+ceph_rgw_ingress_count: "{{ groups['ceph_ingress'] | length }}"   # haproxy + keepalived on every ceph_ingress host
+ceph_rgw_ingress_ssl: true             # self-signed cert generated on the admin host, or Let's Encrypt (below)
+ceph_rgw_ingress_cert_days: 3650       # self-signed only
+
+# Let's Encrypt certificate for the ingress instead of the self-signed one
+# (make ceph-s3-cert). Needs a public domain whose DNS is hosted at GoDaddy and
+# a GoDaddy personal access token with the domains.dns:update scope, stored as
+# GODADDY_PAT=<token> in .secrets/godaddy.env. lego on the admin host proves
+# the domain with DNS TXT records (nothing needs to be reachable from the
+# internet) and renews it from a systemd timer (ceph-s3-cert.timer).
+ceph_rgw_acme_enabled: true
+ceph_rgw_acme_domain: "{{ site_s3_host }}"   # certificate for it and *.<it>; the S3 name clients use
+ceph_rgw_acme_zone: "{{ site_dns_zone }}"    # the GoDaddy DNS zone that holds it
+ceph_rgw_acme_email: "{{ site_acme_email }}" # Let's Encrypt account; expiry warnings go there
+ceph_rgw_acme_staging: false             # true: Let's Encrypt staging CA (untrusted certificates, for tests)
+ceph_rgw_acme_public_dns: true           # keep public A records <domain> and *.<domain> -> the ingress VIP
+ceph_acme_lego_version: "{{ lego_version }}"
+# lego's account and certificates on the admin host
+ceph_acme_dir: /etc/ceph/acme
+ceph_acme_cert_file: "{{ ceph_acme_dir }}/certificates/{{ ceph_rgw_acme_domain }}.crt"   # with the chain
+ceph_acme_key_file: "{{ ceph_acme_dir }}/certificates/{{ ceph_rgw_acme_domain }}.key"
+# cephadm's default ingress images (quay.io/ceph/haproxy, quay.io/ceph/keepalived)
+# are amd64-only and crash with "Exec format error" on the arm64 boards. Use the
+# official multi-arch haproxy and a keepalived image built locally on each
+# ingress host (roles/ceph_ingress_image).
+ceph_ingress_haproxy_image: docker.io/library/haproxy:2.8
+ceph_ingress_keepalived_image: localhost/ceph-keepalived:2.2
+ceph_ingress_keepalived_base_image: docker.io/library/alpine:3.20
+ceph_ingress_keepalived_package: keepalived=2.2.8-r0   # the apk package, pinned: both ingress hosts build the same
+
+# STS (AssumeRole / AssumeRoleWithWebIdentity) on the same endpoint
+ceph_rgw_sts_enabled: true
+ceph_rgw_sts_key: "{{ lookup('password', secrets_dir ~ '/ceph-rgw-sts.key chars=ascii_letters,digits length=16') }}"
+ceph_rgw_sts_max_session_duration: 43200
+
+# Administrative S3/IAM user created at install; keys land in .secrets/
+ceph_rgw_admin_uid: s3admin
+# Backups: an S3 user that owns the bucket where k3s (etcd snapshots) and the
+# data platform (PostgreSQL backups, OpenBao snapshots) keep theirs. Its keys
+# go to .secrets/s3-<uid>.json (k3s reads them; make dataplatform-ceph copies
+# them into OpenBao). make ceph-backup itself copies Ceph's own state to the
+# control node, not here.
+ceph_rgw_backup_enabled: true
+ceph_rgw_backup_uid: backup
+ceph_rgw_backup_bucket: "{{ site_backup_bucket }}"
+# the SigV4 region of the S3 clients Ansible runs (RGW does not check it)
+ceph_rgw_region: "{{ site_s3_region }}"
+ceph_rgw_admin_display_name: "S3 administrator"
+ceph_rgw_admin_caps: "users=*;buckets=*;metadata=*;usage=*;zone=*;info=*;roles=*;user-policy=*;oidc-provider=*"
+
+# Derived: the endpoint clients should use
+ceph_rgw_vip: "{{ ceph_rgw_ingress_virtual_ip | regex_replace('/.*$', '') }}"
+ceph_rgw_acme_active: "{{ ceph_rgw_acme_enabled | bool and ceph_rgw_ingress_enabled | bool and ceph_rgw_ingress_ssl | bool }}"
+ceph_rgw_endpoint: >-
+  {{ ('https://' ~ ceph_rgw_acme_domain ~ ('' if ceph_rgw_ingress_port | int == 443 else ':' ~ ceph_rgw_ingress_port))
+     if ceph_rgw_acme_active | bool else
+     (('https' if ceph_rgw_ingress_ssl | bool else 'http') ~ '://' ~ ceph_rgw_vip ~ ':' ~ ceph_rgw_ingress_port)
+     if ceph_rgw_ingress_enabled | bool
+     else ('http://' ~ hostvars[groups['ceph_rgws'][0]]['ansible_host'] ~ ':' ~ ceph_rgw_port) }}

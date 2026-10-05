@@ -1,0 +1,22 @@
+# VictoriaMetrics single node: every metric of the platform, written by the
+# OpenTelemetry collector (Prometheus remote write, names unchanged, so the
+# community dashboards work). Service victoria-metrics:8428.
+server:
+  fullnameOverride: victoria-metrics
+  retentionPeriod: 30d
+  # its own metrics, scraped by the OTel cluster collector
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8428"
+  persistentVolume:
+    enabled: true
+    storageClassName: ceph-rbd
+    size: 20Gi
+  resources:
+    requests: {cpu: 100m, memory: 512Mi}
+    limits: {memory: 2Gi}
+  extraArgs:
+    # the OTel collector adds k8s labels; allow a few more than the default 30
+    maxLabelsPerTimeseries: "40"
+    # stop ingesting rather than fill the 20Gi volume
+    storage.minFreeDiskSpaceBytes: 2GiB

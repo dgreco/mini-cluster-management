@@ -1,0 +1,7 @@
+---
+- name: Install fio
+  ansible.builtin.apt:
+    name: fio
+    state: present
+    update_cache: true
+    cache_valid_time: 3600

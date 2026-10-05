@@ -1,0 +1,321 @@
+---
+# Replace mode: delete dataplatform_pg_restore_cluster and recreate it, same
+# name and spec, from its backups. Data written after the last archived WAL
+# (seconds) is lost; the applications on it are down until it is back.
+#
+#  1. keep the original Cluster in <state dir>/<cluster>.json (a re-run after
+#     a failure resumes from it, whatever is live by then)
+#  2. pause its Argo CD Application (skip-reconcile), or Argo CD would
+#     recreate an empty cluster (initdb) the moment the old one is gone
+#  3. rows per table, then a WAL switch and every finished WAL archived
+#  4. delete the Cluster, wait until its pods and volumes are gone
+#  5. create it again with a recovery bootstrap along the live timeline;
+#     cnpg.io/skipEmptyWalArchiveCheck lets it go on archiving, on a new
+#     timeline, into the same path (the source is gone: no second writer)
+#  6. wait until healthy and archiving; drop the annotation; switch the
+#     bootstrap back to the original initdb (only used at creation), so the
+#     live Cluster matches Git again
+#  7. compare rows, take a base backup of the new timeline, resume Argo CD
+- name: State files
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_state: "{{ dataplatform_pg_restore_state_dir }}/{{ dataplatform_pg_restore_cluster }}.json"
+    dataplatform_pg_restore_meta: "{{ dataplatform_pg_restore_state_dir }}/{{ dataplatform_pg_restore_cluster }}.meta.json"
+
+- name: State directory on the control node
+  ansible.builtin.file:
+    path: "{{ dataplatform_pg_restore_state_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+
+- name: An earlier, interrupted run?
+  ansible.builtin.stat:
+    path: "{{ dataplatform_pg_restore_state }}"
+  delegate_to: localhost
+  become: false
+  register: dataplatform_pg_restore_state_stat
+
+- name: Read the live cluster
+  ansible.builtin.include_tasks: live.yml
+
+- name: Original cluster (from the earlier run, or live)
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_orig: >-
+      {{ lookup('ansible.builtin.file', dataplatform_pg_restore_state) | from_json
+         if dataplatform_pg_restore_state_stat.stat.exists else dataplatform_pg_restore_live }}
+
+- name: There is a cluster to restore
+  ansible.builtin.assert:
+    that: dataplatform_pg_restore_orig | length > 0
+    fail_msg: "{{ dataplatform_pg_restore_cluster }} does not exist and no earlier run left its definition"
+    quiet: true
+
+- name: Keep the original cluster on the control node
+  ansible.builtin.copy:
+    content: "{{ dataplatform_pg_restore_orig | to_nice_json }}"
+    dest: "{{ dataplatform_pg_restore_state }}"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  when: not dataplatform_pg_restore_state_stat.stat.exists
+
+- name: Is the original still there, and its Argo CD Application
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_original_live: >-
+      {{ dataplatform_pg_restore_live | length > 0
+         and dataplatform_pg_restore_live.metadata.uid == dataplatform_pg_restore_orig.metadata.uid }}
+    dataplatform_pg_restore_app: >-
+      {{ (dataplatform_pg_restore_orig.metadata.annotations | default({}))['argocd.argoproj.io/tracking-id']
+         | default('') | split(':') | first }}
+
+- name: Pause Argo CD for {{ dataplatform_pg_restore_app }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    k="{{ dataplatform_pg_restore_kubectl }} -n argocd"
+    a={{ dataplatform_pg_restore_app }}
+    $k annotate application $a argocd.argoproj.io/skip-reconcile=true --overwrite >/dev/null
+    sleep 5
+    before=$($k get application $a -o 'jsonpath={.status.reconciledAt}')
+    $k annotate application $a argocd.argoproj.io/refresh=normal --overwrite >/dev/null
+    $k annotate application dataplatform argocd.argoproj.io/refresh=normal --overwrite >/dev/null
+    sleep 45
+    after=$($k get application $a -o 'jsonpath={.status.reconciledAt}|{.metadata.annotations.argocd\.argoproj\.io/skip-reconcile}')
+    [ "$after" = "$before|true" ] || { echo "Argo CD still reconciles $a ($before -> $after)"; exit 1; }
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: dataplatform_pg_restore_app | length > 0
+
+- name: Before the delete
+  when: dataplatform_pg_restore_original_live
+  block:
+    - name: Primary
+      ansible.builtin.set_fact:
+        dataplatform_pg_restore_primary: "{{ dataplatform_pg_restore_live.status.currentPrimary }}"
+
+    - name: Timeline to follow
+      ansible.builtin.include_tasks: timeline.yml
+
+    - name: Rows in the database before the restore
+      ansible.builtin.include_tasks: counts.yml
+      vars:
+        dataplatform_pg_restore_count_pod: "{{ dataplatform_pg_restore_primary }}"
+        dataplatform_pg_restore_count_db: "{{ dataplatform_pg_restore_orig.spec.bootstrap.initdb.database }}"
+
+    - name: Keep timeline and rows on the control node
+      ansible.builtin.copy:
+        content: "{{ {'tli': dataplatform_pg_restore_tli, 'counts': dataplatform_pg_restore_counts} | to_nice_json }}"
+        dest: "{{ dataplatform_pg_restore_meta }}"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+
+    - name: Switch WAL and wait until every finished WAL is archived
+      ansible.builtin.shell: |
+        set -o pipefail
+        x="{{ dataplatform_pg_restore_kubectl }} -n {{ dataplatform_pg_restore_namespace }} exec {{ dataplatform_pg_restore_primary }} -c postgres --"
+        $x psql -U postgres -At -c "select pg_switch_wal()" >/dev/null
+        end=$((SECONDS + 300))
+        while :; do
+          n=$($x psql -U postgres -At -c "select count(*) from pg_ls_archive_statusdir() where name like '%.ready'")
+          [ "$n" = 0 ] && exit 0
+          if [ $SECONDS -ge $end ]; then echo "$n WAL files still waiting to be archived"; exit 1; fi
+          sleep 5
+        done
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Delete the cluster, wait until its pods and volumes are gone
+      ansible.builtin.shell: |
+        set -o pipefail
+        k="{{ dataplatform_pg_restore_kubectl }} -n {{ dataplatform_pg_restore_namespace }}"
+        $k delete clusters.postgresql.cnpg.io {{ dataplatform_pg_restore_cluster }} --wait=true
+        end=$((SECONDS + 600))
+        while [ -n "$($k get pods,pvc -l cnpg.io/cluster={{ dataplatform_pg_restore_cluster }} -o name)" ]; do
+          if [ $SECONDS -ge $end ]; then echo "pods or volumes of {{ dataplatform_pg_restore_cluster }} still there"; exit 1; fi
+          sleep 5
+        done
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+- name: Timeline and rows from before the delete are known
+  ansible.builtin.stat:
+    path: "{{ dataplatform_pg_restore_meta }}"
+  delegate_to: localhost
+  become: false
+  register: dataplatform_pg_restore_meta_stat
+
+- name: Recorded before the delete
+  ansible.builtin.assert:
+    that: dataplatform_pg_restore_meta_stat.stat.exists
+    fail_msg: >-
+      {{ dataplatform_pg_restore_cluster }} is gone but {{ dataplatform_pg_restore_meta }} is missing:
+      give the timeline with -e pg_target_tli=<n> after writing {"tli": "<n>", "counts": {}} there
+    quiet: true
+
+- name: Timeline and rows from before the delete
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_before: "{{ lookup('ansible.builtin.file', dataplatform_pg_restore_meta) | from_json }}"
+
+- name: Timeline to follow (given, or recorded)
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_tli: >-
+      {{ dataplatform_pg_restore_target_tli | string if dataplatform_pg_restore_target_tli | string | length > 0
+         else dataplatform_pg_restore_before.tli | string }}
+
+- name: Recovery bootstrap
+  ansible.builtin.include_tasks: recovery.yml
+
+- name: Read the cluster again
+  ansible.builtin.include_tasks: live.yml
+
+- name: Create the cluster from its backups
+  ansible.builtin.command:
+    argv: ["/usr/local/bin/k3s", "kubectl", "create", "-f", "-"]
+    stdin: >-
+      {{ {'apiVersion': dataplatform_pg_restore_orig.apiVersion, 'kind': 'Cluster',
+          'metadata': {'name': dataplatform_pg_restore_cluster, 'namespace': dataplatform_pg_restore_namespace,
+                       'labels': dataplatform_pg_restore_orig.metadata.labels | default({}),
+                       'annotations': (dataplatform_pg_restore_orig.metadata.annotations | default({}))
+                                      | combine({'cnpg.io/skipEmptyWalArchiveCheck': 'enabled'})},
+          'spec': dataplatform_pg_restore_orig.spec
+                  | combine({'bootstrap': dataplatform_pg_restore_bootstrap,
+                             'externalClusters': dataplatform_pg_restore_external})} | to_json }}
+  changed_when: true
+  when: dataplatform_pg_restore_live | length == 0
+
+- name: Wait until it has recovered, every instance ready and WAL archiving working
+  ansible.builtin.shell: |
+    set -o pipefail
+    k="{{ dataplatform_pg_restore_kubectl }} -n {{ dataplatform_pg_restore_namespace }}"
+    want="Cluster in healthy state|{{ dataplatform_pg_restore_orig.spec.instances }}|True"
+    end=$((SECONDS + {{ dataplatform_pg_restore_timeout }}))
+    while :; do
+      s=$($k get clusters.postgresql.cnpg.io {{ dataplatform_pg_restore_cluster }} \
+          -o 'jsonpath={.status.phase}|{.status.readyInstances}|{.status.conditions[?(@.type=="ContinuousArchiving")].status}')
+      [ "$s" = "$want" ] && exit 0
+      if [ $SECONDS -ge $end ]; then echo "not ready: $s"; exit 1; fi
+      sleep 15
+    done
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: No archive-check override any more
+  ansible.builtin.command: >-
+    {{ dataplatform_pg_restore_kubectl }} -n {{ dataplatform_pg_restore_namespace }}
+    annotate clusters.postgresql.cnpg.io {{ dataplatform_pg_restore_cluster }} cnpg.io/skipEmptyWalArchiveCheck-
+  changed_when: true
+
+- name: Read the restored cluster
+  ansible.builtin.include_tasks: live.yml
+
+- name: Back to the Git definition, the initdb bootstrap (only used at creation)
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - -n
+      - "{{ dataplatform_pg_restore_namespace }}"
+      - patch
+      - clusters.postgresql.cnpg.io
+      - "{{ dataplatform_pg_restore_cluster }}"
+      - --type=json
+      - -p
+      - >-
+        {{ [{'op': 'replace', 'path': '/spec/bootstrap', 'value': dataplatform_pg_restore_orig.spec.bootstrap},
+            {'op': 'remove', 'path': '/spec/externalClusters'}] | to_json }}
+  changed_when: true
+  when: dataplatform_pg_restore_live.spec.externalClusters is defined
+
+- name: Rows in the restored database
+  ansible.builtin.include_tasks: counts.yml
+  vars:
+    dataplatform_pg_restore_count_pod: "{{ dataplatform_pg_restore_live.status.currentPrimary }}"
+    dataplatform_pg_restore_count_db: "{{ dataplatform_pg_restore_orig.spec.bootstrap.initdb.database }}"
+
+- name: Compare with before
+  ansible.builtin.set_fact:
+    dataplatform_pg_restore_missing: >-
+      {{ dataplatform_pg_restore_before.counts.keys() | difference(dataplatform_pg_restore_counts.keys()) }}
+    dataplatform_pg_restore_report: |-
+      {%- set out = [] -%}
+      {%- for t, n in dataplatform_pg_restore_before.counts.items() -%}
+      {%-   if t in dataplatform_pg_restore_counts and dataplatform_pg_restore_counts[t] != n -%}
+      {%-     set _ = out.append(t ~ ' before ' ~ n ~ ' restored ' ~ dataplatform_pg_restore_counts[t]) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: A base backup of the new timeline
+  ansible.builtin.shell: |
+    set -o pipefail
+    k="{{ dataplatform_pg_restore_kubectl }} -n {{ dataplatform_pg_restore_namespace }}"
+    b={{ dataplatform_pg_restore_cluster }}-restored-$(date -u +%Y%m%d%H%M%S)
+    cat <<EOF | $k create -f - >/dev/null
+    apiVersion: postgresql.cnpg.io/v1
+    kind: Backup
+    metadata: {name: $b}
+    spec:
+      cluster: {name: {{ dataplatform_pg_restore_cluster }}}
+      method: plugin
+      pluginConfiguration: {name: {{ dataplatform_pg_restore_plugin }}}
+    EOF
+    end=$((SECONDS + {{ dataplatform_pg_restore_timeout }}))
+    while :; do
+      p=$($k get backups.postgresql.cnpg.io $b -o 'jsonpath={.status.phase}')
+      case "$p" in completed) echo "$b"; exit 0;; failed) echo "$b failed"; exit 1;; esac
+      if [ $SECONDS -ge $end ]; then echo "$b: $p"; exit 1; fi
+      sleep 10
+    done
+  args:
+    executable: /bin/bash
+  register: dataplatform_pg_restore_backup
+  changed_when: true
+
+- name: Resume Argo CD for {{ dataplatform_pg_restore_app }}
+  ansible.builtin.shell: |
+    set -o pipefail
+    k="{{ dataplatform_pg_restore_kubectl }} -n argocd"
+    a={{ dataplatform_pg_restore_app }}
+    $k annotate application $a argocd.argoproj.io/skip-reconcile- >/dev/null
+    $k annotate application $a argocd.argoproj.io/refresh=hard --overwrite >/dev/null
+    sleep 20
+    end=$((SECONDS + 900))
+    while :; do
+      s=$($k get application $a -o 'jsonpath={.status.sync.status}/{.status.health.status}')
+      [ "$s" = "Synced/Healthy" ] && exit 0
+      if [ $SECONDS -ge $end ]; then echo "$a is $s"; exit 1; fi
+      sleep 15
+    done
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: dataplatform_pg_restore_app | length > 0
+
+- name: Done with this cluster, forget the state
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ dataplatform_pg_restore_state }}"
+    - "{{ dataplatform_pg_restore_meta }}"
+  delegate_to: localhost
+  become: false
+
+- name: Restored
+  ansible.builtin.assert:
+    that:
+      - dataplatform_pg_restore_counts | length > 0
+      - dataplatform_pg_restore_missing | length == 0
+    fail_msg: >-
+      {{ dataplatform_pg_restore_cluster }}: the restored database lacks {{ dataplatform_pg_restore_missing | join(', ') }}
+    success_msg: >-
+      {{ dataplatform_pg_restore_cluster }}: restored along timeline {{ dataplatform_pg_restore_tli }},
+      {{ dataplatform_pg_restore_counts | length }} tables;
+      {{ ('rows differ from before: ' ~ dataplatform_pg_restore_report | join('; '))
+         if dataplatform_pg_restore_report | length > 0 else 'same rows in every table as before' }};
+      new base backup {{ dataplatform_pg_restore_backup.stdout | trim }}

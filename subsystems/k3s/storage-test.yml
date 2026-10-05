@@ -1,0 +1,104 @@
+---
+# Smoke test of both StorageClasses, cleaned up afterwards:
+# - ceph-rbd: a pod writes to and reads back a ReadWriteOnce block volume;
+# - ceph-cephfs: two pods on two different nodes share one ReadWriteMany
+#   volume and each reads the file the other wrote.
+# Then checks that deleting the claims removed the RBD images and subvolumes.
+#   make k3s-storage-test
+- name: Storage smoke test
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  vars:
+    _ns: k3s-storage-test
+    _image: docker.io/library/busybox:1.36
+    _kubectl: /usr/local/bin/k3s kubectl
+    # Two different nodes for the RWX pods: the first and the last k3s host.
+    _nodes: >-
+      {{ [groups['k3s'][0], groups['k3s'][-1]] | map('extract', hostvars, 'ansible_host') | list }}
+  tasks:
+    - name: Test
+      block:
+        - name: Apply the test objects
+          ansible.builtin.command: "{{ _kubectl }} apply -f -"
+          args:
+            stdin: "{{ lookup('template', 'templates/storage-test.yaml.j2') }}"
+          changed_when: true
+
+        - name: Wait for the pods (volumes provisioned, attached, mounted)
+          ansible.builtin.command: "{{ _kubectl }} -n {{ _ns }} wait --for=condition=Ready pod --all --timeout=240s"
+          changed_when: false
+
+        - name: The volumes behind the claims (to check their removal later)
+          ansible.builtin.command: "{{ _kubectl }} get pv -o json"
+          register: k3s_test_pvs_before
+          changed_when: false
+
+        - name: RBD volume content
+          ansible.builtin.command: "{{ _kubectl }} -n {{ _ns }} exec rbd -- cat /data/check"
+          register: k3s_test_rbd
+          changed_when: false
+          failed_when: k3s_test_rbd.stdout != 'rbd-ok'
+
+        - name: Each CephFS pod sees both files
+          ansible.builtin.command: "{{ _kubectl }} -n {{ _ns }} exec cephfs-{{ item }} -- sh -c 'cat /data/written-by-*'"
+          loop: [1, 2]
+          register: k3s_test_cephfs
+          changed_when: false
+          failed_when: k3s_test_cephfs.stdout_lines | sort != _nodes | sort
+
+        - name: Where the pods ran
+          ansible.builtin.command: "{{ _kubectl }} -n {{ _ns }} get pods,pvc -o wide"
+          register: k3s_test_where
+          changed_when: false
+
+        - name: Result
+          ansible.builtin.debug:
+            msg: >-
+              {{ [k3s_rbd_storage_class ~ ': RWO volume written and read back',
+                  k3s_cephfs_storage_class ~ ': one RWX volume shared by pods on ' ~ (_nodes | join(' and '))]
+                 + k3s_test_where.stdout_lines }}
+      always:
+        - name: Delete the test objects
+          ansible.builtin.command: "{{ _kubectl }} delete namespace {{ _ns }} --ignore-not-found --timeout=180s"
+          changed_when: true
+
+    - name: Released volumes are deleted
+      ansible.builtin.command: "{{ _kubectl }} get pv -o json"
+      register: k3s_test_pvs
+      changed_when: false
+      retries: 18
+      delay: 10
+      until: >-
+        (k3s_test_pvs.stdout | from_json)['items']
+        | selectattr('spec.claimRef.namespace', 'defined')
+        | selectattr('spec.claimRef.namespace', 'equalto', _ns) | list | length == 0
+
+    - name: Images and subvolumes the test used
+      ansible.builtin.set_fact:
+        k3s_test_images: >-
+          {{ (k3s_test_pvs_before.stdout | from_json)['items']
+             | selectattr('spec.claimRef.namespace', 'defined') | selectattr('spec.claimRef.namespace', 'equalto', _ns)
+             | map(attribute='spec.csi.volumeAttributes.imageName', default='') | select | list }}
+        k3s_test_subvolumes: >-
+          {{ (k3s_test_pvs_before.stdout | from_json)['items']
+             | selectattr('spec.claimRef.namespace', 'defined') | selectattr('spec.claimRef.namespace', 'equalto', _ns)
+             | map(attribute='spec.csi.volumeAttributes.subvolumeName', default='') | select | list }}
+
+    - name: RBD images and CephFS subvolumes that remain in Ceph
+      ansible.builtin.command: cephadm shell -- {{ item }}
+      loop:
+        - "rbd ls {{ k3s_ceph_rbd_pool }}"
+        - "ceph fs subvolume ls {{ ceph_cephfs_name }} {{ k3s_ceph_cephfs_subvolumegroup }} --format json"
+      delegate_to: "{{ groups['ceph_mons'][0] }}"
+      register: k3s_test_ceph
+      changed_when: false
+
+    - name: They are gone from Ceph too
+      ansible.builtin.assert:
+        that:
+          - k3s_test_images | intersect(k3s_test_ceph.results[0].stdout_lines) | length == 0
+          - k3s_test_subvolumes | intersect(k3s_test_ceph.results[1].stdout | from_json | map(attribute='name') | list) | length == 0
+        fail_msg: >-
+          still in Ceph: images {{ k3s_test_images | intersect(k3s_test_ceph.results[0].stdout_lines) }}, subvolumes
+          {{ k3s_test_subvolumes | intersect(k3s_test_ceph.results[1].stdout | from_json | map(attribute='name') | list) }}
+        quiet: true

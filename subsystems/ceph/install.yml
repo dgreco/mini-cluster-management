@@ -1,0 +1,20 @@
+---
+# Full Ceph installation, idempotent end to end. Each step is also runnable alone.
+- name: Preflight
+  ansible.builtin.import_playbook: preflight.yml
+- name: Bootstrap
+  ansible.builtin.import_playbook: bootstrap.yml
+- name: Hosts and labels
+  ansible.builtin.import_playbook: hosts.yml
+- name: Monitors, managers, crash
+  ansible.builtin.import_playbook: services.yml
+- name: OSDs
+  ansible.builtin.import_playbook: osds.yml
+- name: RGW (S3), STS, ingress
+  ansible.builtin.import_playbook: rgw.yml
+- name: CephFS
+  ansible.builtin.import_playbook: cephfs.yml
+- name: Monitoring
+  ansible.builtin.import_playbook: monitoring.yml
+- name: Mount CephFS on the nodes
+  ansible.builtin.import_playbook: cephfs-mount.yml

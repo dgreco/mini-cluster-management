@@ -1,0 +1,14 @@
+# Trino (481) takes a user's groups only from a group provider, never from the
+# token. The file provider reads groups.txt, which iam-sync writes from the
+# Keycloak groups into the ConfigMap trino-iam (with the S3 security mapping).
+# Mounted into Trino's --etc-dir (/stackable/rwconfig) by trino.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-group-provider
+  namespace: compute
+data:
+  group-provider.properties: |
+    group-provider.name=file
+    file.group-file=/stackable/mount/iam/groups.txt
+    file.refresh-period=10s
