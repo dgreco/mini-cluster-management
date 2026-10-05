@@ -1,0 +1,24 @@
+# What is granted on the platform's data: Meta Catalog is the only place where
+# data access is managed (provisioning/lib-iam.sh, lib-grants.sh).
+#
+# The record: one key per resource a member of <%= site_admin_group %> authorized in
+# Meta Catalog, {"path": ..., "grants": [{access, users, groups}]}. Argo CD
+# only creates it (seeded, on 2026-10-05, with the grants then in force; a
+# record made anew starts empty): the provisioning scripts write its data (authorize puts a
+# resource's key, reject removes it; the Application ignores /data), and it is
+# never pruned or deleted with the Application. iam-sync reads it (Trino's S3
+# mapping); iam-reconcile applies it to Ceph's STS roles every hour and copies
+# it to s3://<%= site_backup_bucket %>/metacatalog-grants/.
+# make dataplatform-grants lists it, plans, applies, removes a key and
+# restores a copy.
+#
+# It lives here, in governance-iam-access (wave 1), not with Meta Catalog
+# (wave 3): iam-sync (wave 1) applies nothing before it has read it once, and
+# Trino (wave 2) cannot start without iam-sync's ConfigMap trino-iam, so on
+# an install from scratch the record must exist before either.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metacatalog-grants
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false

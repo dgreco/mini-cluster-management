@@ -73,7 +73,8 @@ Prerequisites:
 
 ```bash
 make dataplatform-install       # 30-60 minutes; safe to run again
-make dataplatform-smoke-test    # checks that the IAM model holds (about 10 minutes)
+make dataplatform-smoke-test    # checks that the IAM model holds (about 10 minutes; on a new platform it
+                                # first loads Meta Catalog's medallion model and its own lakehouse)
 make dataplatform-passwords     # the bootstrap and break-glass logins
 ```
 

@@ -17,10 +17,10 @@ spec:
         releaseName: openbao
         valueFiles:
           - $values/subsystems/dataplatform/gitops/helm-values/openbao-values.yaml
+    # the values file only: the route is core-openbao-gateway's (wave -2)
     - repoURL: git@github.com:your-account/mini-cluster-management.git
       targetRevision: main
       ref: values
-      path: subsystems/dataplatform/gitops/manifests/governance/openbao
   destination:
     server: https://kubernetes.default.svc
     namespace: governance

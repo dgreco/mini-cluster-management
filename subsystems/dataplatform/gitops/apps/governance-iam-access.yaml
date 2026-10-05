@@ -15,12 +15,18 @@ spec:
     path: subsystems/dataplatform/gitops/iam
   destination:
     server: https://kubernetes.default.svc
+  # the record of grants: Argo CD creates it, Meta Catalog's scripts write it
+  ignoreDifferences:
+    - kind: ConfigMap
+      name: metacatalog-grants
+      jsonPointers: [/data]
   syncPolicy:
     automated:
       prune: true
       selfHeal: true
     syncOptions:
       - SkipDryRunOnMissingResource=true
+      - RespectIgnoreDifferences=true
     retry:
       limit: 10
       backoff:

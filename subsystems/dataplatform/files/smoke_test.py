@@ -12,8 +12,11 @@ Everything happens in the smoke test's own lakehouse, smoke_test
 (metacatalog/lakehouses/smoke_test.yaml), whose schemas and tables only
 Meta Catalog creates and whose policy grants the engineer group the bronze
 layer and the analyst group the gold layer (the site's groups: ADMIN_GROUP,
-ENGINEER_GROUP, ANALYST_GROUP). 0 loads, provisions and authorizes it when
-it is missing.
+ENGINEER_GROUP, ANALYST_GROUP). 0 loads the medallion model
+(metacatalog/medallion-model.yaml, as make dataplatform-medallion does) when
+Meta Catalog has none of it, and loads, provisions and authorizes the
+lakehouse when it is missing: a platform built from scratch needs no step
+before this test.
 
 0  Meta Catalog lets the engineer in and refuses the analyst (only
    the admin and engineer groups); the lakehouse: in Meta Catalog,
@@ -66,6 +69,7 @@ LABEL_DOMAIN = os.environ["LABEL_DOMAIN"]               # the platform's label k
 METACATALOG = os.environ["METACATALOG_URL"].rstrip("/") + "/metacatalog/v1"
 LAKEHOUSE = os.environ.get("SMOKE_LAKEHOUSE", "smoke_test")
 LAKEHOUSE_FILE = os.environ["SMOKE_LAKEHOUSE_FILE"]
+MODEL_FILE = os.environ["SMOKE_MODEL_FILE"]            # metacatalog/medallion-model.yaml
 ROOT = f"lakehouse/{LAKEHOUSE}"                      # its storageRoot, under the bucket
 BRONZE, GOLD = f"{ROOT}/bronze", f"{ROOT}/gold"     # the engineers', the analysts'
 ENG_T, SPARK_T = f"lakehouse.{LAKEHOUSE}_bronze.eng_t", f"lakehouse.{LAKEHOUSE}_bronze.spark_t"
@@ -195,11 +199,51 @@ def resources(user: str) -> list:
     return out
 
 
+def model_types() -> list:
+    """the entity types the model file defines (its EntityTypes section, read
+    like dp-medallion.sh reads it)"""
+    names, section = [], False
+    for line in open(MODEL_FILE):
+        if line.startswith("EntityTypes:"):
+            section = True
+        elif re.match(r"^[A-Za-z]", line):
+            section = False
+        elif section and line.startswith("  - name:"):
+            names.append(line.split()[2].strip("\"'"))
+    return names
+
+
+def model(eng: str) -> bool:
+    """The medallion model is in Meta Catalog: loaded by the engineer when none
+    of its entity types is there (a fresh platform); a partial model is left
+    to a person, as dp-medallion.sh leaves it."""
+    names = model_types()
+    found = {n: metacatalog(eng, "GET", f"/entity-type/{n}")[0] for n in names}
+    other = {n: c for n, c in found.items() if c not in (200, 404)}
+    present = [n for n, c in found.items() if c == 200]
+    if other or not names:
+        check(f"0 Meta Catalog answers {eng} about the model's entity types", False,
+              f"{other or 'no entity type in ' + MODEL_FILE}")
+        return False
+    if len(present) == len(names):
+        check(f"0 the medallion model is in Meta Catalog ({len(names)} entity types)", True)
+        return True
+    if present:
+        check("0 the medallion model is in Meta Catalog", False,
+              f"{len(present)} of {len(names)} entity types only: finish or undo that by hand (Meta Catalog UI)")
+        return False
+    code, out = metacatalog(eng, "POST", "/bulk-creation", open(MODEL_FILE, "rb").read(), "application/octet-stream")
+    check(f"0 Meta Catalog loads the medallion model ({len(names)} entity types)", code == 204, f"HTTP {code} {out}")
+    return code == 204
+
+
 def fixture(eng: str) -> bool:
     """The smoke lakehouse exists, is provisioned and its grants are in force.
-    Missing pieces are made through Meta Catalog: the engineer loads and
-    provisions, the administrator authorizes (every run: unchanged grants
-    change nothing)."""
+    Missing pieces are made through Meta Catalog: the engineer loads the model
+    and the lakehouse and provisions, the administrator authorizes (every run:
+    unchanged grants change nothing)."""
+    if not model(eng):
+        return False
     q = urllib.parse.urlencode({"entityTypeName": "LakehouseType", "queryPath": f'$ ? (@.name == "{LAKEHOUSE}")'})
     code, rows = metacatalog(eng, "GET", f"/entity?{q}")
     check(f"0a Meta Catalog answers {eng} ({METACATALOG})", code == 200, str(rows)[:200])

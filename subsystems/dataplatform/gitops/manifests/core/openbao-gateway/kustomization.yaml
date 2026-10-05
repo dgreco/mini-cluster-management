@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# OpenBao's route, apart from OpenBao (wave -3) like Argo CD's
+# (core-argocd-gateway): Argo CD counts an HTTPRoute Progressing until a
+# Gateway accepts it, and the Gateway (wave -2) needs OpenBao for its
+# certificate, so the route in OpenBao's app held every later wave back
+namespace: governance
+resources:
+  - openbao-httproute.yaml

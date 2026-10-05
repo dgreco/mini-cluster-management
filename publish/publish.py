@@ -217,10 +217,13 @@ def prepare(dest, create):
     top = run(["git", "rev-parse", "--show-toplevel"], cwd=dest).stdout.strip()
     if os.path.realpath(top) != dest:
         fail(f"{dest} is inside another Git repository ({top})")
-    private = set(run(["git", "remote", "-v"]).stdout.split())
-    for url in run(["git", "remote", "-v"], cwd=dest).stdout.split():
-        if url in private:
-            fail(f"{dest} has this repository's remote {url}: refusing")
+    # URLs only: the remote names (origin) and the (fetch)/(push) words are
+    # the same in every repository
+    def urls(cwd):
+        return {f[1] for f in (l.split() for l in run(["git", "remote", "-v"], cwd=cwd).stdout.splitlines())
+                if len(f) >= 2}
+    for url in urls(dest) & urls(ROOT):
+        fail(f"{dest} has this repository's remote {url}: refusing")
     for entry in os.listdir(dest):
         if entry != ".git":
             p = os.path.join(dest, entry)
@@ -387,6 +390,11 @@ def push(args):
              "--description", "Ansible for a Turing Pi 2 home cluster: Ceph (cephadm), HA k3s, "
              "and a Trino/Spark data platform installed by Argo CD"], cwd=dest)
     url = run(["git", "remote", "get-url", "origin"], cwd=dest).stdout.strip()
+    if url.startswith("https://github.com/"):
+        # gh's login, for this repository only (gh repo create picks HTTPS by default)
+        run(["git", "config", "--local", "--replace-all", "credential.https://github.com.helper", ""], cwd=dest)
+        run(["git", "config", "--local", "--add", "credential.https://github.com.helper",
+             "!gh auth git-credential"], cwd=dest)
     print(f"pushing to {url}")
     run(["git", "push", "-u", "origin", "main"], cwd=dest, capture=False)
 

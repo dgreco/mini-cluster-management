@@ -6,9 +6,10 @@
 # STS, Trino and Spark in the smoke test's own lakehouse (Meta Catalog,
 # metacatalog/lakehouses/smoke_test.yaml): every data access must be decided
 # by Ceph through a group role and the layers the lakehouse's policy grants
-# it, and only Meta Catalog may create a schema or a table. Missing pieces of
-# the lakehouse are made on the way (load, provision); smoke-adm authorizes
-# it on every run.
+# it, and only Meta Catalog may create a schema or a table. Missing pieces
+# are made on the way (the medallion model and the lakehouse loaded, the
+# lakehouse provisioned), so a platform built from scratch needs no other
+# step first; smoke-adm authorizes the lakehouse on every run.
 # The users go at the end, pass or fail; the lakehouse stays, emptied.
 #   make dataplatform-smoke-test
 - name: Data platform smoke test
@@ -142,6 +143,7 @@
             JUPYTER_URL: https://jupyter.{{ dataplatform_domain }}
             METACATALOG_URL: https://metacatalog.{{ dataplatform_domain }}
             SMOKE_LAKEHOUSE_FILE: "{{ playbook_dir }}/metacatalog/lakehouses/smoke_test.yaml"
+            SMOKE_MODEL_FILE: "{{ playbook_dir }}/metacatalog/medallion-model.yaml"
             SPARK_SUBMIT: "{{ playbook_dir }}/files/dp-spark-submit.sh"
             S3_LOGIN: "{{ playbook_dir }}/files/dp-s3-login.sh"
             S3_BUCKET: "{{ dataplatform_bucket }}"

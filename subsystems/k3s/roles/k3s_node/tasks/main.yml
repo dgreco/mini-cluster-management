@@ -90,6 +90,17 @@
     quiet: true
   when: k3s_node_is_server and k3s_etcd_s3_enabled | bool
 
+# k3s makes these at its first start, but the manifests below are written
+# before k3s is installed: on a new board they do not exist yet (root only,
+# as k3s keeps its server directory)
+- name: Directory of the server's auto-deployed manifests
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop: [/var/lib/rancher/k3s/server, /var/lib/rancher/k3s/server/manifests]
+  when: k3s_node_is_server
+
 - name: S3 settings of the etcd snapshots
   ansible.builtin.copy:
     content: "{{ _secret | to_nice_yaml(indent=2) }}"

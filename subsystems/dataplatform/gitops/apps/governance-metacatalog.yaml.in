@@ -15,12 +15,6 @@ spec:
     path: subsystems/dataplatform/gitops/manifests/governance/metacatalog
   destination:
     server: https://kubernetes.default.svc
-  # The record of grants (metacatalog-grants.yaml): Argo CD creates it, the
-  # provisioning scripts own its data
-  ignoreDifferences:
-    - kind: ConfigMap
-      name: metacatalog-grants
-      jsonPointers: [/data]
   syncPolicy:
     # No finalizer and no prune: deleting or renaming this Application in Git
     # must not take the data with it (the database cluster and its volumes)
@@ -29,7 +23,6 @@ spec:
       selfHeal: true
     syncOptions:
       - SkipDryRunOnMissingResource=true
-      - RespectIgnoreDifferences=true
     retry:
       limit: 10
       backoff:

@@ -28,9 +28,24 @@
       ansible.builtin.shell: |
         set -o pipefail
         k="/usr/local/bin/k3s kubectl"
+        # An admission webhook whose Service is gone (the namespace of its operator
+        # was deleted first) can only fail, and blocks the deletion of every
+        # object it validates, namespaces included: delete it.
+        dead_webhooks() {
+          local kind name ns svc
+          for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
+            w=.webhooks[0].clientConfig.service
+            $k get "$kind" -o jsonpath="{range .items[*]}{.metadata.name} {$w.namespace} {$w.name}{\"\\n\"}{end}" |
+            while read -r name ns svc; do
+              [ -n "$svc" ] || continue
+              $k -n "$ns" get service "$svc" >/dev/null 2>&1 || $k delete "$kind" "$name" --ignore-not-found
+            done
+          done
+        }
         $k -n argocd delete application dataplatform --ignore-not-found --wait=false
         end=$((SECONDS + {{ remove_timeout }}))
         while [ -n "$($k -n argocd get applications -o name 2>/dev/null)" ]; do
+          dead_webhooks
           if [ $SECONDS -ge $end ]; then
             echo "still there, finalizers removed: $($k -n argocd get applications -o name | tr '\n' ' ')"
             for a in $($k -n argocd get applications -o name); do
@@ -49,11 +64,41 @@
       ansible.builtin.shell: |
         set -o pipefail
         k="/usr/local/bin/k3s kubectl"
+        # An admission webhook whose Service is gone (the namespace of its operator
+        # was deleted first) can only fail, and blocks the deletion of every
+        # object it validates, namespaces included: delete it.
+        dead_webhooks() {
+          local kind name ns svc
+          for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
+            w=.webhooks[0].clientConfig.service
+            $k get "$kind" -o jsonpath="{range .items[*]}{.metadata.name} {$w.namespace} {$w.name}{\"\\n\"}{end}" |
+            while read -r name ns svc; do
+              [ -n "$svc" ] || continue
+              $k -n "$ns" get service "$svc" >/dev/null 2>&1 || $k delete "$kind" "$name" --ignore-not-found
+            done
+          done
+        }
         nss="operators nginx-gateway core governance compute observability tools"
+        # Once operators is gone, no controller is left to run the finalizers
+        # of the objects still in a terminating namespace (the cleanup of the
+        # ExternalSecrets, of a database cluster): clear the finalizers of the kinds the
+        # namespace reports, or it stays Terminating for ever.
+        orphan_finalizers() {
+          local ns r cond
+          $k get namespace operators >/dev/null 2>&1 && return 0
+          cond='{.status.conditions[?(@.type=="NamespaceFinalizersRemaining")].message}'
+          for ns in $nss; do
+            for r in $($k get namespace "$ns" -o jsonpath="$cond" 2>/dev/null | grep -oE '[a-z0-9.-]+/[^ ,]+ in' | sed 's|/.*||' | sort -u); do
+              $k -n "$ns" get "$r" -o name | xargs -r -I{} $k -n "$ns" patch {} --type merge -p '{"metadata":{"finalizers":null}}'
+            done
+          done
+        }
         $k delete namespace --ignore-not-found --wait=false $nss
         end=$((SECONDS + {{ remove_timeout }}))
         for ns in $nss; do
           while $k get namespace "$ns" >/dev/null 2>&1; do
+            dead_webhooks
+            orphan_finalizers
             [ $SECONDS -ge $end ] && { echo "namespace $ns still terminating"; break; }
             sleep 5
           done
@@ -69,7 +114,8 @@
         rm -f /var/lib/rancher/k3s/server/manifests/dataplatform-argocd.yaml
         $k -n kube-system delete helmchart argo-cd --ignore-not-found --wait=true --timeout=300s
         $k delete namespace argocd --ignore-not-found --wait=true --timeout=300s
-        $k get crd -o name | grep -E 'argoproj\.io' | xargs -r $k delete --ignore-not-found
+        # no match on a second run: the status of grep must not fail the pipeline
+        $k get crd -o name | { grep -E 'argoproj\.io' || true; } | xargs -r $k delete --ignore-not-found
       args:
         executable: /bin/bash
       changed_when: true
@@ -139,41 +185,79 @@
           changed_when: true
           failed_when: false
 
-        - name: Delete the OIDC provider of the account
-          vars:
-            _idp: "{{ dataplatform_keycloak_issuer | regex_replace('^https?://', '') }}"
-          ansible.builtin.command: >-
-            cephadm shell -- radosgw-admin oidc-provider delete --account-id={{ dataplatform_rgw_account_id }}
-            --oidc-provider-arn=arn:aws:iam::{{ dataplatform_rgw_account_id }}:oidc-provider/{{ _idp }}
-          changed_when: true
+        # radosgw-admin has no OIDC provider commands (Squid): they go through
+        # the IAM API, as a root user of the account, a temporary one (the
+        # platform's own may be gone already, after a run that stopped later)
+        - name: The account
+          ansible.builtin.command: cephadm shell -- radosgw-admin account get --account-id={{ dataplatform_rgw_account_id }}
+          register: remove_account_info
+          changed_when: false
           failed_when: false
 
-        - name: Delete the service users with their buckets and data
-          ansible.builtin.command: cephadm shell -- radosgw-admin user rm --uid={{ item.uid }} --purge-data
-          loop: "{{ dataplatform_s3_users }}"
-          loop_control:
-            label: "{{ item.uid }}"
+        - name: A temporary root user of the account
+          ansible.builtin.command: >-
+            cephadm shell -- sh -c 'radosgw-admin user info --uid=dataplatform-remove 2>/dev/null
+            || radosgw-admin user create --uid=dataplatform-remove --display-name=dataplatform-remove
+            --account-id={{ dataplatform_rgw_account_id }} --account-root'
+          register: remove_tmp_user
+          when: remove_account_info.rc == 0
           changed_when: true
-          failed_when: false
+          no_log: true
+
+        - name: Delete the OIDC providers of the account
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_playbook_python }}"
+              - -c
+              - |
+                import os, boto3
+                iam = boto3.client("iam", endpoint_url=os.environ["IAM_ENDPOINT"], region_name=os.environ["IAM_REGION"])
+                for p in iam.list_open_id_connect_providers()["OpenIDConnectProviderList"]:
+                    iam.delete_open_id_connect_provider(OpenIDConnectProviderArn=p["Arn"])
+                    print("deleted", p["Arn"])
+          environment:
+            IAM_ENDPOINT: "{{ dataplatform_s3_endpoint }}"
+            IAM_REGION: "{{ dataplatform_s3_region }}"
+            AWS_ACCESS_KEY_ID: "{{ (remove_tmp_user.stdout | from_json)['keys'][0]['access_key'] }}"
+            AWS_SECRET_ACCESS_KEY: "{{ (remove_tmp_user.stdout | from_json)['keys'][0]['secret_key'] }}"
+          delegate_to: localhost
+          become: false
+          register: remove_oidc
+          when: remove_account_info.rc == 0
+          changed_when: "'deleted' in remove_oidc.stdout"
+          no_log: true                         # the key is in the environment
+
+        # The account owns its buckets (not a user): user rm --purge-data
+        # leaves them, and account rm refuses an account that still has one.
+        - name: Buckets of the account
+          ansible.builtin.command: cephadm shell -- radosgw-admin bucket stats
+          register: remove_buckets
+          changed_when: false
+
+        - name: Delete them with their objects
+          ansible.builtin.command: cephadm shell -- radosgw-admin bucket rm --bucket={{ item }} --purge-objects
+          loop: >-
+            {{ remove_buckets.stdout | from_json | selectattr('owner', 'equalto', dataplatform_rgw_account_id)
+               | map(attribute='bucket') | list }}
+          changed_when: true
+
+        - name: Delete the service users and the temporary root user
+          ansible.builtin.command: cephadm shell -- radosgw-admin user rm --uid={{ item }} --purge-data
+          loop: "{{ dataplatform_s3_users | map(attribute='uid') | list + ['dataplatform-remove'] }}"
+          register: remove_users
+          changed_when: remove_users.rc == 0
+          failed_when: remove_users.rc != 0 and 'does not exist' not in remove_users.stderr
 
         - name: Delete the account
           ansible.builtin.command: cephadm shell -- radosgw-admin account rm --account-id={{ dataplatform_rgw_account_id }}
-          changed_when: true
-          failed_when: false
-
-        - name: Delete the pipeline's key on this computer
-          ansible.builtin.file:
-            path: "{{ secrets_dir }}/{{ item }}"
-            state: absent
-          loop: [s3-iam-terraform.json, s3-iam-terraform.env]
-          delegate_to: localhost
-          become: false
+          register: remove_account
+          changed_when: remove_account.rc == 0
+          failed_when: remove_account.rc != 0 and 'No such file' not in remove_account.stderr   # gone already
 
     - name: What is left
       ansible.builtin.debug:
         msg: >-
-          {{ 'The RGW account of the platform, its users, bucket, roles and OIDC provider were removed '
-             ~ '(the GitLab state of subsystems/dataplatform/iam is stale: delete it in GitLab, or the next apply recreates every role).'
+          {{ 'The RGW account of the platform, its users, bucket (with its data), roles and OIDC provider were removed.'
              if remove_ceph_data | bool else
              'The RGW account with its users, bucket (and its data), roles and OIDC provider was kept: '
              ~ 'make dataplatform-remove ARGS="-e remove_confirm=yes -e remove_ceph_data=true" removes them. '

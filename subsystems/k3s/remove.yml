@@ -115,13 +115,17 @@
           changed_when: true
 
         - name: Delete the CephFS subvolume group (with every RWX volume in it)
-          ansible.builtin.shell: >-
-            set -o pipefail;
-            for sv in $(cephadm shell -- ceph fs subvolume ls {{ ceph_cephfs_name }} {{ k3s_ceph_cephfs_subvolumegroup }} --format json 2>/dev/null
-                        | python3 -c 'import sys,json; [print(s["name"]) for s in json.load(sys.stdin)]'); do
-              cephadm shell -- ceph fs subvolume rm {{ ceph_cephfs_name }} "$sv" {{ k3s_ceph_cephfs_subvolumegroup }} --force;
-            done;
-            cephadm shell -- ceph fs subvolumegroup rm {{ ceph_cephfs_name }} {{ k3s_ceph_cephfs_subvolumegroup }} --force
+          # A literal block: folded (>-), the more-indented "| python3" line kept
+          # its newline and bash refused a line starting with a pipe
+          ansible.builtin.shell: |
+            set -o pipefail
+            g="{{ ceph_cephfs_name }} {{ k3s_ceph_cephfs_subvolumegroup }}"
+            svs=$(cephadm shell -- ceph fs subvolume ls $g --format json 2>/dev/null |
+                  python3 -c 'import sys,json; [print(s["name"]) for s in json.load(sys.stdin)]')
+            for sv in $svs; do
+              cephadm shell -- ceph fs subvolume rm {{ ceph_cephfs_name }} "$sv" {{ k3s_ceph_cephfs_subvolumegroup }} --force
+            done
+            cephadm shell -- ceph fs subvolumegroup rm $g --force
           args:
             executable: /bin/bash
           changed_when: true

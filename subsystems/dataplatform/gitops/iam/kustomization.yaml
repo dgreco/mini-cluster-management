@@ -6,6 +6,8 @@ namespace: governance
 # metacatalog-grants). A fixed name: iam-sync lives in another Argo CD
 # Application, which a name hash would not reach; it re-reads the file on
 # every round, so a change needs no restart.
+resources:
+  - metacatalog-grants.yaml       # the record of grants Meta Catalog writes
 generatorOptions:
   disableNameSuffixHash: true
 configMapGenerator:
