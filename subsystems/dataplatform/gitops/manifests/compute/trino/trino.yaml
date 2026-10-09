@@ -3,11 +3,14 @@
 #   authenticates over HTTPS); the Gateway re-encrypts (trino-httproute.yaml).
 # - Login with Keycloak (trino-authentication.yaml); groups from the file
 #   provider (trino-group-provider.yaml + ConfigMap trino-iam from iam-sync).
-# - Data access is decided by Ceph RGW through the STS role of the user's
-#   group (trino-catalog-lakehouse.yaml). Trino's own file-based access
-#   control (rules.json, written by iam-sync from the catalog's schema
-#   locations) only keeps the catalog entries of a schema to the group whose
-#   bucket holds it: others may query, not drop, rename or create in it.
+# - Data access is decided by Ceph RGW through the STS role the S3 security
+#   mapping picks for the user and the file's directory: their own or a
+#   group's, from the grants authorized in Meta Catalog
+#   (trino-catalog-lakehouse.yaml). Trino's own file-based access control
+#   (rules.json, written by iam-sync from access.yaml's
+#   metacatalog.provisioner) allows schema and table DDL to Meta Catalog's
+#   provisioner only, nobody else, admins included; data statements to
+#   everyone: Ceph refuses the files their roles do not reach.
 apiVersion: trino.stackable.tech/v1alpha1
 kind: TrinoCluster
 metadata:
