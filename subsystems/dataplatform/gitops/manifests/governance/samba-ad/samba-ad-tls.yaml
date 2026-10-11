@@ -1,0 +1,59 @@
+# LDAPS of the domain controller: Samba refuses a password bind without TLS.
+# cert-manager keeps a certificate authority of the directory's own (ten
+# years) and the controller's certificate, named after its Service. Keycloak
+# trusts the authority (ca.crt of the Secret samba-ad-tls, mounted alone into
+# its truststore: keycloak.yaml), never the key. cert-manager renews the
+# certificate two months before its end; Samba reads it at its start, so the
+# controller's liveness probe (ad-healthy) restarts it once on a renewal.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: samba-ad-selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: samba-ad-ca
+spec:
+  isCA: true
+  commonName: samba-ad-ca
+  secretName: samba-ad-ca
+  duration: 87600h
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  issuerRef:
+    name: samba-ad-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: samba-ad-ca
+spec:
+  ca:
+    secretName: samba-ad-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: samba-ad-tls
+spec:
+  secretName: samba-ad-tls
+  commonName: samba-ad.governance.svc
+  dnsNames:
+    - samba-ad
+    - samba-ad.governance
+    - samba-ad.governance.svc
+    - samba-ad.governance.svc.cluster.local
+  usages: [server auth]
+  duration: 8760h
+  renewBefore: 1440h
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  issuerRef:
+    name: samba-ad-ca
+    kind: Issuer

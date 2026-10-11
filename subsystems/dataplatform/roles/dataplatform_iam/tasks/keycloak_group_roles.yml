@@ -1,6 +1,7 @@
 ---
-# Client roles of one group of realm-import.yaml (dataplatform_iam_group):
-# add the missing ones (e.g. the admin group -> realm-management realm-admin).
+# Client roles of one group of the realm (dataplatform_iam_group: name and
+# clientRoles): add the missing ones (the admin group -> realm-management
+# realm-admin). The group comes from the directory: it is there after a sync.
 - name: Group {{ dataplatform_iam_group.name }}
   ansible.builtin.uri:
     url: "{{ dataplatform_iam_kc_api }}/groups?search={{ dataplatform_iam_group.name | urlencode }}&exact=true&briefRepresentation=true"

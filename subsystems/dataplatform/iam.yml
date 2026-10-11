@@ -1,8 +1,11 @@
 ---
-# The IAM model: Keycloak realm converged from Git, Ceph RGW trusting it with
-# one STS role and bucket per Keycloak group, OpenBao logins through Keycloak,
-# the GitLab trigger token the cluster starts the hourly IAM pipeline with.
-# Re-run after adding a group in Keycloak (make dataplatform-iam).
+# The IAM model (make dataplatform-iam): the Keycloak realm converged from Git,
+# its people and groups read from the directory (Samba AD) through a user
+# federation, Ceph RGW trusting the realm, the platform's own STS roles, the
+# catalog's logins, OpenBao logins through Keycloak. A new group or a changed
+# membership in the directory needs no run of this. A realm that still holds
+# users of its own (before the directory): once,
+#   make dataplatform-iam ARGS="-e dataplatform_iam_adopt_directory=true"
 - name: Identity and access
   hosts: "{{ groups['ceph_mons'][0] }}"
   gather_facts: false

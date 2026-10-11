@@ -288,8 +288,25 @@ dataplatform-pg-restore: ## REPLACE a PostgreSQL cluster by its backups (downtim
 ##> make dataplatform-pg-restore ARGS="-e pg_cluster=metacatalog-db -e restore_confirm=yes"
 ##> make dataplatform-pg-restore ARGS="-e pg_cluster=all -e restore_confirm=yes"   Keycloak last
 
+.PHONY: dataplatform-directory-restore-check
+dataplatform-directory-restore-check: ## Test the directory's backups: back up now, restore in a scratch pod, compare (changes nothing)
+	$(call playbook,subsystems/dataplatform/directory-restore.yml) -e directory_mode=check
+##> make dataplatform-directory-restore-check ARGS="-e directory_backup=samba-ad-20261011T034500Z.tar.bz2"   an older backup
+
+.PHONY: dataplatform-directory-restore
+dataplatform-directory-restore: ## REPLACE the directory (users, groups) by its newest backup (no password logins meanwhile)
+	$(call countdown,this empties the directory and fills it from a backup: users and groups made since are lost.)
+	$(call playbook,subsystems/dataplatform/directory-restore.yml) -e directory_mode=replace
+##> make dataplatform-directory-restore ARGS="-e restore_confirm=yes"
+##> make dataplatform-directory-restore ARGS="-e restore_confirm=yes -e directory_backup=<name>"   a chosen backup
+
+.PHONY: dataplatform-samba-image
+dataplatform-samba-image: ## Build and push the Samba AD image (images/samba-ad) for arm64 and amd64; prints the digest to pin
+	@subsystems/dataplatform/files/dp-samba-image.sh $(ARGS)
+##> make dataplatform-samba-image ARGS="4.25.0-2"
+
 .PHONY: dataplatform-remove
-dataplatform-remove: ## REMOVE the data platform and its data (databases, OpenBao, Keycloak, metrics, logs)
+dataplatform-remove: ## REMOVE the data platform and its data (databases, OpenBao, Keycloak, the directory, metrics, logs)
 	$(call countdown,this removes the data platform with its databases, secrets and Keycloak realm.)
 	$(call playbook,subsystems/dataplatform/remove.yml)
 ##> make dataplatform-remove ARGS="-e remove_confirm=yes"
@@ -298,6 +315,15 @@ dataplatform-remove: ## REMOVE the data platform and its data (databases, OpenBa
 .PHONY: dataplatform-kubeconfig
 dataplatform-kubeconfig: ## Kubeconfig that logs in to Kubernetes with Keycloak (.secrets/kubeconfig-oidc.yaml)
 	$(call playbook,subsystems/dataplatform/kubeconfig.yml)
+
+.PHONY: dataplatform-directory
+dataplatform-directory: ## Users and groups (the directory, Samba AD): list, add, password, disable, remove, join, leave
+	@subsystems/dataplatform/files/dp-directory.sh $(ARGS)
+##> make dataplatform-directory ARGS="user list"
+##> make dataplatform-directory ARGS="user add alice --given-name Alice --surname Rossi --mail alice@example.com --group <group>"   asks for the password
+##> make dataplatform-directory ARGS="group join <group> alice"
+##> make dataplatform-directory ARGS="user disable alice"         no login from now on; remove deletes the account
+##> make dataplatform-directory ARGS="group add <group>"          in Keycloak within a minute
 
 .PHONY: dataplatform-s3-login
 dataplatform-s3-login: ## Temporary S3 keys of your Keycloak group (single sign-on + STS) in .secrets/sso-<you>.env

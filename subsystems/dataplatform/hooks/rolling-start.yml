@@ -1,7 +1,8 @@
 ---
 # Task-file hook included once by cluster/rolling-reboot.yml before the first
 # node: refuse to start unless the data platform is healthy (every Argo CD
-# Application Healthy, OpenBao 3/3 unsealed, Keycloak ready). Nothing to check
+# Application Healthy, OpenBao 3/3 unsealed, Keycloak ready, the directory's
+# domain controller ready, where there is one). Nothing to check
 # when the platform is not installed.
 - name: Is the data platform installed?
   ansible.builtin.command: /usr/local/bin/k3s kubectl get namespace argocd -o name
@@ -22,8 +23,11 @@
               | grep -v '=Healthy$' || true)
         bao=$($k -n {{ dataplatform_openbao_namespace }} get statefulset openbao -o 'jsonpath={.status.readyReplicas}/{.spec.replicas}')
         kc=$($k -n governance get keycloak keycloak -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}')
-        echo "not healthy: ${bad:-none}; openbao ready ${bao}; keycloak ready ${kc}"
-        [ -z "$bad" ] && [ "$bao" = 3/3 ] && [ "$kc" = True ]
+        # empty where the directory is not deployed (yet)
+        ad=$($k -n {{ dataplatform_directory_namespace }} get statefulset samba-ad \
+             -o 'jsonpath={.status.readyReplicas}/{.spec.replicas}' 2>/dev/null || true)
+        echo "not healthy: ${bad:-none}; openbao ready ${bao}; keycloak ready ${kc}; directory ready ${ad:-none}"
+        [ -z "$bad" ] && [ "$bao" = 3/3 ] && [ "$kc" = True ] && { [ -z "$ad" ] || [ "$ad" = 1/1 ]; }
       args:
         executable: /bin/bash
       delegate_to: "{{ groups['k3s_servers'][0] }}"

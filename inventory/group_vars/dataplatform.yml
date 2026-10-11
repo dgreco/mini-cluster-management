@@ -45,6 +45,46 @@ dataplatform_keycloak_realm: "{{ site_keycloak_realm }}"
 dataplatform_keycloak_url: https://keycloak.{{ dataplatform_domain }}
 dataplatform_keycloak_issuer: "{{ dataplatform_keycloak_url }}/realms/{{ dataplatform_keycloak_realm }}"
 
+# ---------------------------------------------------------------- directory ----
+# People and groups are kept in one place, the Samba Active Directory domain
+# governance/samba-ad (one domain controller, reachable inside the cluster
+# only). Keycloak reads them from it over LDAPS and writes every change back
+# (make dataplatform-iam creates that federation), so they are managed in the
+# Keycloak console, where people also change their own password;
+# make dataplatform-directory is the command line beside it. Two
+# organizational units hold them; the accounts Samba needs and Keycloak's
+# bind account are elsewhere, so they never show up in Keycloak, and the bind
+# account may write in those two units only.
+dataplatform_directory_domain: "{{ site_ad_domain }}"                  # AD DNS domain; its Kerberos realm in capitals
+dataplatform_directory_netbios_domain: "{{ site_ad_netbios_domain }}"
+dataplatform_directory_base_dn: "DC={{ dataplatform_directory_domain.split('.') | join(',DC=') }}"
+dataplatform_directory_people_ou: People
+dataplatform_directory_groups_ou: Groups
+dataplatform_directory_services_ou: Services
+dataplatform_directory_bind_user: keycloak-bind      # Keycloak's account in the directory: full control of the two units, nothing else
+# Shortest password the directory and the realm's policy take; both also want
+# capitals, small letters and digits
+dataplatform_directory_min_password_length: 12
+# The domain controller, as Keycloak reaches it (the certificate names it)
+dataplatform_directory_url: ldaps://samba-ad.governance.svc:636
+dataplatform_directory_namespace: governance
+dataplatform_directory_pod: samba-ad-0
+# Groups the domain controller creates when they are missing, and the first
+# user (in the admin group, with the password of governance/platform-admin)
+dataplatform_directory_seed_groups: ["{{ site_admin_group }}", "{{ site_engineer_group }}", "{{ site_analyst_group }}"]
+dataplatform_directory_first_admin: "{{ dataplatform_openbao_generated['governance/platform-admin'].username }}"
+# Keycloak's side (the user federation samba-ad of the realm). New groups and
+# changed users arrive with the next changed-users sync; a group's members
+# are read from the directory at every question, and a user's groups stay in
+# Keycloak's cache for at most the lifespan below (s).
+dataplatform_directory_federation: samba-ad
+dataplatform_directory_changed_sync_period: 60
+dataplatform_directory_full_sync_period: 3600
+dataplatform_directory_cache_lifespan: 300
+# Backups (the CronJob governance/samba-ad-backup): where, and how many stay
+dataplatform_directory_backup_prefix: samba-ad/
+dataplatform_directory_backup_keep: 14
+
 # ---------------------------------------------------------------- storage ----
 dataplatform_storage_class: "{{ site_rbd_storage_class }}"
 
@@ -224,7 +264,8 @@ dataplatform_openbao_generated:
   governance/keycloak-admin: {username: temp-admin, password: null}      # master realm bootstrap admin
   governance/keycloak-clients: {argocd: null, grafana: null, openbao: null, trino: null, jupyterhub: null, iam-sync: null, smoke-test: null, ansible: null,
                                 s3browser: null, vmui: null, metacatalog: null, metacatalog-provisioner: null}
-  governance/platform-admin: {username: admin, password: null}           # first user of the realm (in the admin group)
+  governance/platform-admin: {username: admin, password: null}           # first user of the directory (in the admin group)
+  governance/samba-ad: {admin-password: null, bind-password: null}       # the domain's Administrator; the account Keycloak manages the directory as
   governance/iceberg-catalog-db: {username: iceberg, password: null}
   governance/iceberg-catalog-spark: {username: spark_writer, password: null}   # the Spark jobs' catalog login (no DDL)
   governance/metacatalog-db: {username: metacatalog, password: null}  # owner of Meta Catalog's database

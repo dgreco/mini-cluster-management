@@ -1,0 +1,394 @@
+---
+# People and groups are kept in the directory (Samba AD, governance/samba-ad)
+# and nowhere else. This makes and keeps the realm's user federation
+# (dataplatform_directory_federation): Keycloak reads the two organizational
+# units over LDAPS as the bind account and writes every change back, so the
+# Keycloak console is where people are managed, and a user made there is made
+# in the directory.
+# - It is created through the admin API, never by the realm import: Keycloak
+#   starts a federation's periodic sync when one is made or its periods change
+#   through the API (and at its own start), not for a realm the operator's
+#   import Job wrote into the database.
+# - Only this one component (by type and name) and its mappers are touched;
+#   the realm's key providers are components too, and are never managed.
+# - The bind password is sent when the component is made, and again only when
+#   Keycloak's own test says the stored one is refused: the API returns it
+#   masked, and a masked value sent back keeps the stored one.
+# - A user the realm holds itself (no federation link) is refused: with
+#   -e dataplatform_iam_adopt_directory=true those the directory has under the
+#   same name are deleted here and come back from it (a new Keycloak id; the
+#   user name, which is what the platform's roles and tools go by, stays).
+#   Keycloak cannot link an existing user to the directory.
+# Needs dataplatform_iam_kc_api and the OpenBao client (keycloak.yml).
+
+# ---------------------------------------------------------------- the directory ----
+- name: The domain controller answers
+  ansible.builtin.shell: |
+    set -o pipefail
+    k="/usr/local/bin/k3s kubectl -n {{ dataplatform_directory_namespace }}"
+    end=$((SECONDS + {{ dataplatform_iam_keycloak_timeout }}))
+    until [ "$($k get pod {{ dataplatform_directory_pod }} -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ]; do
+      if [ $SECONDS -ge $end ]; then
+        echo "the domain controller {{ dataplatform_directory_namespace }}/{{ dataplatform_directory_pod }} is not Ready (make dataplatform-status)" >&2
+        exit 1
+      fi
+      sleep 10
+    done
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: false
+
+- name: What the directory holds
+  ansible.builtin.command: >-
+    /usr/local/bin/k3s kubectl -n {{ dataplatform_directory_namespace }} exec {{ dataplatform_directory_pod }} -c samba --
+    adctl inventory
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_directory_raw
+  changed_when: false
+
+- name: The directory's users and groups
+  ansible.builtin.set_fact:
+    dataplatform_iam_directory: "{{ dataplatform_iam_directory_raw.stdout | from_json }}"
+
+- name: The directory has the platform's admin groups
+  ansible.builtin.assert:
+    that: dataplatform_iam_admin_groups | difference(dataplatform_iam_directory['groups'].keys()) | length == 0
+    fail_msg: >-
+      The directory lacks {{ dataplatform_iam_admin_groups | difference(dataplatform_iam_directory['groups'].keys()) | join(', ') }}:
+      make dataplatform-directory ARGS="group add <name>"
+    quiet: true
+
+# Keycloak reads conf/truststores at its start: the pods must carry the
+# directory's certificate authority (keycloak.yaml) before the first bind.
+- name: Keycloak's pods carry the directory's certificate authority
+  ansible.builtin.shell: |
+    set -o pipefail
+    k="/usr/local/bin/k3s kubectl -n {{ dataplatform_iam_keycloak_namespace }}"
+    end=$((SECONDS + {{ dataplatform_iam_keycloak_timeout }}))
+    while :; do
+      mounts=$($k get statefulset keycloak -o 'jsonpath={.spec.template.spec.containers[0].volumeMounts[*].name}' 2>/dev/null || true)
+      case " $mounts " in *" samba-ad-ca "*) break ;; esac
+      if [ $SECONDS -ge $end ]; then
+        echo "Keycloak's StatefulSet does not mount samba-ad-ca (mounts: $mounts): make dataplatform-sync" >&2
+        exit 1
+      fi
+      sleep 10
+    done
+    # every pod restarted with it (the operator rolls them one at a time)
+    $k rollout status statefulset keycloak --timeout=$((end - SECONDS > 60 ? end - SECONDS : 60))s >/dev/null
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: false
+
+- name: The bind account's password (OpenBao)
+  ansible.builtin.uri:
+    url: "{{ dataplatform_openbao_addr }}/v1/secret/data/dataplatform/governance/samba-ad"
+    headers: {X-Vault-Token: "{{ dataplatform_openbao_token }}"}
+  delegate_to: "{{ groups['k3s_servers'][0] }}"
+  register: dataplatform_iam_fed_kv
+  no_log: true
+
+# ---------------------------------------------------------------- the federation ----
+- name: Admin token
+  ansible.builtin.include_tasks: keycloak_token.yml
+
+- name: User federations of the realm
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/components?type=org.keycloak.storage.UserStorageProvider"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_fed_lookup
+
+- name: The federation as it is and as it should be
+  ansible.builtin.set_fact:
+    dataplatform_iam_fed_current: >-
+      {{ dataplatform_iam_fed_lookup.json | selectattr('name', 'equalto', dataplatform_directory_federation)
+         | selectattr('providerId', 'equalto', 'ldap') | list }}
+    # the API's form of a component's settings: every value a list of one string
+    dataplatform_iam_fed_wanted: >-
+      {%- set out = {} -%}
+      {%- for k, v in dataplatform_iam_federation_config.items() -%}
+      {%- set _ = out.update({k: [v | string]}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+# Groups the directory lacks are dropped from Keycloak at every sync: before
+# the first one, nothing of the realm may be lost that way.
+- name: Groups of the realm before its first sync with the directory
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/groups?briefRepresentation=true&max=1000"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_fed_groups_before
+  when: dataplatform_iam_fed_current | length == 0
+
+- name: Every group of the realm is in the directory
+  ansible.builtin.assert:
+    that: _only_here | length == 0
+    fail_msg: >-
+      The realm has groups the directory lacks: {{ _only_here | join(', ') }}. The first sync would delete them from
+      Keycloak: create each in the directory (make dataplatform-directory ARGS="group add <name>") or delete it in
+      Keycloak, then run this again.
+    quiet: true
+  vars:
+    _only_here: >-
+      {{ dataplatform_iam_fed_groups_before.json | map(attribute='name')
+         | difference(dataplatform_iam_directory['groups'].keys()) }}
+  when: dataplatform_iam_fed_current | length == 0
+
+- name: Create the user federation {{ dataplatform_directory_federation }}
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/components"
+    method: POST
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body:
+      name: "{{ dataplatform_directory_federation }}"
+      providerId: ldap
+      providerType: org.keycloak.storage.UserStorageProvider
+      config: "{{ dataplatform_iam_fed_wanted | combine({'bindCredential': [dataplatform_iam_fed_kv.json.data.data['bind-password']]}) }}"
+    status_code: [201]
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  when: dataplatform_iam_fed_current | length == 0
+  changed_when: true
+  no_log: true
+
+# Fields of ours win; what Keycloak keeps beside them (the masked credential,
+# the time of the last sync) goes back as it came.
+- name: Update the user federation where it differs
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/components/{{ _current.id }}"
+    method: PUT
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: "{{ _current | combine({'config': _current.config | combine(dataplatform_iam_fed_wanted)}) }}"
+    status_code: [204]
+  vars:
+    _current: "{{ dataplatform_iam_fed_current[0] }}"
+  when:
+    - dataplatform_iam_fed_current | length > 0
+    - _current.config | combine(dataplatform_iam_fed_wanted) != _current.config
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+
+- name: The user federation
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/components?type=org.keycloak.storage.UserStorageProvider"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_fed_lookup
+
+- name: Its id
+  ansible.builtin.set_fact:
+    dataplatform_iam_fed_id: >-
+      {{ (dataplatform_iam_fed_lookup.json | selectattr('name', 'equalto', dataplatform_directory_federation)
+          | selectattr('providerId', 'equalto', 'ldap') | first).id }}
+
+# ---------------------------------------------------------------- its mappers ----
+- name: Admin token
+  ansible.builtin.include_tasks: keycloak_token.yml
+
+# Keycloak adds its defaults for Active Directory when a federation is made
+# (a full-name mapper, a Kerberos one): the list of ours is the whole list.
+- name: Mappers of the federation
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/components?parent={{ dataplatform_iam_fed_id }}&type=org.keycloak.storage.ldap.mappers.LDAPStorageMapper"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_fed_mappers
+
+# One entry per mapper of ours: {name, providerId, config (lists), current: the mapper there or none}
+- name: Mappers to create or update
+  ansible.builtin.set_fact:
+    dataplatform_iam_fed_mapper_work: >-
+      {%- set out = [] -%}
+      {%- for name, m in dataplatform_iam_federation_mappers.items() -%}
+      {%- set config = {} -%}
+      {%- for k, v in (m.config | default({})).items() -%}{%- set _ = config.update({k: [v | string]}) -%}{%- endfor -%}
+      {%- set cur = dataplatform_iam_fed_mappers.json | selectattr('name', 'equalto', name) | list -%}
+      {%- set _ = out.append({'name': name, 'providerId': m.providerId, 'config': config, 'current': cur[0] if cur else none}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: Create the missing mappers
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/components"
+    method: POST
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body:
+      name: "{{ item.name }}"
+      providerId: "{{ item.providerId }}"
+      providerType: org.keycloak.storage.ldap.mappers.LDAPStorageMapper
+      parentId: "{{ dataplatform_iam_fed_id }}"
+      config: "{{ item.config }}"
+    status_code: [201]
+  loop: "{{ dataplatform_iam_fed_mapper_work | selectattr('current', 'none') }}"
+  loop_control:
+    label: "{{ item.name }}"
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+
+- name: Update the mappers that differ
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/components/{{ item.current.id }}"
+    method: PUT
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: >-
+      {{ item.current | combine({'providerId': item.providerId,
+                                 'config': (item.current.config | default({})) | combine(item.config)}) }}
+    status_code: [204]
+  loop: "{{ dataplatform_iam_fed_mapper_work | rejectattr('current', 'none') }}"
+  loop_control:
+    label: "{{ item.name }}"
+  # Keycloak adds defaults to a mapper's settings: only the keys of ours count.
+  when: >-
+    item.current.providerId != item.providerId
+    or (item.current.config | default({})) | combine(item.config) != item.current.config | default({})
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+
+- name: Delete the mappers that are not ours
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/components/{{ item.id }}"
+    method: DELETE
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    status_code: [204]
+  loop: "{{ dataplatform_iam_fed_mappers.json | rejectattr('name', 'in', dataplatform_iam_federation_mappers.keys()) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+
+# ---------------------------------------------------------------- the bind ----
+- name: Admin token
+  ansible.builtin.include_tasks: keycloak_token.yml
+
+- name: Keycloak binds to the directory with the password it holds
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/testLDAPConnection"
+    method: POST
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: "{{ dataplatform_iam_fed_test }}"
+    status_code: [204, 400]
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_fed_bind
+
+- name: Give Keycloak the bind account's password (the one it holds is refused)
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/components/{{ dataplatform_iam_fed_id }}"
+    method: PUT
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: >-
+      {{ _current | combine({'config': _current.config
+                             | combine({'bindCredential': [dataplatform_iam_fed_kv.json.data.data['bind-password']]})}) }}
+    status_code: [204]
+  vars:
+    _current: "{{ dataplatform_iam_fed_lookup.json | selectattr('id', 'equalto', dataplatform_iam_fed_id) | first }}"
+  when:
+    - dataplatform_iam_fed_bind.status == 400
+    - dataplatform_iam_fed_bind.json.errorMessage | default('') == 'AuthenticationFailure'
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+  no_log: true
+
+- name: Keycloak binds to the directory with the password of OpenBao
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/testLDAPConnection"
+    method: POST
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    body_format: json
+    body: "{{ dataplatform_iam_fed_test }}"
+    status_code: [204, 400]
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_fed_bind_again
+  when: dataplatform_iam_fed_bind.status == 400
+
+- name: The bind works
+  ansible.builtin.assert:
+    that: _bind.status == 204
+    fail_msg: >-
+      Keycloak cannot bind to {{ dataplatform_directory_url }} as {{ dataplatform_iam_federation_config.bindDn }}:
+      {{ _bind.json.errorMessage | default('no answer') }}. AuthenticationFailure: the domain controller
+      holds another password than OpenBao governance/samba-ad (it reads it at its start: restart the pod
+      {{ dataplatform_directory_pod }}). CommunicationError: the controller is down, or Keycloak does not trust its
+      certificate (kubectl -n governance logs keycloak-0).
+    quiet: true
+  vars:
+    _bind: "{{ dataplatform_iam_fed_bind if dataplatform_iam_fed_bind_again is skipped else dataplatform_iam_fed_bind_again }}"
+
+# ---------------------------------------------------------------- only the directory's people ----
+- name: Admin token
+  ansible.builtin.include_tasks: keycloak_token.yml
+
+# Service-account users are not in this listing (Keycloak keeps them out of it)
+- name: Users of the realm
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/users?briefRepresentation=true&max=1000"
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_fed_users
+
+- name: The users the realm holds itself
+  ansible.builtin.set_fact:
+    dataplatform_iam_fed_local: >-
+      {%- set out = [] -%}
+      {%- for u in dataplatform_iam_fed_users.json if not u.federationLink | default('', true) -%}
+      {%- set _ = out.append({'id': u.id, 'username': u.username}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: Every user of the realm comes from the directory
+  ansible.builtin.assert:
+    that: >-
+      dataplatform_iam_fed_local | length == 0
+      or (dataplatform_iam_adopt_directory | bool and _unknown | length == 0)
+    fail_msg: >-
+      The realm holds users of its own: {{ dataplatform_iam_fed_local | map(attribute='username') | join(', ') }}.
+      The directory is the only source of people.
+      {{ ('Not in the directory: ' ~ (_unknown | join(', ')) ~ ': create them there (make dataplatform-directory ARGS="user add
+      <name> --given-name ... --surname ... --mail ...") or delete them in Keycloak. ') if _unknown | length > 0 else '' }}Then
+      make dataplatform-iam ARGS="-e dataplatform_iam_adopt_directory=true" deletes the realm's own copy of each (its
+      sessions end) and brings the directory's in, under the same user name.
+    quiet: true
+  vars:
+    _unknown: >-
+      {{ dataplatform_iam_fed_local | map(attribute='username')
+         | difference(dataplatform_iam_directory['users'] | map(attribute='name')) }}
+
+- name: Delete the realm's own copy of the users the directory has
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/users/{{ item.id }}"
+    method: DELETE
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+    status_code: [204]
+  loop: "{{ dataplatform_iam_fed_local }}"
+  loop_control:
+    label: "{{ item.username }}"
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  changed_when: true
+
+# ---------------------------------------------------------------- sync ----
+# People are found at their first login anyway; groups reach Keycloak only
+# through a sync, and iam-sync applies nothing before it has seen one.
+- name: Sync the realm with the directory
+  ansible.builtin.uri:
+    url: "{{ dataplatform_iam_kc_api }}/user-storage/{{ dataplatform_iam_fed_id }}/sync?action=triggerFullSync"
+    method: POST
+    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+  delegate_to: "{{ dataplatform_iam_kc_host }}"
+  register: dataplatform_iam_fed_sync
+  changed_when: dataplatform_iam_fed_sync.json.added | default(0) > 0 or dataplatform_iam_fed_sync.json.removed | default(0) > 0
+
+- name: The sync left nobody out
+  ansible.builtin.assert:
+    that: dataplatform_iam_fed_sync.json.failed | default(0) == 0
+    fail_msg: >-
+      Keycloak could not take every user of the directory: {{ dataplatform_iam_fed_sync.json.status | default('') }}
+      (kubectl -n governance logs keycloak-0)
+    success_msg: "Directory: {{ dataplatform_iam_fed_sync.json.status | default('') }}"

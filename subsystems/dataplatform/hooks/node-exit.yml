@@ -1,8 +1,9 @@
 ---
 # Task-file hook included by cluster/rolling-reboot.yml for each node after the
 # k3s exit hook: return only once the data platform is whole again (OpenBao
-# 3/3 unsealed, Keycloak ready, every CloudNativePG cluster with all its
-# instances, every Argo CD Application Healthy), so the next node can go.
+# 3/3 unsealed, Keycloak ready, the directory's domain controller ready, every
+# CloudNativePG cluster with all its instances, every Argo CD Application
+# Healthy), so the next node can go.
 - name: Find a k3s server that answers
   ansible.builtin.include_tasks: ../../k3s/hooks/pick-server.yml
   when: inventory_hostname in groups['k3s'] | default([])
@@ -31,9 +32,14 @@
       kc=$($k -n governance get keycloak keycloak -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}')
       pg=$($k get clusters.postgresql.cnpg.io -A -o 'jsonpath={range .items[*]}{.metadata.name}={.status.readyInstances}/{.spec.instances}{"\n"}{end}' \
            | awk -F'[=/]' '$2 != $3')
-      [ -z "$bad" ] && [ "$bao" = 3/3 ] && [ "$kc" = True ] && [ -z "$pg" ] && exit 0
+      # the one domain controller moves with its volume when its node drains;
+      # empty where the directory is not deployed (yet)
+      ad=$($k -n {{ dataplatform_directory_namespace }} get statefulset samba-ad \
+           -o 'jsonpath={.status.readyReplicas}/{.spec.replicas}' 2>/dev/null || true)
+      [ -z "$bad" ] && [ "$bao" = 3/3 ] && [ "$kc" = True ] && [ -z "$pg" ] && { [ -z "$ad" ] || [ "$ad" = 1/1 ]; } && exit 0
       if [ $SECONDS -ge $end ]; then
-        echo "not recovered after {{ dataplatform_recover_timeout }} s: apps ${bad:-ok}; openbao $bao; keycloak $kc; postgres ${pg:-ok}" >&2
+        echo "not recovered after {{ dataplatform_recover_timeout }} s: apps ${bad:-ok}; openbao $bao; keycloak $kc;" \
+             "directory ${ad:-none}; postgres ${pg:-ok}" >&2
         exit 1
       fi
       sleep 15

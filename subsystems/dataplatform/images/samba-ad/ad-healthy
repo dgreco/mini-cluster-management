@@ -1,0 +1,8 @@
+#!/bin/bash
+# Liveness of the domain controller: LDAPS answers, and the certificate it
+# serves is the one mounted. cert-manager renews the certificate in the
+# Secret, Samba reads it only at its start: failing here makes the kubelet
+# restart the container, which then serves the new one.
+tls=${AD_TLS_DIR:-/run/secrets/samba-ad-tls}
+cmp -s "$tls/tls.crt" /run/samba-ad/tls/tls.crt || { echo "the certificate changed: a restart serves the new one"; exit 1; }
+timeout 5 bash -c '</dev/tcp/127.0.0.1/636' 2>/dev/null || { echo "nothing listens on 636"; exit 1; }

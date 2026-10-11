@@ -1,0 +1,218 @@
+---
+# The directory (Samba AD, governance/samba-ad) from its backups,
+# s3://<backup bucket>/<dataplatform_directory_backup_prefix> (the CronJob
+# governance/samba-ad-backup; ad-backup and ad-restore of the controller's
+# image do the work).
+#
+#   make dataplatform-directory-restore-check
+#     takes a backup now, restores it in a scratch pod and compares what it
+#     holds (users, groups, memberships) with the live directory: changes
+#     nothing but the new backup, the drill to run now and then.
+#     ARGS="-e directory_backup=samba-ad-20261011T034500Z.tar.bz2" restores
+#     that backup instead and lists where it differs from today.
+#   make dataplatform-directory-restore ARGS="-e restore_confirm=yes [-e directory_backup=<name>]"
+#     REPLACES the directory by the newest backup (or the named one): the
+#     controller stops, its volume is emptied and filled from the backup, and
+#     it starts again as the next controller name (dc1 -> dc2: Samba restores
+#     a domain only under a new one). Nobody logs in with a password
+#     meanwhile (a few minutes); users and groups made after the backup are
+#     gone. Every user keeps their id, so Keycloak's copies stay linked. A
+#     failed run starts over when run again. Run make dataplatform-iam after.
+- name: Restore the directory from its backups
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  vars:
+    directory_restore_mode: "{{ directory_mode | default('check') }}"
+    directory_restore_object: "{{ directory_backup | default('') }}"
+    directory_restore_k: "/usr/local/bin/k3s kubectl -n {{ dataplatform_directory_namespace }}"
+    directory_restore_app: governance-samba-ad
+    directory_restore_helper: "samba-ad-restore-{{ directory_restore_mode }}"
+  tasks:
+    - name: Replacing needs -e restore_confirm=yes
+      ansible.builtin.assert:
+        that: directory_restore_mode != 'replace' or (restore_confirm | default('')) == 'yes'
+        fail_msg: >-
+          This empties the directory's volume and fills it from a backup.
+          Run: make dataplatform-directory-restore ARGS="-e restore_confirm=yes"
+        quiet: true
+
+    - name: The domain controller, as it is deployed
+      ansible.builtin.command: "{{ directory_restore_k }} get statefulset samba-ad -o json"
+      register: directory_restore_sts_raw
+      changed_when: false
+
+    # The helper is the controller's own container (image, settings, rights)
+    # with another command; the volume only when replacing.
+    - name: The helper pod's definition
+      ansible.builtin.set_fact:
+        directory_restore_pod:
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: "{{ directory_restore_helper }}"
+            namespace: "{{ dataplatform_directory_namespace }}"
+            labels: {app.kubernetes.io/name: samba-ad-restore}
+          spec:
+            restartPolicy: Never
+            automountServiceAccountToken: false
+            enableServiceLinks: false
+            securityContext: "{{ _spec.securityContext | default({}) }}"
+            containers:
+              - name: restore
+                image: "{{ _c.image }}"
+                command: "{{ ['ad-restore', 'replace'] + ([directory_restore_object] if directory_restore_object else [])
+                             if directory_restore_mode == 'replace' else ['sleep', '3600'] }}"
+                env: "{{ _c.env }}"
+                resources: "{{ _c.resources }}"
+                securityContext: "{{ _c.securityContext }}"
+                volumeMounts: >-
+                  {{ [{'name': 'run', 'mountPath': '/run/samba-ad'},
+                      {'name': 'backup-s3', 'mountPath': '/run/secrets/backup-s3', 'readOnly': true}]
+                     + ([{'name': 'data', 'mountPath': '/var/lib/samba'}] if directory_restore_mode == 'replace' else []) }}
+            volumes: >-
+              {{ [{'name': 'run', 'emptyDir': {'medium': 'Memory'}},
+                  {'name': 'backup-s3', 'secret': {'secretName': 'backup-s3'}}]
+                 + ([{'name': 'data', 'persistentVolumeClaim': {'claimName': 'data-' ~ dataplatform_directory_pod}}]
+                    if directory_restore_mode == 'replace' else []) }}
+      vars:
+        _spec: "{{ (directory_restore_sts_raw.stdout | from_json).spec.template.spec }}"
+        _c: "{{ _spec.containers[0] }}"
+
+    # ---------------------------------------------------------------- check ----
+    - name: Drill
+      when: directory_restore_mode == 'check'
+      block:
+        - name: A backup now
+          ansible.builtin.command: "{{ directory_restore_k }} exec {{ dataplatform_directory_pod }} -c samba -- ad-backup"
+          register: directory_restore_fresh
+          changed_when: true
+          when: not directory_restore_object
+
+        - name: What the live directory holds
+          ansible.builtin.command: "{{ directory_restore_k }} exec {{ dataplatform_directory_pod }} -c samba -- adctl inventory"
+          register: directory_restore_live
+          changed_when: false
+
+        - name: Scratch pod
+          ansible.builtin.shell: |
+            set -o pipefail
+            {{ directory_restore_k }} delete pod {{ directory_restore_helper }} --ignore-not-found --wait=true >/dev/null
+            {{ directory_restore_k }} apply -f - >/dev/null
+            {{ directory_restore_k }} wait --for=condition=Ready pod/{{ directory_restore_helper }} --timeout=300s >/dev/null
+          args:
+            executable: /bin/bash
+            stdin: "{{ directory_restore_pod | to_json }}"
+          changed_when: true
+
+        - name: Restore the backup in the scratch pod
+          ansible.builtin.command: >-
+            {{ directory_restore_k }} exec {{ directory_restore_helper }} -- ad-restore check {{ directory_restore_object }}
+          register: directory_restore_checked
+          changed_when: false
+
+        - name: What the backup holds against the live directory
+          ansible.builtin.set_fact:
+            directory_restore_diff: >-
+              {%- set out = [] -%}
+              {%- for kind in ['users', 'groups'] -%}
+              {%- set b = _backup[kind] if kind == 'groups' else dict(_backup[kind] | map(attribute='name') | zip(_backup[kind])) -%}
+              {%- set l = _live[kind] if kind == 'groups' else dict(_live[kind] | map(attribute='name') | zip(_live[kind])) -%}
+              {%- for name in (b.keys() | list + l.keys() | list) | unique | sort -%}
+              {%- if name not in b -%}{%- set _ = out.append(kind[:-1] ~ ' ' ~ name ~ ': only in the live directory') -%}
+              {%- elif name not in l -%}{%- set _ = out.append(kind[:-1] ~ ' ' ~ name ~ ': only in the backup') -%}
+              {%- elif b[name] != l[name] -%}{%- set _ = out.append(kind[:-1] ~ ' ' ~ name ~ ': differs') -%}
+              {%- endif -%}
+              {%- endfor -%}
+              {%- endfor -%}
+              {{ out }}
+          vars:
+            _backup: "{{ directory_restore_checked.stdout | from_json }}"
+            _live: "{{ directory_restore_live.stdout | from_json }}"
+
+        - name: The backup restores, and holds the directory
+          ansible.builtin.assert:
+            that:
+              - (directory_restore_checked.stdout | from_json).users | length > 0
+              - directory_restore_object | length > 0 or directory_restore_diff | length == 0
+            fail_msg: "The backup made a moment ago does not hold what the directory holds: {{ directory_restore_diff | join('; ') }}"
+            success_msg: >-
+              {{ directory_restore_checked.stderr_lines | last | default('') }}:
+              {{ (directory_restore_checked.stdout | from_json).users | length }} users,
+              {{ (directory_restore_checked.stdout | from_json)['groups'] | length }} groups,
+              {{ 'as the live directory' if directory_restore_diff | length == 0 else 'differences from today: ' ~ (directory_restore_diff | join('; ')) }}
+
+      always:
+        - name: Remove the scratch pod
+          ansible.builtin.command: "{{ directory_restore_k }} delete pod {{ directory_restore_helper }} --ignore-not-found --wait=false"
+          changed_when: false
+
+    # ---------------------------------------------------------------- replace ----
+    - name: Replace
+      when: directory_restore_mode == 'replace'
+      block:
+        # Argo CD would start the controller again (selfHeal) under the helper
+        - name: Pause the Argo CD Application
+          ansible.builtin.shell: |
+            set -o pipefail
+            k="/usr/local/bin/k3s kubectl -n argocd"
+            $k annotate application {{ directory_restore_app }} argocd.argoproj.io/skip-reconcile=true --overwrite >/dev/null
+          args:
+            executable: /bin/bash
+          changed_when: true
+
+        - name: Stop the domain controller
+          ansible.builtin.shell: |
+            set -o pipefail
+            {{ directory_restore_k }} scale statefulset samba-ad --replicas=0 >/dev/null
+            {{ directory_restore_k }} wait --for=delete pod/{{ dataplatform_directory_pod }} --timeout=300s >/dev/null
+            {{ directory_restore_k }} delete pod {{ directory_restore_helper }} --ignore-not-found --wait=true >/dev/null
+          args:
+            executable: /bin/bash
+          changed_when: true
+
+        - name: Empty the volume and fill it from the backup
+          ansible.builtin.shell: |
+            set -o pipefail
+            k="{{ directory_restore_k }}"
+            $k apply -f - >/dev/null
+            end=$((SECONDS + 900))
+            while :; do
+              phase=$($k get pod {{ directory_restore_helper }} -o 'jsonpath={.status.phase}')
+              case $phase in Succeeded) break ;; Failed) $k logs {{ directory_restore_helper }} >&2; exit 1 ;; esac
+              if [ $SECONDS -ge $end ]; then echo "the restore did not end in 15 minutes (phase $phase)" >&2; exit 1; fi
+              sleep 5
+            done
+            $k logs {{ directory_restore_helper }}
+          args:
+            executable: /bin/bash
+            stdin: "{{ directory_restore_pod | to_json }}"
+          register: directory_restore_replaced
+          changed_when: true
+
+        - name: Start the domain controller
+          ansible.builtin.shell: |
+            set -o pipefail
+            {{ directory_restore_k }} delete pod {{ directory_restore_helper }} --ignore-not-found --wait=true >/dev/null
+            {{ directory_restore_k }} scale statefulset samba-ad --replicas=1 >/dev/null
+            {{ directory_restore_k }} rollout status statefulset samba-ad --timeout=600s >/dev/null
+            {{ directory_restore_k }} exec {{ dataplatform_directory_pod }} -c samba -- adctl user list
+          args:
+            executable: /bin/bash
+          register: directory_restore_started
+          changed_when: true
+
+        - name: Restored
+          ansible.builtin.debug:
+            msg: >-
+              {{ directory_restore_replaced.stdout_lines + directory_restore_started.stdout_lines
+                 + ['Now: make dataplatform-iam (Keycloak syncs with the restored directory)'] }}
+
+      always:
+        # also after a failure: the Application must not stay paused. A
+        # controller it then starts on a half-restored volume refuses to run
+        # (the marker .restoring), and this playbook starts over.
+        - name: Resume the Argo CD Application
+          ansible.builtin.command: >-
+            /usr/local/bin/k3s kubectl -n argocd annotate application {{ directory_restore_app }} argocd.argoproj.io/skip-reconcile-
+          changed_when: true
+          failed_when: false

@@ -1,0 +1,31 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: governance-samba-ad
+  namespace: argocd
+  annotations:
+    # with Keycloak: the realm (wave 1) federates from this directory, and
+    # iam-sync applies nothing before it has seen its groups
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: dataplatform
+  source:
+    repoURL: <%= dataplatform_git_repo %>
+    targetRevision: <%= dataplatform_git_revision %>
+    path: subsystems/dataplatform/gitops/manifests/governance/samba-ad
+  destination:
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    # No finalizer and no prune: deleting or renaming this Application in Git
+    # must not take the directory with it (the domain controller and its volume)
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        maxDuration: 5m
+        factor: 2

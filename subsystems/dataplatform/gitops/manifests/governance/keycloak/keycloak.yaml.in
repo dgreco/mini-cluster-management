@@ -55,3 +55,19 @@ spec:
           prometheus.io/scrape: "true"
           prometheus.io/port: "9000"
           prometheus.io/path: /metrics
+      # The directory's certificate authority, alone, in Keycloak's truststore
+      # (conf/truststores is read at start): the realm's user federation reads
+      # Samba AD over LDAPS. spec.truststores would mount the whole Secret,
+      # the domain controller's key included.
+      spec:
+        containers:
+          - volumeMounts:
+              - name: samba-ad-ca
+                mountPath: /opt/keycloak/conf/truststores/samba-ad
+                readOnly: true
+        volumes:
+          - name: samba-ad-ca
+            secret:
+              secretName: samba-ad-tls
+              items:
+                - {key: ca.crt, path: samba-ad-ca.crt}

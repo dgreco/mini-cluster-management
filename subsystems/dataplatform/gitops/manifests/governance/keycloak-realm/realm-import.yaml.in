@@ -1,13 +1,18 @@
-# The realm <%= dataplatform_keycloak_realm %>: groups (<%= site_admin_group %> administers the realm in
-# its own console, /admin/<%= dataplatform_keycloak_realm %>/console), one client per platform, the
-# first user (admin, in <%= site_admin_group %>) and the iam-sync service account.
+# The realm <%= dataplatform_keycloak_realm %>: one client per platform and the service accounts of
+# two of them (iam-sync, Meta Catalog's provisioner). It defines no person and
+# no group: both are kept in the directory (Samba AD, governance/samba-ad),
+# which Keycloak reads and writes through the user federation that make
+# dataplatform-iam creates in the running realm (a federation in this file would never sync:
+# the operator imports a realm in a process of its own, and Keycloak starts a
+# federation's periodic sync only for one made through its API, or at its own
+# start). <%= site_admin_group %> administers the realm in its own console,
+# /admin/<%= dataplatform_keycloak_realm %>/console (make dataplatform-iam gives that group its role).
 #
-# This file is the only definition of the realm:
+# This file is the only definition of the realm's settings and clients:
 # - the Keycloak operator imports it once, when the realm does not exist yet
 #   (a KeycloakRealmImport never overwrites a realm);
 # - make dataplatform-iam reads it and converges the running realm: realm
-#   settings, clients (updated in place, protocol mappers included) and groups
-#   (only created). Users and memberships are managed in the Keycloak console.
+#   settings and clients (updated in place, protocol mappers included).
 #
 # Signing keys: exactly one certificate (rsa-generated); the encryption key is
 # disabled. Ceph RGW trusts the realm by that certificate's SHA-1 thumbprint,
@@ -66,10 +71,6 @@ spec:
       secret:
         name: keycloak-realm-secrets
         key: metacatalog-provisioner
-    ADMIN_PASSWORD:
-      secret:
-        name: keycloak-realm-secrets
-        key: admin-password
   realm:
     realm: <%= dataplatform_keycloak_realm %>
     displayName: Data platform
@@ -80,16 +81,12 @@ spec:
     duplicateEmailsAllowed: false
     resetPasswordAllowed: false
     bruteForceProtected: true
+    # what the directory asks of a password, said by Keycloak before it sends
+    # one there (the federation validates against this policy)
+    passwordPolicy: length(<%= dataplatform_directory_min_password_length %>) and upperCase(1) and lowerCase(1) and digits(1)
     accessTokenLifespan: 3600
     ssoSessionIdleTimeout: 28800
     ssoSessionMaxLifespan: 43200
-    groups:
-    - name: <%= site_admin_group %>
-      clientRoles:
-        realm-management:
-        - realm-admin
-    - name: <%= site_engineer_group %>
-    - name: <%= site_analyst_group %>
     clients:
     - clientId: argocd
       name: Argo CD
@@ -523,18 +520,6 @@ spec:
       serviceAccountsEnabled: true
       fullScopeAllowed: true
     users:
-    - username: admin
-      enabled: true
-      email: admin@<%= dataplatform_domain %>
-      emailVerified: true
-      firstName: Platform
-      lastName: Administrator
-      groups:
-      - /<%= site_admin_group %>
-      credentials:
-      - type: password
-        value: ${ADMIN_PASSWORD}
-        temporary: false
     - username: service-account-iam-sync
       enabled: true
       serviceAccountClientId: iam-sync

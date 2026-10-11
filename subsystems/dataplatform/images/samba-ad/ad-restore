@@ -1,0 +1,62 @@
+#!/bin/bash
+# ad-restore: this domain from a backup of ad-backup.
+#   ad-restore check [<object>]     restore into a scratch directory and print
+#                                   what the backup holds (adctl inventory,
+#                                   JSON on stdout); changes nothing
+#   ad-restore replace [<object>]   REPLACE the volume's domain by the backup;
+#                                   the domain controller must not be running
+#                                   (its StatefulSet at 0)
+# <object> is a name under s3://$S3_BUCKET/$S3_PREFIX, the newest by default.
+# samba-tool domain backup restore refuses the name of a controller the backup
+# knows: the domain comes back under the next name (dc1 -> dc2), written to
+# the volume (.dc-name). Users, groups and their object GUIDs are the
+# backup's, so Keycloak's copies stay linked.
+set -euo pipefail
+shopt -s inherit_errexit
+. /usr/local/lib/ad-lib.sh
+
+mode=${1:-}
+case $mode in check | replace) ;; *) sed -n '2,13s/^# \{0,1\}//p' "$0" >&2; exit 2 ;; esac
+work=$(mktemp -d /tmp/ad-restore.XXXXXX)
+trap 'rm -rf "$work"' EXIT
+
+object=${2:-}
+if [ -z "$object" ]; then
+  object=$(ad_s3_backups | tail -n 1)
+  [ -n "$object" ] || { echo "no backup under s3://$S3_BUCKET/$S3_PREFIX" >&2; exit 1; }
+else
+  object="s3://$S3_BUCKET/$S3_PREFIX${object##*/}"
+fi
+ad_s3 get "$object" "$work/backup.tar.bz2" > /dev/null
+old=$(tar -xjOf "$work/backup.tar.bz2" etc/smb.conf | sed -n 's/^[[:space:]]*netbios name[[:space:]]*=[[:space:]]*//p' | head -n 1)
+[ -n "$old" ] || { echo "$object names no domain controller (etc/smb.conf)" >&2; exit 1; }
+new=$(ad_next_name "$old")
+echo "$object: controller ${old,,}, restoring as $new" >&2
+
+restore() {  # <target directory>
+  samba-tool domain backup restore --backup-file="$work/backup.tar.bz2" --newservername="$new" \
+    --targetdir="$1" > "$work/log" 2>&1 || { cat "$work/log" >&2; exit 1; }
+}
+
+if [ "$mode" = check ]; then
+  restore "$work/domain"
+  adctl --samdb "$work/domain/private/sam.ldb" inventory
+  exit 0
+fi
+
+# The marker stays until the volume is whole again: the entry point refuses
+# to start on it, and a second run begins from an empty volume.
+touch "$ad_state/.restoring"
+ad_empty_volume .restoring
+restore "$ad_state/.restore"
+mv "$ad_state/.restore/private" "$ad_state/private"
+find "$ad_state/.restore/state" -mindepth 1 -maxdepth 1 -exec mv -t "$ad_state" {} +
+rm -rf "$ad_state/.restore"
+echo "$new" > "$ad_state/.dc-name"
+# the first administrator is the backup's business, never created again
+[ -e "$ad_state/.seed-first-admin" ] || echo restored > "$ad_state/.seed-first-admin"
+# sysvol comes back without its ACLs
+ad_render_conf "$new"
+samba-tool ntacl sysvolreset > "$work/log" 2>&1 || { cat "$work/log" >&2; exit 1; }
+rm -f "$ad_state/.restoring"
+echo "restored $object as controller $new: $(adctl inventory | python3 -c 'import json, sys; d = json.load(sys.stdin); print(len(d["users"]), "users,", len(d["groups"]), "groups")')" >&2

@@ -1,0 +1,72 @@
+#!/bin/bash
+# Entry point of the platform's Samba AD domain controller (governance/samba-ad).
+#   empty volume   -> provision the domain (AD_REALM, AD_NETBIOS_DOMAIN,
+#                     controller AD_DC_NAME), then as below
+#   a domain there -> seed what the platform needs of it (adctl seed), start Samba
+# Everything happens on the volume's own database before the daemon starts, so
+# the directory never answers without the platform's groups in it.
+# Secrets are mounted files (AD_SECRETS_DIR: admin-password, bind-password,
+# first-admin-password; AD_TLS_DIR: tls.crt, tls.key, ca.crt), read at every
+# start: a value changed in OpenBao counts from the next restart.
+set -euo pipefail
+shopt -s inherit_errexit
+. /usr/local/lib/ad-lib.sh
+
+tls=${AD_TLS_DIR:-/run/secrets/samba-ad-tls}
+
+# Samba refuses a key that is not 0600 and its own; a Secret volume's files
+# are links. The copy lives outside /etc/samba, which the backups take.
+install -d -m 0700 "$ad_run" "$ad_run/tls"
+install -m 0600 "$tls/tls.key" "$ad_run/tls/tls.key"
+install -m 0644 "$tls/tls.crt" "$tls/ca.crt" "$ad_run/tls/"
+
+# The controller resolves through its own DNS server, which holds the
+# domain's records and forwards the rest to the resolver the pod was given.
+# A restarted container finds the file as it left it, hence the first line.
+if grep -q '^# samba-ad forwarder' /etc/resolv.conf; then
+  forwarder=$(sed -n 's/^# samba-ad forwarder //p' /etc/resolv.conf)
+else
+  forwarder=$(awk '$1 == "nameserver" && $2 !~ /:/ {print $2; exit}' /etc/resolv.conf)
+  printf '# samba-ad forwarder %s\nsearch %s\nnameserver 127.0.0.1\n' "$forwarder" "$ad_realm_lc" > /etc/resolv.conf
+fi
+
+if [ -e "$ad_state/.restoring" ]; then
+  echo "a restore of this volume did not finish: run it again (make dataplatform-directory-restore)" >&2
+  exit 1
+fi
+if [ -e "$ad_state/.provisioning" ]; then
+  echo "an earlier provision did not finish: starting again on an empty volume"
+  ad_empty_volume .provisioning
+fi
+if [ ! -e "$ad_state/private/sam.ldb" ]; then
+  leftovers=$(find "$ad_state" -mindepth 1 -type f ! -path "$ad_state/lost+found/*" ! -name .provisioning | head -n 3)
+  if [ -n "$leftovers" ]; then
+    echo "the volume holds no domain, but files: refusing to provision over" $leftovers >&2
+    exit 1
+  fi
+  dc=${AD_DC_NAME:-dc1}
+  echo "provisioning the domain $ad_realm_uc ($AD_NETBIOS_DOMAIN), controller $dc"
+  touch "$ad_state/.provisioning"
+  ad_render_conf "$dc" "$forwarder"
+  # The one password on a command line: a throwaway, replaced by the seed
+  # below before anything listens
+  throwaway="$(head -c 30 /dev/urandom | base64 | tr -d '/+=')aA1"
+  samba-tool domain provision --server-role=dc --dns-backend=SAMBA_INTERNAL --realm="$ad_realm_uc" \
+    --domain="$AD_NETBIOS_DOMAIN" --host-name="$dc" --adminpass="$throwaway" > /tmp/provision.log 2>&1 \
+    || { cat /tmp/provision.log >&2; exit 1; }
+  rm -f /tmp/provision.log
+  echo "$dc" > "$ad_state/.dc-name"
+  rm -f "$ad_state/.provisioning"
+fi
+
+dc=$(ad_dc_name)
+ad_render_conf "$dc" "$forwarder"
+
+# Passwords never expire and may change at once: people set their own in
+# Keycloak, whose realm policy asks at least what this one does.
+samba-tool domain passwordsettings set --max-pwd-age=0 --min-pwd-age=0 \
+  --min-pwd-length="${AD_MIN_PASSWORD_LENGTH:-12}" --complexity=on > /dev/null
+adctl seed
+
+echo "starting Samba $(samba --version | awk '{print $2}') as $dc.$ad_realm_lc"
+exec samba --foreground --no-process-group --debug-stdout

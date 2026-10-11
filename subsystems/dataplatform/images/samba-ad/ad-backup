@@ -1,0 +1,24 @@
+#!/bin/bash
+# ad-backup: a backup of this domain controller to the object store.
+# samba-tool domain backup offline copies the controller's own files under
+# their locks while Samba serves (the database with every password hash, the
+# controller's secrets, sysvol with its ACLs), so it runs here, in the
+# controller's container: the CronJob governance/samba-ad-backup calls it.
+# The archive goes to s3://$S3_BUCKET/$S3_PREFIX with the backup key (files of
+# the Secret backup-s3); the newest $KEEP stay. Restore: ad-restore.
+set -euo pipefail
+shopt -s inherit_errexit
+. /usr/local/lib/ad-lib.sh
+
+work=$(mktemp -d /tmp/ad-backup.XXXXXX)
+trap 'rm -rf "$work"' EXIT
+samba-tool domain backup offline --targetdir="$work" > "$work/log" 2>&1 || { cat "$work/log" >&2; exit 1; }
+archive=$(find "$work" -maxdepth 1 -name 'samba-backup-*.tar.bz2' | head -n 1)
+[ -s "$archive" ] || { echo "samba-tool wrote no archive:" >&2; cat "$work/log" >&2; exit 1; }
+name="samba-ad-$(date -u +%Y%m%dT%H%M%SZ).tar.bz2"
+ad_s3 put "$archive" "s3://$S3_BUCKET/$S3_PREFIX$name" > /dev/null
+echo "saved s3://$S3_BUCKET/$S3_PREFIX$name ($(stat -c %s "$archive") bytes, controller $(ad_dc_name))"
+ad_s3_backups | head -n "-${KEEP:-14}" | while read -r old; do
+  [ -n "$old" ] || continue
+  ad_s3 del "$old" > /dev/null && echo "pruned $old"
+done

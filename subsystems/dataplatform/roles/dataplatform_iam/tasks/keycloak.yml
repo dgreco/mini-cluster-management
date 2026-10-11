@@ -1,10 +1,11 @@
 ---
 # Converge the running realm with realm-import.yaml, the file the Keycloak
 # operator created it from: realm settings, clients (with their protocol
-# mappers and secrets), the roles of service-account users, groups (only
-# created: groups made in the console stay) and their client roles (only
-# added). Users, memberships and key providers are never touched: people
-# are managed in the Keycloak console. The admin API is called inside the
+# mappers and secrets) and the roles of service-account users. People and
+# groups are the directory's (Samba AD): keycloak_federation.yml makes and
+# keeps the user federation Keycloak reads them through, and nothing here
+# creates one of either; the admin groups get their client roles (only
+# added). Key providers are never touched. The admin API is called inside the
 # cluster (keycloak_admin_base.yml); only the discovery document is read at
 # the public URL, as a check that Keycloak serves the realm.
 - name: Keycloak serves the realm - {{ dataplatform_keycloak_issuer }}
@@ -106,37 +107,22 @@
   changed_when: true
   no_log: true
 
-# ---------------------------------------------------------------- groups ----
-- name: Groups
-  ansible.builtin.uri:
-    url: "{{ dataplatform_iam_kc_api }}/groups?briefRepresentation=true&max=1000"
-    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
-  delegate_to: "{{ dataplatform_iam_kc_host }}"
-  register: dataplatform_iam_groups_current
-
-- name: Create the groups of realm-import.yaml that are missing
-  ansible.builtin.uri:
-    url: "{{ dataplatform_iam_kc_api }}/groups"
-    method: POST
-    headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
-    body_format: json
-    body: {name: "{{ item }}"}
-    status_code: [201]
-  loop: >-
-    {{ dataplatform_iam_realm.groups | map(attribute='name')
-       | difference(dataplatform_iam_groups_current.json | map(attribute='name')) }}
-  delegate_to: "{{ dataplatform_iam_kc_host }}"
-  changed_when: true
+# ---------------------------------------------------------------- people and groups ----
+- name: The directory, through the realm's user federation
+  ansible.builtin.include_tasks: keycloak_federation.yml
 
 - name: Admin token
   ansible.builtin.include_tasks: keycloak_token.yml
 
-- name: Client roles of the groups
+- name: Client roles of the admin groups
   ansible.builtin.include_tasks: keycloak_group_roles.yml
-  loop: "{{ dataplatform_iam_realm.groups | selectattr('clientRoles', 'defined') }}"
+  loop: "{{ dataplatform_iam_admin_groups }}"
   loop_control:
-    loop_var: dataplatform_iam_group
-    label: "{{ dataplatform_iam_group.name }}"
+    loop_var: dataplatform_iam_admin_group
+  vars:
+    dataplatform_iam_group:
+      name: "{{ dataplatform_iam_admin_group }}"
+      clientRoles: "{{ dataplatform_iam_admin_client_roles }}"
 
 # ---------------------------------------------------------------- clients ----
 - name: Admin token

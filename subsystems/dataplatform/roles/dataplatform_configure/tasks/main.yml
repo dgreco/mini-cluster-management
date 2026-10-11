@@ -32,6 +32,9 @@
       - site_admin_group is match(_group)
       - site_engineer_group is match(_group)
       - site_analyst_group is match(_group)
+      - site_ad_domain is match('^[a-z0-9-]+(\.[a-z0-9-]+)+$')
+      - site_ad_domain != site_lan_domain and site_ad_domain != site_platform_domain
+      - site_ad_netbios_domain is match('^[A-Z0-9][A-Z0-9-]{0,14}$')
       - site_s3_region is match('^[a-z]{2}(-[a-z]+)+-[0-9]+$')
       - site_bucket is match('^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
       - site_backup_bucket is match('^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')

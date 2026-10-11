@@ -374,7 +374,10 @@
   no_log: true
 
 # Only missing keys are added: an existing value is never replaced. A path
-# without keys is still created, so an ExternalSecret can read it.
+# without keys is still created, so an ExternalSecret can read it. Every value
+# ends with a lower-case letter, a capital and a digit: the directory (Samba
+# AD) refuses a password with fewer than three kinds of characters, and 32
+# random letters and digits have no digit once in 280 times.
 - name: Add the missing values
   ansible.builtin.uri:
     url: "{{ dataplatform_openbao_addr }}/v1/secret/data/dataplatform/{{ item.item.key }}"
@@ -392,7 +395,10 @@
       {%- set out = {} -%}
       {%- for k, v in item.item.value.items() if k not in _current -%}
       {%- set _ = out.update({k: v if v is not none else
-                              lookup('ansible.builtin.password', '/dev/null', length=32, chars=['ascii_letters', 'digits'])}) -%}
+                              lookup('ansible.builtin.password', '/dev/null', length=29, chars=['ascii_letters', 'digits'])
+                              ~ lookup('ansible.builtin.password', '/dev/null', length=1, chars=['ascii_lowercase'])
+                              ~ lookup('ansible.builtin.password', '/dev/null', length=1, chars=['ascii_uppercase'])
+                              ~ lookup('ansible.builtin.password', '/dev/null', length=1, chars=['digits'])}) -%}
       {%- endfor -%}
       {{ out }}
   when: item.status == 404 or item.item.value.keys() | difference(_current.keys()) | length > 0

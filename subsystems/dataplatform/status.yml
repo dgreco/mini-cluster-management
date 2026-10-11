@@ -1,5 +1,5 @@
 ---
-# Where the data platform stands: Argo CD Applications, OpenBao, and the URLs.
+# Where the data platform stands: Argo CD Applications, OpenBao, the directory, and the URLs.
 - name: Data platform status
   hosts: "{{ groups['k3s_servers'][0] }}"
   gather_facts: false
@@ -22,12 +22,31 @@
       changed_when: false
       failed_when: false
 
+    # The directory (Samba AD): the controller, who is in it, the last backups
+    - name: The directory
+      ansible.builtin.shell: |
+        set -o pipefail
+        k="/usr/local/bin/k3s kubectl -n {{ dataplatform_directory_namespace }}"
+        p={{ dataplatform_directory_pod }}
+        cols='POD:.metadata.name,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount'
+        $k get pod $p -o "custom-columns=$cols,NODE:.spec.nodeName" || exit 0
+        $k exec $p -c samba -- sh -c \
+          'echo "controller $(cat /var/lib/samba/.dc-name).$AD_REALM, Samba $(samba --version | cut -d" " -f2)"; adctl user list' 2>&1 || true
+        echo "backups (the newest of {{ dataplatform_directory_backup_keep }}):"
+        $k exec $p -c samba -- bash -c '. /usr/local/lib/ad-lib.sh; ad_s3_backups | tail -n 3' 2>&1 || true
+      args:
+        executable: /bin/bash
+      register: status_directory
+      changed_when: false
+      failed_when: false
+
     - name: Report
       ansible.builtin.debug:
         msg:
           - "Git: {{ dataplatform_git_repo }} @ {{ dataplatform_git_revision }}"
           - "{{ status_apps.stdout_lines | default([]) }}"
           - "{{ status_openbao.stdout_lines | default([]) }}"
+          - "{{ status_directory.stdout_lines | default([]) }}"
           - "Web UIs: {{ ['argocd', 'openbao', 'keycloak', 'grafana', 'trino', 'jupyter']
                         | map('regex_replace', '^(.*)$', 'https://\\1.' ~ dataplatform_domain) | join('  ') }}"
           - "Logins: make dataplatform-passwords"

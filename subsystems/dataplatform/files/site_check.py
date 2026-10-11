@@ -7,8 +7,8 @@ gitops tree that carry one are rendered from their .in templates. This
 fails, naming file and line, when a tracked file holds one of them, in any
 of the forms it takes (as written, regex-escaped, the network prefixes of
 the LAN and of the pod network). Words that are also generic names (the
-revision `main`, the bucket and account name, the storage classes) are not
-searched. Allowed: site.yml itself, hosts.ini and inventory/known_hosts,
+revision `main`, the bucket and account name, the storage classes, the
+directory's NetBIOS name) are not searched. Allowed: site.yml itself, hosts.ini and inventory/known_hosts,
 files rendered from a .in template, Markdown documentation, test fixtures
 (files/tests/) and the example site (publish/example/).
 
@@ -32,7 +32,7 @@ SITE = "inventory/group_vars/all/site.yml"
 HOSTS = "inventory/hosts.ini"
 # values that are also ordinary words or names elsewhere in the tree
 GENERIC = {"site_git_revision", "site_bucket", "site_rgw_account_name", "site_rbd_storage_class",
-           "site_cephfs_storage_class", "site_git_host_keys", "site_k3s_api_vip"}
+           "site_cephfs_storage_class", "site_git_host_keys", "site_k3s_api_vip", "site_ad_netbios_domain"}
 EXEMPT_FILES = {SITE, HOSTS, "inventory/known_hosts"}
 # the test fixtures; the example site (publish/), which the public copy puts in place of this one
 EXEMPT_PREFIXES = ("subsystems/dataplatform/files/tests/", "publish/example/")

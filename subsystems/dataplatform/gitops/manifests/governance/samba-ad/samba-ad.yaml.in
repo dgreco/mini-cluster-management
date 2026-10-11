@@ -1,0 +1,143 @@
+# The directory of the platform's people and groups: Samba 4.25 as the one
+# domain controller of the Active Directory domain <%= dataplatform_directory_domain %>
+# (NetBIOS <%= dataplatform_directory_netbios_domain %>). The only place where a user or a group is kept:
+# Keycloak reads both from here over LDAPS and writes every change back (the
+# user federation made by make dataplatform-iam), so people are managed in
+# the Keycloak console; make dataplatform-directory (adctl, in this pod) is
+# the command line beside it. Reachable inside the cluster only, on LDAPS: no
+# desktop joins this domain.
+#
+# The image (subsystems/dataplatform/images/samba-ad) provisions the domain on
+# an empty volume, then at every start seeds what the platform needs (the two
+# organizational units, the bind account and its right to write in those two
+# units and nowhere else, the groups below, once the first administrator) on
+# the database itself, before the daemon listens.
+#
+# Pod Security baseline holds: NT ACLs are kept in user.NTACL, so the
+# controller needs no CAP_SYS_ADMIN, only what a root daemon that binds low
+# ports, owns its files and changes identity needs.
+#
+# One replica: a second controller means AD replication between pods. While
+# this one moves to another node (a drain, about a minute), people cannot log
+# in with their password; issued tokens and service accounts go on, and a
+# token refresh for as long as Keycloak caches the user (five minutes).
+# Nightly backup: the CronJob samba-ad-backup (its own Application).
+apiVersion: v1
+kind: Service
+metadata:
+  name: samba-ad
+  labels:
+    app.kubernetes.io/name: samba-ad
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: samba-ad
+  ports:
+    - {name: ldaps, port: 636, targetPort: ldaps}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: samba-ad
+  labels:
+    app.kubernetes.io/name: samba-ad
+spec:
+  serviceName: samba-ad
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: samba-ad
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: samba-ad
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: samba
+          # pinned by tag and digest (make dataplatform-samba-image builds and prints it)
+          image: ghcr.io/dgreco/samba-ad:4.25.0-2@sha256:53abac4aabba68f39dcb45349c0097c321fee794a2f71d823aa65d4f6a0e218c
+          env:
+            - {name: AD_REALM, value: <%= dataplatform_directory_domain %>}
+            - {name: AD_NETBIOS_DOMAIN, value: <%= dataplatform_directory_netbios_domain %>}
+            # the first controller's name; a restore renames it on the volume (dc2, ...)
+            - {name: AD_DC_NAME, value: dc1}
+            - {name: AD_PEOPLE_OU, value: <%= dataplatform_directory_people_ou %>}
+            - {name: AD_GROUPS_OU, value: <%= dataplatform_directory_groups_ou %>}
+            - {name: AD_SERVICES_OU, value: <%= dataplatform_directory_services_ou %>}
+            - {name: AD_BIND_USER, value: <%= dataplatform_directory_bind_user %>}
+            # Keycloak manages people and groups as that account
+            - {name: AD_BIND_WRITES, value: "true"}
+            - {name: AD_MIN_PASSWORD_LENGTH, value: "<%= dataplatform_directory_min_password_length %>"}
+            - {name: AD_SEED_GROUPS, value: "<%= dataplatform_directory_seed_groups | join(' ') %>"}
+            - {name: AD_FIRST_ADMIN, value: <%= dataplatform_directory_first_admin %>}
+            - {name: AD_FIRST_ADMIN_GROUP, value: <%= dataplatform_iam_admin_groups | first %>}
+            - {name: AD_FIRST_ADMIN_MAIL, value: <%= dataplatform_directory_first_admin %>@<%= dataplatform_domain %>}
+            # ad-backup and ad-restore
+            - {name: S3_ENDPOINT, value: <%= dataplatform_s3_endpoint %>}
+            - {name: S3_REGION, value: <%= dataplatform_s3_region %>}
+            - {name: S3_BUCKET, value: <%= site_backup_bucket %>}
+            - {name: S3_PREFIX, value: <%= dataplatform_directory_backup_prefix %>}
+            - {name: KEEP, value: "<%= dataplatform_directory_backup_keep %>"}
+          ports:
+            - {name: ldaps, containerPort: 636}
+          # the first start provisions the domain: a minute or two on the boards
+          startupProbe:
+            tcpSocket: {port: ldaps}
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            tcpSocket: {port: ldaps}
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: [/usr/local/sbin/ad-healthy]
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 50m, memory: 256Mi}
+            limits: {memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+              add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, SETGID, SETUID, NET_BIND_SERVICE]
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/samba}
+            - {name: run, mountPath: /run/samba-ad}
+            - {name: secrets, mountPath: /run/secrets/samba-ad, readOnly: true}
+            - {name: tls, mountPath: /run/secrets/samba-ad-tls, readOnly: true}
+            - {name: backup-s3, mountPath: /run/secrets/backup-s3, readOnly: true}
+      volumes:
+        # the certificate's copy and the backup's settings: never on a disk
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Mi
+        - name: secrets
+          secret:
+            secretName: samba-ad
+        - name: tls
+          secret:
+            secretName: samba-ad-tls
+        # optional: the backup key arrives with make dataplatform-ceph, and
+        # the directory must not wait for it on a first install
+        - name: backup-s3
+          secret:
+            secretName: backup-s3
+            optional: true
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: <%= dataplatform_storage_class %>
+        resources:
+          requests:
+            storage: 2Gi

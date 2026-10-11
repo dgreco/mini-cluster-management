@@ -306,16 +306,19 @@ make dataplatform-passwords      # bootstrap logins; everyday logins go through 
 make dataplatform-status         # what runs, and the web addresses
 make dataplatform-grants ARGS=list   # what is granted (administrators; grants are given in Meta Catalog)
 make dataplatform-iam-check      # validate gitops/iam/access.yaml (the platform's part of the access model)
+make dataplatform-directory ARGS="user list"   # users and groups on the command line (the Keycloak console is the everyday way)
 make dataplatform-s3-login       # temporary S3 keys of your group, with your Keycloak login
 make dataplatform-kubeconfig     # kubectl with your Keycloak login (Spark jobs)
 ```
 
-Users and groups are managed in Keycloak (https://keycloak.data.example.org,
-realm `data-platform`). Who may use which directory of the platform's bucket
-`s3://dataplatform` is one file in Git, `subsystems/dataplatform/gitops/iam/access.yaml`:
-a commit on `main` makes Ceph match it. A user reads and writes the directories
-granted to them or their groups, and the tables in them, through Trino, Spark,
-JupyterHub notebooks or S3 directly.
+Users and groups are kept in one place, the platform's directory (a Samba
+Active Directory domain on the cluster). You manage them in the Keycloak
+console, which writes to it and logs everybody in (`make dataplatform-directory`
+does the same on the command line, and makes and removes groups). Who may use which directory of the platform's bucket `s3://dataplatform`
+is decided in Meta Catalog, where an administrator authorizes each lakehouse's
+policy. A user reads and writes the directories granted to them or their
+groups, and the tables in them, through Trino, Spark, JupyterHub notebooks or
+S3 directly.
 
 ### Monitoring
 
@@ -395,7 +398,7 @@ bucket `platform-backups`, except Ceph's, which goes to `backups/ceph/` here.
    changed.
 
 Some values in `site.yml` are marked *install-time*: the Keycloak realm, the
-S3 account and bucket, the pod network, the cluster name, the platform's
+directory's domain, the S3 account and bucket, the pod network, the cluster name, the platform's
 domain. Set them before the first install; changing them later means
 migrating data and trust, not just re-running a command.
 

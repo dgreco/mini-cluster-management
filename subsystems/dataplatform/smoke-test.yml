@@ -1,8 +1,11 @@
 ---
 # End-to-end check of the IAM model on the live platform (about 10 minutes):
-# temporary Keycloak users smoke-eng (the engineer group), smoke-ana (the
-# analyst group), smoke-both (both), smoke-nogroup and smoke-adm (also the
-# admin group: only it may authorize; site.yml names the groups) exercise direct
+# temporary users of the directory (Samba AD, where every user lives; made
+# there with adctl, and one through Keycloak, which writes to it)
+# smoke-eng (the engineer group),
+# smoke-ana (the analyst group), smoke-both (both), smoke-nogroup and
+# smoke-adm (also the admin group: only it may authorize; site.yml names the
+# groups) exercise direct
 # STS, Trino and Spark in the smoke test's own lakehouse (Meta Catalog,
 # metacatalog/lakehouses/smoke_test.yaml): every data access must be decided
 # by Ceph through a group role and the layers the lakehouse's policy grants
@@ -24,6 +27,17 @@
       smoke-nogroup: []
       # the admin group after other groups: the gate must find it among several
       smoke-adm: ["{{ site_analyst_group }}", "{{ site_engineer_group }}", "{{ site_admin_group }}"]
+    # the directory checks' own (F): smoke-off is disabled in the directory
+    # before it ever logs in; smoke-late joins the analyst group there after
+    # its first login, and gets a new password from Keycloak; smoke-kc is
+    # made in Keycloak, not here
+    smoke_directory_users:
+      smoke-off: ["{{ site_engineer_group }}"]
+      smoke-late: []
+    smoke_keycloak_user: smoke-kc
+    smoke_all_users: "{{ (smoke_users | combine(smoke_directory_users)).keys() | list + [smoke_keycloak_user] }}"
+    smoke_adctl: >-
+      /usr/local/bin/k3s kubectl -n {{ dataplatform_directory_namespace }} exec -i {{ dataplatform_directory_pod }} -c samba -- adctl
   tasks:
     - name: OpenBao client
       ansible.builtin.include_role:
@@ -59,7 +73,12 @@
 
     - name: Password of the temporary users
       ansible.builtin.set_fact:
-        smoke_password: "{{ lookup('ansible.builtin.password', '/dev/null', length=24, chars=['ascii_letters', 'digits']) }}"
+        # three kinds of characters: the directory refuses less
+        smoke_password: >-
+          {{ lookup('ansible.builtin.password', '/dev/null', length=21, chars=['ascii_letters', 'digits'])
+             ~ lookup('ansible.builtin.password', '/dev/null', length=1, chars=['ascii_lowercase'])
+             ~ lookup('ansible.builtin.password', '/dev/null', length=1, chars=['ascii_uppercase'])
+             ~ lookup('ansible.builtin.password', '/dev/null', length=1, chars=['digits']) }}
         smoke_users_json: >-
           {%- set out = {} -%}
           {%- for u, g in smoke_users.items() -%}{%- set _ = out.update({u: {'group': g[0] if g else '', 'groups': g}}) -%}{%- endfor -%}
@@ -68,51 +87,131 @@
 
     - name: Run the checks with temporary users
       block:
-        - name: Create the temporary users
+        # A user an interrupted run left behind goes first: its password is
+        # that run's.
+        - name: Remove what an earlier run left in the directory
+          ansible.builtin.command: "{{ smoke_adctl }} user remove {{ item }}"
+          loop: "{{ smoke_all_users }}"
+          register: smoke_leftover
+          changed_when: smoke_leftover.rc == 0
+          failed_when: false
+
+        - name: Create the temporary users in the directory
+          ansible.builtin.command:
+            cmd: >-
+              {{ smoke_adctl }} user add {{ item.key }} --given-name Smoke --surname {{ item.key }}
+              --mail {{ item.key }}@{{ dataplatform_domain }}
+              {{ item.value | map('regex_replace', '^', '--group ') | join(' ') }}
+            stdin: "{{ smoke_password }}"
+          loop: "{{ smoke_users | combine(smoke_directory_users) | dict2items }}"
+          loop_control:
+            label: "{{ item.key }} ({{ item.value | join(', ') or 'no group' }})"
+          changed_when: true
+          no_log: true
+
+        - name: The directory disables smoke-off
+          ansible.builtin.command: "{{ smoke_adctl }} user disable smoke-off"
+          changed_when: true
+
+        # Keycloak now knows smoke-late, in no group; what the directory says
+        # afterwards has to reach its next token
+        - name: First login of smoke-late
+          ansible.builtin.uri:
+            url: "{{ dataplatform_iam_kc_admin_base }}/realms/{{ dataplatform_keycloak_realm }}/protocol/openid-connect/token"
+            method: POST
+            body_format: form-urlencoded
+            body:
+              grant_type: password
+              client_id: smoke-test
+              client_secret: "{{ smoke_client_secret }}"
+              username: smoke-late
+              password: "{{ smoke_password }}"
+              scope: openid
+          delegate_to: "{{ dataplatform_iam_kc_host }}"
+          no_log: true
+
+        - name: The directory puts smoke-late into {{ site_analyst_group }}
+          ansible.builtin.command: "{{ smoke_adctl }} group join {{ site_analyst_group }} smoke-late"
+          changed_when: true
+
+        - name: Fresh admin token
+          ansible.builtin.include_role:
+            name: dataplatform_iam
+            tasks_from: keycloak_token
+          vars:
+            dataplatform_iam_kc_admin: "{{ smoke_kc_admin.json.data.data }}"
+
+        - name: Users of the realm
+          ansible.builtin.uri:
+            url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}/users?briefRepresentation=true&max=1000"
+            headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+          delegate_to: "{{ dataplatform_iam_kc_host }}"
+          register: smoke_realm_users
+
+        # Keycloak writes to the directory: a password it sets is the
+        # directory's, and a user it makes is made there
+        - name: Keycloak sets the password of smoke-late
+          ansible.builtin.uri:
+            url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}/users/{{ _id }}/reset-password"
+            method: PUT
+            headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
+            body_format: json
+            body: {type: password, value: "{{ smoke_password }}Kc9", temporary: false}
+            status_code: [204, 400, 403, 500]
+          vars:
+            _id: "{{ (smoke_realm_users.json | selectattr('username', 'equalto', 'smoke-late') | first).id }}"
+          delegate_to: "{{ dataplatform_iam_kc_host }}"
+          register: smoke_keycloak_write
+          no_log: true
+
+        - name: Keycloak makes the user {{ smoke_keycloak_user }}
           ansible.builtin.uri:
             url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}/users"
             method: POST
             headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
             body_format: json
             body:
-              username: "{{ item.key }}"
+              username: "{{ smoke_keycloak_user }}"
               enabled: true
-              emailVerified: true
-              email: "{{ item.key }}@{{ dataplatform_domain }}"
+              email: "{{ smoke_keycloak_user }}@{{ dataplatform_domain }}"
               firstName: Smoke
-              lastName: "{{ item.key }}"
-              groups: "{{ item.value | map('regex_replace', '^', '/') | list }}"
-              credentials: [{type: password, value: "{{ smoke_password }}", temporary: false}]
-            status_code: [201, 409]
-          loop: "{{ smoke_users | dict2items }}"
-          loop_control:
-            label: "{{ item.key }} ({{ item.value | join(', ') or 'no group' }})"
+              lastName: "{{ smoke_keycloak_user }}"
+            status_code: [201]
           delegate_to: "{{ dataplatform_iam_kc_host }}"
 
-        # A user left behind by an interrupted run (409 above) keeps its old
-        # password: set this run's on every user.
-        - name: Find the temporary users
+        - name: Its id, and the engineer group's
           ansible.builtin.uri:
-            url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}/users?username={{ item }}&exact=true"
+            url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}/{{ item }}"
             headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
-          loop: "{{ smoke_users.keys() | list }}"
+          loop:
+            - "users?username={{ smoke_keycloak_user }}&exact=true"
+            - "groups?search={{ site_engineer_group }}&exact=true&briefRepresentation=true"
           delegate_to: "{{ dataplatform_iam_kc_host }}"
-          register: smoke_created
+          register: smoke_kc_ids
 
-        - name: Set this run's password on every temporary user
+        - name: Keycloak gives it a password and puts it into {{ site_engineer_group }}
           ansible.builtin.uri:
-            url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}/users/{{ item.json[0].id }}/reset-password"
+            url: "{{ smoke_kc_api }}/users/{{ smoke_kc_ids.results[0].json[0].id }}/{{ item.path }}"
             method: PUT
             headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
             body_format: json
-            body: {type: password, value: "{{ smoke_password }}", temporary: false}
+            body: "{{ item.body }}"
             status_code: [204]
-          loop: "{{ smoke_created.results }}"
+          loop:
+            - {path: reset-password, body: {type: password, value: "{{ smoke_password }}", temporary: false}}
+            - path: "groups/{{ (smoke_kc_ids.results[1].json | selectattr('name', 'equalto', site_engineer_group) | first).id }}"
+              body: {}
           loop_control:
-            label: "{{ item.item }}"
+            label: "{{ item.path | regex_replace('/.*$', '') }}"
+          vars:
+            smoke_kc_api: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}"
           delegate_to: "{{ dataplatform_iam_kc_host }}"
-          changed_when: false
           no_log: true
+
+        - name: What the directory holds now
+          ansible.builtin.command: "{{ smoke_adctl }} inventory"
+          register: smoke_directory
+          changed_when: false
 
         # iam-sync (every 30 s) writes Trino's group file; Trino re-reads it
         # every 10 s.
@@ -157,6 +256,20 @@
             SMOKE_PASSWORD: "{{ smoke_password }}"
             SMOKE_CLIENT: smoke-test
             SMOKE_CLIENT_SECRET: "{{ smoke_client_secret }}"
+            SMOKE_DISABLED_USER: smoke-off
+            SMOKE_LATE_USER: smoke-late
+            SMOKE_LATE_GROUP: "{{ site_analyst_group }}"
+            # a user's groups stay in Keycloak's cache that long at most
+            SMOKE_LATE_WAIT: "{{ dataplatform_directory_cache_lifespan | int + 90 }}"
+            SMOKE_KEYCLOAK_WRITE: "{{ smoke_keycloak_write.status }}"
+            SMOKE_LATE_PASSWORD: "{{ smoke_password }}Kc9"
+            SMOKE_KC_USER: "{{ smoke_keycloak_user }}"
+            SMOKE_KC_GROUP: "{{ site_engineer_group }}"
+            # that user as the directory has it (its groups), or nothing
+            SMOKE_KC_IN_DIRECTORY: >-
+              {{ (smoke_directory.stdout | from_json).users | selectattr('name', 'equalto', smoke_keycloak_user) | list | to_json }}
+            SMOKE_LOCAL_USERS: >-
+              {{ smoke_realm_users.json | rejectattr('federationLink', 'defined') | map(attribute='username') | list | to_json }}
             K8S_SERVER: "{{ (lookup('ansible.builtin.file', k3s_kubeconfig) | from_yaml).clusters[0].cluster.server }}"
             K8S_CA: "{{ (lookup('ansible.builtin.file', k3s_kubeconfig) | from_yaml).clusters[0].cluster['certificate-authority-data'] }}"
           delegate_to: localhost
@@ -183,25 +296,36 @@
           vars:
             dataplatform_iam_kc_admin: "{{ smoke_kc_admin.json.data.data }}"
 
-        - name: Find the temporary users
+        # Keycloak first: deleting a user there deletes it in the directory
+        # too. The other way round fails: Keycloak answers 500 when asked to
+        # delete a user the directory no longer has.
+        - name: Find the temporary users in Keycloak
           ansible.builtin.uri:
             url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}/users?username={{ item }}&exact=true"
             headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
-          loop: "{{ smoke_users.keys() | list }}"
+          loop: "{{ smoke_all_users }}"
           delegate_to: "{{ dataplatform_iam_kc_host }}"
           register: smoke_found
 
-        - name: Delete the temporary users
+        - name: Delete them in Keycloak, and with that in the directory
           ansible.builtin.uri:
             url: "{{ dataplatform_iam_kc_admin_base }}/admin/realms/{{ dataplatform_keycloak_realm }}/users/{{ item.json[0].id }}"
             method: DELETE
             headers: {Authorization: "Bearer {{ dataplatform_iam_kc_token }}"}
-            status_code: [204]
+            status_code: [204, 404]
           loop: "{{ smoke_found.results | selectattr('json', 'truthy') | list }}"
           loop_control:
             label: "{{ item.item }}"
           delegate_to: "{{ dataplatform_iam_kc_host }}"
           changed_when: true
+
+        # whatever Keycloak did not know, or could not delete
+        - name: Remove what is left of them in the directory
+          ansible.builtin.command: "{{ smoke_adctl }} user remove {{ item }}"
+          loop: "{{ smoke_all_users }}"
+          register: smoke_removed
+          changed_when: smoke_removed.rc == 0
+          failed_when: false
 
         - name: Delete their Spark namespaces
           ansible.builtin.command: >-

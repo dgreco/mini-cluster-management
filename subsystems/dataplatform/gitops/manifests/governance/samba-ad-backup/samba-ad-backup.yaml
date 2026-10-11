@@ -1,0 +1,90 @@
+# A backup of the directory every night, kept in s3://platform-backups/samba-ad/
+# (the last 14). samba-tool domain backup offline has to run on the domain
+# controller itself (it copies the controller's files under their locks), so
+# this job only starts ad-backup in the controller's pod: its service account
+# may exec into that one pod and nothing else. The archive holds every
+# password hash and the controller's keys: it is as sensitive as an OpenBao
+# snapshot, and goes to the same bucket with the same key.
+# Restore: subsystems/dataplatform/README.md, "Backups"
+# (make dataplatform-directory-restore-check, make dataplatform-directory-restore).
+#
+# A run the cluster missed while it was off starts as soon as k3s is back,
+# before the controller may answer (it needs Ceph for its volume): the job
+# retries for a while, and its Application is in the last wave so that a
+# waiting or failed run holds no other Application back.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: samba-ad-backup
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: samba-ad-backup
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    resourceNames: [samba-ad-0]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    resourceNames: [samba-ad-0]
+    verbs: [create, get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: samba-ad-backup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: samba-ad-backup
+subjects:
+  - kind: ServiceAccount
+    name: samba-ad-backup
+    namespace: governance
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: samba-ad-backup
+spec:
+  schedule: "45 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # a pod that fails (the controller is not up yet) is tried again, with
+      # a growing pause: about an hour in all
+      backoffLimit: 12
+      activeDeadlineSeconds: 7200
+      template:
+        spec:
+          serviceAccountName: samba-ad-backup
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              # the cluster's Kubernetes version (k3s_version), pinned by digest
+              image: registry.k8s.io/kubectl:v1.36.4@sha256:b8d523e7b8cdc5e3caa0f8891ee9f504abf137dec786e6e0ddd33e4f272c2f13
+              args: [exec, -n, governance, samba-ad-0, -c, samba, --, /usr/local/sbin/ad-backup]
+              env:
+                - {name: HOME, value: /tmp}
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+                limits: {memory: 128Mi}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: tmp
+              emptyDir: {}

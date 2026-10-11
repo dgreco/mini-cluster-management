@@ -2,8 +2,8 @@
 """End-to-end check of the IAM model (make dataplatform-smoke-test).
 
 Run by smoke-test.yml with Ansible's Python (boto3), after it created the
-temporary Keycloak users of SMOKE_USERS (JSON {name: {group, groups}}, password
-SMOKE_PASSWORD): smoke-eng (the engineer group), smoke-ana (the analyst
+temporary users of SMOKE_USERS in the directory (Samba AD; JSON {name: {group,
+groups}}, password SMOKE_PASSWORD): smoke-eng (the engineer group), smoke-ana (the analyst
 group), smoke-both (both), smoke-nogroup (none), smoke-adm (analyst,
 engineer and the admin group, last: the gate must find it among
 several groups; it authorizes the lakehouse).
@@ -38,9 +38,19 @@ C  Spark (web identity): the engineer's job reads Trino's table and writes
    account reads no Secret and starts no pod mounting another one.
 D  Kubernetes (Keycloak login): the engineer may run jobs in compute, not
    read the platform's secrets, nor write objects the Spark fence refuses.
+F  the directory is the only place people live, and Keycloak manages them
+   there: a user the directory disabled cannot log in; a membership it gives
+   after a user's first login is in a later token; a password Keycloak set
+   is the directory's (the user logs in with it); the realm holds no user of
+   its own; a user made in Keycloak is in the directory with the group
+   Keycloak gave it, and logs in. The playbook prepares these
+   (SMOKE_DISABLED_USER, SMOKE_LATE_USER, _GROUP and _PASSWORD,
+   SMOKE_KEYCLOAK_WRITE, SMOKE_LOCAL_USERS, SMOKE_KC_USER, _GROUP and
+   _IN_DIRECTORY).
 Reads use sum(), not count(*) (answered from Iceberg statistics, no data read).
 Prints one line per check and exits 1 when any check fails.
 """
+import base64
 import json
 import os
 import re
@@ -88,12 +98,13 @@ CLIENT = os.environ.get("SMOKE_CLIENT", "smoke-test")               # the test's
 CLIENT_SECRET = os.environ["SMOKE_CLIENT_SECRET"]                    # the only one with the password grant
 
 
-def token(user: str, client: str = CLIENT, id_token: bool = False) -> str:
+def token(user: str, client: str = CLIENT, id_token: bool = False, password: str = "") -> str:
     """A token of the temporary user from the smoke-test client (audiences trino
     and kubernetes, groups; RGW accepts the client); `client` is kept for the
     call sites' readability."""
     data = urllib.parse.urlencode({"grant_type": "password", "client_id": CLIENT, "client_secret": CLIENT_SECRET,
-                                   "username": user, "password": PASSWORD, "scope": "openid profile"}).encode()
+                                   "username": user, "password": password or PASSWORD,
+                                   "scope": "openid profile"}).encode()
     with urllib.request.urlopen(f"{KEYCLOAK}/protocol/openid-connect/token", data, timeout=30) as r:
         return json.load(r)["id_token" if id_token else "access_token"]
 
@@ -593,6 +604,58 @@ print("SMOKE leaked", spark.sql("SELECT sum(x) FROM {ENG_T}").collect()[0][0])
                   f"{e.code} {loc[:200]}")
         except (urllib.error.URLError, OSError) as e:
             check("E2 JupyterHub logs in through Keycloak", False, str(e)[:200])
+
+    # ---------------------------------------------------------------- F ----
+    # The directory (Samba AD) is the only source of people and groups
+    off = os.environ.get("SMOKE_DISABLED_USER")
+    if off:
+        try:
+            token(off)
+            check(f"F1 {off}, disabled in the directory, cannot log in", False, "got a token")
+        except urllib.error.HTTPError as e:
+            check(f"F1 {off}, disabled in the directory, cannot log in", e.code in (400, 401), str(e.code))
+    # smoke-late's password is the one Keycloak set after the directory made the user
+    late, late_group = os.environ.get("SMOKE_LATE_USER"), os.environ.get("SMOKE_LATE_GROUP")
+    late_password = os.environ.get("SMOKE_LATE_PASSWORD", "")
+
+    def groups_of(user: str, password: str = "") -> list:
+        body = token(user, password=password).split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))).get("groups") or []
+
+    if late and late_group:
+        end, seen = time.time() + int(os.environ.get("SMOKE_LATE_WAIT", "390")), []
+        while True:
+            try:
+                seen = groups_of(late, late_password)
+            except (urllib.error.URLError, OSError) as e:
+                seen = [f"no token: {e}"]
+            if late_group in seen or time.time() >= end:
+                break
+            time.sleep(10)
+        check(f"F2 {late}'s token has the group the directory gave it after its first login",
+              late_group in seen, f"groups {seen}")
+    if os.environ.get("SMOKE_KEYCLOAK_WRITE") and late:
+        status = os.environ["SMOKE_KEYCLOAK_WRITE"]
+        try:
+            groups_of(late, late_password)
+            took, detail = True, ""
+        except (urllib.error.URLError, OSError) as e:
+            took, detail = False, str(e)
+        check(f"F3 a password Keycloak set for {late} is the directory's", status == "204" and took,
+              f"Keycloak answered {status}; login: {detail or 'ok'}")
+    if "SMOKE_LOCAL_USERS" in os.environ:
+        local = json.loads(os.environ["SMOKE_LOCAL_USERS"])
+        check("F4 every user of the realm comes from the directory", not local, ", ".join(local))
+    made, made_group = os.environ.get("SMOKE_KC_USER"), os.environ.get("SMOKE_KC_GROUP")
+    if made:
+        there = json.loads(os.environ.get("SMOKE_KC_IN_DIRECTORY", "[]"))
+        in_group = bool(there) and made_group in there[0].get("groups", [])
+        try:
+            seen = groups_of(made)
+        except (urllib.error.URLError, OSError) as e:
+            seen = [f"no token: {e}"]
+        check(f"F5 {made}, made in Keycloak, is in the directory with its group and logs in",
+              in_group and made_group in seen, f"directory {there}; token groups {seen}")
 
 
 if __name__ == "__main__":

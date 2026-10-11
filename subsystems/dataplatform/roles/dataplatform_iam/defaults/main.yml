@@ -1,5 +1,5 @@
 ---
-# The realm, as the Keycloak operator imports it (single definition)
+# The realm's settings and clients, as the Keycloak operator imports them (single definition)
 dataplatform_iam_realm_file: "{{ dataplatform_gitops_dir }}/manifests/governance/keycloak-realm/realm-import.yaml"
 # The issuer without its scheme: RGW's name for the provider and the prefix of
 # its condition keys (<idp>:groups, <idp>:sub, ...).
@@ -14,6 +14,123 @@ dataplatform_iam_group_pattern: '^[a-z0-9][a-z0-9-]{0,40}[a-z0-9]$'
 # temporary admin is then deleted (Keycloak nags about it until it is)
 dataplatform_iam_kc_client: ansible
 dataplatform_iam_delete_temp_admin: true
+# The realm's user federation: people and groups live in the directory (Samba
+# AD, group_vars dataplatform_directory_*) and nowhere else, and Keycloak is
+# the way to manage them: it reads them from the directory and writes every
+# change back (WRITABLE; a user made in Keycloak is made in the directory:
+# syncRegistrations). tasks/keycloak_federation.yml makes and keeps it; values
+# go to the admin API as strings.
+dataplatform_iam_federation_config:
+  enabled: "true"
+  priority: "0"
+  vendor: ad
+  connectionUrl: "{{ dataplatform_directory_url }}"
+  useTruststoreSpi: always          # the directory's own certificate authority, in Keycloak's truststore
+  startTls: "false"
+  authType: simple
+  bindDn: "CN={{ dataplatform_directory_bind_user }},OU={{ dataplatform_directory_services_ou }},{{ dataplatform_directory_base_dn }}"
+  # one level under the people's unit: nothing else of the domain is a user here
+  usersDn: "OU={{ dataplatform_directory_people_ou }},{{ dataplatform_directory_base_dn }}"
+  searchScope: "1"
+  usernameLDAPAttribute: sAMAccountName
+  rdnLDAPAttribute: cn
+  uuidLDAPAttribute: objectGUID
+  userObjectClasses: person, organizationalPerson, user
+  editMode: WRITABLE
+  importEnabled: "true"
+  syncRegistrations: "true"
+  trustEmail: "true"
+  connectionPooling: "true"
+  pagination: "true"
+  # a domain controller that does not answer fails a login in seconds
+  connectionTimeout: "5000"
+  readTimeout: "10000"
+  changedSyncPeriod: "{{ dataplatform_directory_changed_sync_period }}"
+  fullSyncPeriod: "{{ dataplatform_directory_full_sync_period }}"
+  batchSizeForSync: "1000"
+  # a user's groups are cached with the user: a change in the directory
+  # reaches the next token within this time (ms)
+  cachePolicy: MAX_LIFESPAN
+  maxLifespan: "{{ dataplatform_directory_cache_lifespan | int * 1000 }}"
+  # the realm's password policy (realm-import.yaml) is checked before a
+  # password goes to the directory, whose own rule it satisfies
+  validatePasswordPolicy: "true"
+  allowKerberosAuthentication: "false"
+  useKerberosForPasswordAuthentication: "false"
+  usePasswordModifyExtendedOp: "false"
+# Its mappers, by name: the whole list (any other mapper is deleted).
+# full name: write-only, it gives a user made in Keycloak its cn (the RDN) and
+# leaves the reading to the first and last name mappers.
+# groups: mode LDAP_ONLY keeps memberships in the directory alone (a join or
+# a leave in Keycloak is written there).
+dataplatform_iam_federation_mappers:
+  username:
+    providerId: user-attribute-ldap-mapper
+    config: {ldap.attribute: sAMAccountName, user.model.attribute: username, read.only: "false",
+             always.read.value.from.ldap: "false", is.mandatory.in.ldap: "true"}
+  email:
+    providerId: user-attribute-ldap-mapper
+    config: {ldap.attribute: mail, user.model.attribute: email, read.only: "false",
+             always.read.value.from.ldap: "false", is.mandatory.in.ldap: "false"}
+  first name:
+    providerId: user-attribute-ldap-mapper
+    config: {ldap.attribute: givenName, user.model.attribute: firstName, read.only: "false",
+             always.read.value.from.ldap: "false", is.mandatory.in.ldap: "false"}
+  last name:
+    providerId: user-attribute-ldap-mapper
+    config: {ldap.attribute: sn, user.model.attribute: lastName, read.only: "false",
+             always.read.value.from.ldap: "false", is.mandatory.in.ldap: "false"}
+  full name:
+    providerId: full-name-ldap-mapper
+    config: {ldap.full.name.attribute: cn, read.only: "false", write.only: "true"}
+  creation date:
+    providerId: user-attribute-ldap-mapper
+    config: {ldap.attribute: whenCreated, user.model.attribute: createTimestamp, read.only: "true",
+             always.read.value.from.ldap: "false", is.mandatory.in.ldap: "false"}
+  modify date:
+    providerId: user-attribute-ldap-mapper
+    config: {ldap.attribute: whenChanged, user.model.attribute: modifyTimestamp, read.only: "true",
+             always.read.value.from.ldap: "false", is.mandatory.in.ldap: "false"}
+  # a disabled account of the directory is a disabled user here, and the other
+  # way round; a password set in Keycloak enables the account it made
+  MSAD account controls:
+    providerId: msad-user-account-control-mapper
+    config: {}
+  groups:
+    providerId: group-ldap-mapper
+    config:
+      groups.dn: "OU={{ dataplatform_directory_groups_ou }},{{ dataplatform_directory_base_dn }}"
+      group.name.ldap.attribute: cn
+      group.object.classes: group
+      preserve.group.inheritance: "false"
+      ignore.missing.groups: "true"
+      membership.ldap.attribute: member
+      membership.attribute.type: DN
+      membership.user.ldap.attribute: sAMAccountName
+      memberof.ldap.attribute: memberOf
+      mode: LDAP_ONLY
+      user.roles.retrieve.strategy: LOAD_GROUPS_BY_MEMBER_ATTRIBUTE
+      drop.non.existing.groups.during.sync: "true"
+      groups.path: /
+# Keycloak's own test of the bind, with the password it holds (the mask)
+dataplatform_iam_fed_test:
+  action: testAuthentication
+  connectionUrl: "{{ dataplatform_iam_federation_config.connectionUrl }}"
+  bindDn: "{{ dataplatform_iam_federation_config.bindDn }}"
+  bindCredential: "**********"
+  useTruststoreSpi: "{{ dataplatform_iam_federation_config.useTruststoreSpi }}"
+  connectionTimeout: "{{ dataplatform_iam_federation_config.connectionTimeout }}"
+  startTls: "{{ dataplatform_iam_federation_config.startTls }}"
+  authType: "{{ dataplatform_iam_federation_config.authType }}"
+  componentId: "{{ dataplatform_iam_fed_id }}"
+# -e dataplatform_iam_adopt_directory=true: users the realm holds itself are
+# deleted there when the directory has them under the same name (the cut-over
+# of a realm that had its own users)
+dataplatform_iam_adopt_directory: false
+# Client roles the admin groups get in the realm (added, never removed):
+# they administer it in their own console
+dataplatform_iam_admin_client_roles:
+  realm-management: [realm-admin]
 # Keycloak's Service, for the admin API calls made inside the cluster
 dataplatform_iam_keycloak_namespace: governance
 dataplatform_iam_keycloak_service: keycloak-service

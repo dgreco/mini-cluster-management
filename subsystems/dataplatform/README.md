@@ -2,14 +2,14 @@
 
 A small lakehouse on the k3s cluster:
 - **Trino** (SQL) and **Spark** (jobs) share **Iceberg** tables stored in **Ceph S3**.
-- **Keycloak** is the only login for every tool.
+- **Keycloak** is the only login for every tool. The people and their groups live in a directory, a **Samba Active Directory** domain, and are managed in the Keycloak console, which writes every change to it.
 - **Ceph decides every data access**: users reach data only through STS roles that the lakehouses' policies in Meta Catalog grant directories of the one platform bucket to (once a member of `platform-admins` authorized them there), never with a shared key.
 
 Argo CD installs everything from Git. Secrets live in **OpenBao**, not in Git. **OpenTelemetry** collects the metrics and logs, stored in **VictoriaMetrics** and **VictoriaLogs**, and shown in **Grafana**. The logs of the Stackable platforms (Trino, Spark) travel through **Vector** and arrive over OpenTelemetry (OTLP) in a place of their own.
 
 | Web UI | Address | Login |
 |---|---|---|
-| Keycloak (users, groups) | https://keycloak.data.example.org/admin/data-platform/console/ | a user in `platform-admins` (role `realm-admin` of the realm). The master realm (its console and its admin API) is not served through the Gateway, has no human user (Ansible logs in as the client `ansible`, and `make dataplatform-iam` deletes the temporary bootstrap admin), and is reached only through `kubectl -n governance port-forward svc/keycloak-service 8080`. Break-glass: `kubectl -n governance exec keycloak-0 -- /opt/keycloak/bin/kc.sh bootstrap-admin user --username tmp --password:env PW` with `PW` set, then http://localhost:8080/admin/master/console/ |
+| Keycloak (users, groups, clients, sessions; *Users and groups* below) | https://keycloak.data.example.org/admin/data-platform/console/ | a user in `platform-admins` (role `realm-admin` of the realm). The master realm (its console and its admin API) is not served through the Gateway, has no human user (Ansible logs in as the client `ansible`, and `make dataplatform-iam` deletes the temporary bootstrap admin), and is reached only through `kubectl -n governance port-forward svc/keycloak-service 8080`. Break-glass: `kubectl -n governance exec keycloak-0 -- /opt/keycloak/bin/kc.sh bootstrap-admin user --username tmp --password:env PW` with `PW` set, then http://localhost:8080/admin/master/console/ |
 | Trino | https://trino.data.example.org | Keycloak |
 | Grafana | https://grafana.data.example.org | Keycloak (`platform-admins` = Admin, `data-engineers` = Editor) |
 | Argo CD | https://argocd.data.example.org | Keycloak (`platform-admins` = admin, `data-engineers` = viewer: everything but the pod logs); the local admin account is off |
@@ -34,7 +34,7 @@ gitops/iam/access.yaml:  the bucket, the admin group, Meta Catalog's provisioner
 
 **Meta Catalog is the only way to create a schema or a table and the only source of data grants.** Every schema and table belongs to a medallion lakehouse modelled in Meta Catalog (*Medallion lakehouses* under *Everyday use*); its provisioner creates them, and authorizing a lakehouse applies its grants. Anyone who may use Meta Catalog (`platform-admins`, `data-engineers`) may edit a lakehouse's policy, but only a member of `platform-admins` may authorize or reject: an edited policy counts once an administrator authorizes it. `access.yaml` keeps only what the platform needs itself: the admin group and the provisioner.
 
-One bucket, `s3://dataplatform`, holds every lakehouse as a directory, `lakehouse/<lakehouse>/<layer>/<table>`. Every user and group a lakehouse's policy names gets an STS role whose policy is exactly its grants: Meta Catalog's authorize applies them to Ceph at once and keeps them in the record of grants (ConfigMap `governance/metacatalog-grants`), which the CronJob `iam-reconcile` applies again every hour; [`access.yaml`](gitops/iam/access.yaml) holds the platform's own part (the bucket, the admin group, the provisioner). Keycloak groups (`platform-admins`, `data-engineers`, `data-analysts`, more in the Keycloak console) are the teams; `platform-admins` may do everything on the bucket.
+One bucket, `s3://dataplatform`, holds every lakehouse as a directory, `lakehouse/<lakehouse>/<layer>/<table>`. Every user and group a lakehouse's policy names gets an STS role whose policy is exactly its grants: Meta Catalog's authorize applies them to Ceph at once and keeps them in the record of grants (ConfigMap `governance/metacatalog-grants`), which the CronJob `iam-reconcile` applies again every hour; [`access.yaml`](gitops/iam/access.yaml) holds the platform's own part (the bucket, the admin group, the provisioner). The directory's groups (`platform-admins`, `data-engineers`, `data-analysts`, more with `make dataplatform-directory`) are the teams; `platform-admins` may do everything on the bucket.
 
 - **Directly on S3.** You exchange your Keycloak token at Ceph's STS for temporary keys of a role of yours, your group's or your own (`AssumeRoleWithWebIdentity`). Ceph refuses any role your token does not entitle you to.
 - **Trino.**
@@ -88,16 +88,38 @@ make dataplatform-passwords     # the bootstrap and break-glass logins
 | `make dataplatform-openbao` | initialises OpenBao once, saving the keys in `.secrets/openbao-init.json`, and creates the platform's generated secrets |
 | `make dataplatform-cert` | issues the wildcard certificate with a daily renewal timer; every new certificate goes into OpenBao, and from there to the Gateway |
 | `make dataplatform-ceph` | creates the S3 service users and buckets of the platform; their keys go into OpenBao |
-| `make dataplatform-iam` | brings the Keycloak realm in line with Git, makes Ceph's IAM account trust Keycloak, keeps the platform's own roles (the admin group's, the provisioner's), prepares the catalog and enables OpenBao's Keycloak login |
+| `make dataplatform-iam` | brings the Keycloak realm in line with Git, makes it keep people and groups in the directory (a user federation that reads and writes), makes Ceph's IAM account trust Keycloak, keeps the platform's own roles (the admin group's, the provisioner's), prepares the catalog and enables OpenBao's Keycloak login |
 
 On the first install, Argo CD stops at OpenBao (wave -3) until the `openbao` step has initialised it. This is expected.
 
 ## Everyday use
 
-**Users and groups.**
-- Create users in the Keycloak console (realm `data-platform`, a `platform-admins` login; give each an email, Keycloak refuses to log in a user without one) and put them in groups. Nothing else is needed: iam-sync picks up membership changes within about 30 seconds, STS reads the groups from the next token, and JupyterHub lets every realm user in.
-- A **new group** gets data access when a lakehouse's policy grants it a layer: add it to the policy in Meta Catalog and have a member of `platform-admins` authorize it (its role appears at once). Nothing else is needed.
-- Removing a user from every group, or deleting it, takes its access away with its next token; removing it from every lakehouse policy (then authorize) removes its own role. A JupyterHub server it left running stops after an hour idle, and its home volume stays until you delete it.
+**Users and groups.** They are kept in one place, the directory (Samba AD, the pod `governance/samba-ad-0`), and managed in the **Keycloak console** (https://keycloak.data.example.org/admin/data-platform/console/, a `platform-admins` login), which writes every change to the directory:
+
+- **Add a user:** *Users*, *Add user*: a user name, an e-mail address, first and last name. Then *Credentials*, *Set password*; leave *Temporary* on and the user must choose their own at the first login. Then *Groups*, *Join group*.
+- **Everything else about a user** is on the same pages: a new password, leaving a group, disabling (*Enabled* off: no login from then on), deleting. Each is the directory's at once.
+- **People change their own password** at https://keycloak.data.example.org/realms/data-platform/account/ (*Account security*, *Signing in*).
+- **Passwords:** at least 12 characters with a capital, a small letter and a digit; Keycloak says what is missing. They do not expire.
+- **Groups are made and removed on the command line** (below): a group made in the console exists in the directory only from its first member on, and disappears within a minute when it has none by then; a group deleted in the console comes back from the directory.
+
+The same on the command line, with `make dataplatform-directory` (it needs `kubectl`: `make k3s-kubeconfig`), and the way to make or remove a group:
+
+```bash
+make dataplatform-directory ARGS="user list"
+make dataplatform-directory ARGS="group add data-scientists"       # in Keycloak within a minute
+make dataplatform-directory ARGS="group remove data-scientists"    # gone from Keycloak within a minute
+make dataplatform-directory ARGS="user add alice --given-name Alice --surname Rossi --mail alice@example.org --group data-engineers"
+make dataplatform-directory ARGS="user passwd alice"               # asks twice
+make dataplatform-directory ARGS="group join data-analysts alice"  # also: group leave, user disable|enable|remove
+```
+
+- When a change counts:
+  - a new user: at their first login, nothing else is needed;
+  - a membership: within about 30 seconds in Trino (iam-sync), and in the user's next token within 5 minutes (STS, Kubernetes, the web UIs read the groups from the token);
+  - a disabled or removed user: refused at the next login; a token already issued lasts until it expires.
+- A **new group** gets data access when a lakehouse's policy grants it a layer: add it to the policy in Meta Catalog and have a member of `platform-admins` authorize it (its role appears at once).
+- Removing a user from every group, or removing the account, takes its access away with its next token; removing it from every lakehouse policy (then authorize) removes its own role. A JupyterHub server it left running stops after an hour idle, and its home volume stays until you delete it.
+- Keycloak writes to the directory as one account (`keycloak-bind`), which may change what is in the two units of people and groups and nothing else of the domain. The two service accounts of the realm (`service-account-iam-sync`, `service-account-metacatalog-provisioner`) are Keycloak's own, not the directory's.
 
 **SQL with Trino.**
 - Web UI: https://trino.data.example.org.
@@ -340,15 +362,15 @@ gitops/helm-values/<chart>-values.yaml
 | Wave | Components |
 |---|---|
 | -10 | namespaces |
-| -5 | Gateway API CRDs, cert-manager (only for the Barman Cloud plugin's certificates) |
+| -5 | Gateway API CRDs, cert-manager (the Barman Cloud plugin's certificates and the directory's LDAPS certificate) |
 | -4 | Stackable operators (commons, secret, listener, trino, spark-k8s), CloudNativePG, External Secrets, NGINX Gateway Fabric, Keycloak operator |
 | -3 | OpenBao, CloudNativePG's Barman Cloud plugin |
 | -2 | SecretStores, Gateway (+ wildcard certificate, CoreDNS rewrite), S3 connection, RBAC |
 | -1 | VictoriaMetrics, VictoriaLogs, OpenTelemetry collectors, the Vector aggregator, kube-state-metrics |
-| 0 | Keycloak (+ PostgreSQL), Iceberg catalog database |
+| 0 | Keycloak (+ PostgreSQL), the directory (Samba AD, one domain controller), Iceberg catalog database |
 | 1 | the Keycloak realm, iam-sync, Grafana |
 | 2 | Trino, Spark (history server, job RBAC), JupyterHub, VMUI |
-| 3 | Meta Catalog (with the CronJob iam-reconcile, which applies the record of grants every hour), the OpenBao snapshot CronJob and the CronJob that purges finished Spark jobs: last, because Argo CD rates a CronJob whose last run failed (or is still waiting) unhealthy, and the root app waits for each wave to be healthy |
+| 3 | Meta Catalog (with the CronJob iam-reconcile, which applies the record of grants every hour), the OpenBao snapshot CronJob, the directory's backup CronJob and the CronJob that purges finished Spark jobs: last, because Argo CD rates a CronJob whose last run failed (or is still waiting) unhealthy, and the root app waits for each wave to be healthy |
 
 **What Ansible owns on the cluster** (everything else is Argo CD's, from `gitops/`):
 - the k3s HelmChart `argo-cd` (`/var/lib/rancher/k3s/server/manifests/dataplatform-argocd.yaml`, values from `bootstrap/argocd-values.yaml` plus the pinned Git host keys), the Secret `argocd/dataplatform-repo` (the Git key), the AppProject and the root Application from `app-of-apps/` (a change there needs `make dataplatform-argocd`);
@@ -356,7 +378,7 @@ gitops/helm-values/<chart>-values.yaml
 - OpenBao's initialisation and everything inside it (`make dataplatform-openbao`, `-ceph`, `-cert`, `-iam`);
 - the RGW IAM account, its service users and the bucket (`make dataplatform-ceph`), and the platform's own roles (the admin group's, the provisioner's: `make dataplatform-iam`); every other role is Meta Catalog's (its authorize and the CronJob iam-reconcile, from the record of grants);
 - the servicelb node labels and the public DNS records (`make dataplatform-edge`);
-- the running Keycloak realm, converged from the same file the operator imported (`make dataplatform-iam`);
+- the running Keycloak realm, converged from the same file the operator imported, and its user federation `samba-ad`, through which it reads and writes the directory (`make dataplatform-iam`; the directory itself is Argo CD's, and seeds its own groups and first administrator);
 - the annotations `make dataplatform-sync` writes on Argo CD's Applications (`refresh`) and on the ExternalSecrets (`force-sync`).
 
 **Where each setting lives:**
@@ -369,7 +391,9 @@ gitops/helm-values/<chart>-values.yaml
 - **The S3 endpoint and region** are `dataplatform_s3_endpoint` and `dataplatform_s3_region`, derived from `site.yml`'s S3 host and region; Ansible, the manifests, the scripts (`files/site.env`) and the notebook (JupyterHub's env) all follow them. What is Ceph-specific beyond the address, the roles and users made with `radosgw-admin`, the OIDC provider, the account's role ARNs and Trino's `AssumeRole` as the RGW user `trino`, lives in the roles `dataplatform_ceph` and `dataplatform_iam`: another provider needs its own implementation of those two, and `preflight.yml` asserts the endpoint is Ceph's until then.
 - **The Keycloak realm** is `gitops/manifests/governance/keycloak-realm/realm-import.yaml`.
   - The operator imports it once.
-  - `make dataplatform-iam` applies later changes to realm settings, clients and groups.
+  - `make dataplatform-iam` applies later changes to realm settings and clients.
+  - It defines no user and no group: those are the directory's, read and written through the user federation that `make dataplatform-iam` creates (settings: `dataplatform_iam_federation_*` in the role's defaults, `dataplatform_directory_*` in `inventory/group_vars/dataplatform.yml`).
+- **The directory's image** is built from `images/samba-ad` (Samba from Debian testing, pinned by a snapshot of the archive) by `make dataplatform-samba-image ARGS="<samba version>-<build>"`, pushed to GHCR and pinned by digest in `gitops/manifests/governance/samba-ad/samba-ad.yaml.in`. The AD domain's name and its short name are `site_ad_domain` and `site_ad_netbios_domain` (install-time).
   - Signing keys are never touched, because Ceph trusts the realm's certificate.
 
 ## Backups
@@ -383,6 +407,7 @@ in OpenBao, Secret `backup-s3` in `governance`, Argo CD app `governance-backup`)
 | PostgreSQL of Keycloak (`keycloak-db`), of the Iceberg catalog (`iceberg-catalog`) and of Meta Catalog (`metacatalog-db`) | CloudNativePG's Barman Cloud plugin (`operators`, needs cert-manager): continuous WAL archiving plus a base backup every night (`ScheduledBackup`, 02:00, 02:30 and 02:45), into one `ObjectStore` per cluster, named like it; 14 days kept | `cnpg/<cluster>/<cluster>/` |
 | OpenBao (Raft) | CronJob `openbao-snapshot` at 03:15 (service account login, may only read `sys/storage/raft/snapshot`), 14 kept; a run missed while the cluster was off starts at the power-on and waits up to 2 hours for OpenBao | `openbao/openbao-<date>.snap` |
 | etcd of k3s | `subsystems/k3s/README.md` | `etcd/` |
+| The directory (Samba AD: every user, group and password hash, the domain's keys) | CronJob `samba-ad-backup` at 03:45: it starts `ad-backup` in the domain controller's pod (`samba-tool domain backup offline`, which has to run on the controller), 14 kept. As sensitive as an OpenBao snapshot | `samba-ad/samba-ad-<date>.tar.bz2` |
 | The record of grants (ConfigMap `governance/metacatalog-grants`) | CronJob `iam-reconcile`, every hour after it applied the record: `latest.json` and one file per day | `metacatalog-grants/` |
 | Ceph's own state | `make ceph-backup`, to this computer | `backups/ceph/` |
 
@@ -390,6 +415,7 @@ in OpenBao, Secret `backup-s3` in `governance`, Argo CD app `governance-backup`)
 kubectl -n governance get backups                                    # PostgreSQL base backups
 kubectl -n governance get objectstore iceberg-catalog -o jsonpath='{.status.serverRecoveryWindow.iceberg-catalog.firstRecoverabilityPoint}{"\n"}'
 kubectl -n governance create job --from=cronjob/openbao-snapshot snap-now   # an OpenBao snapshot now
+make dataplatform-directory ARGS=backup                                # a backup of the directory now
 source .secrets/s3-backup.env && aws s3 ls --recursive s3://platform-backups/
 ```
 
@@ -407,6 +433,20 @@ make dataplatform-grants ARGS="import /tmp/grants.json"   # validated, put back,
 The bucket sits on the same Ceph as the data: this protects against a broken
 or emptied database and against mistakes, not against losing Ceph. Keep
 `.secrets/` elsewhere too (root README).
+
+**Restore the directory** (users, groups, passwords) with `directory-restore.yml`:
+
+```bash
+make dataplatform-directory-restore-check                                # the drill: backs up now, restores in a scratch pod, compares; changes nothing
+make dataplatform-directory-restore ARGS="-e restore_confirm=yes"        # REPLACES the directory by the newest backup
+make dataplatform-directory-restore ARGS="-e restore_confirm=yes -e directory_backup=samba-ad-20261011T034500Z.tar.bz2"
+make dataplatform-iam                                                    # afterwards: Keycloak syncs with the restored directory
+```
+
+- The replace stops the domain controller, empties its volume, fills it from the backup and starts it again: a few minutes during which nobody logs in with a password. Users and groups made after the backup are gone; everyone else keeps their password, and their id, so Keycloak's copies stay linked.
+- Samba restores a domain only under a new controller name: the controller comes back as `dc2` (then `dc3`, ...). The name is the volume's (`/var/lib/samba/.dc-name`), nothing refers to it: Keycloak talks to the Service `samba-ad`.
+- A run that failed starts over when run again (the volume carries a marker, and the controller refuses to start on a half-restored one). Argo CD is paused for the Application `governance-samba-ad` during the run.
+- The volume lost and no backup: delete the PVC `data-samba-ad-0` and the pod; the controller provisions an empty domain with the groups and the first administrator, and every other user has to be made again (`make dataplatform-iam` afterwards).
 
 **Restore the PostgreSQL clusters** with `pg-restore.yml`
 (`roles/dataplatform_pg_restore`). CloudNativePG never restores into a running
@@ -507,8 +547,12 @@ snapshot. After a restore, `make dataplatform-sync` refreshes the Secrets and
   - Trino chooses for each file: the role granted its directory. A location outside the user's grants gets their default role (their own, else their first group alphabetically, which may be an admin group), and Ceph refuses it unless that role reaches it. The extra credential `s3_role` pins one role for the whole session instead.
   - Directly on S3 and in Spark, a session has one role, and you pick it (`-g <group>` or `-u`).
 - **No password logins from scripts:** the public clients (`data-cli`, `spark`, `kubernetes`) accept only the device or browser flows; a password can be tried only through the smoke test's confidential client, whose secret is in OpenBao. `kubectl oidc-login` with `--grant-type=password` no longer works.
-- **Removing a Keycloak group:** iam-sync refuses an answer that lost a group it had seen (or has none at all), because a half-imported realm would look the same and would revoke every user. After removing a group on purpose, restart iam-sync (`kubectl -n governance rollout restart deploy/iam-sync`), then `make dataplatform-iam ARGS="-e dataplatform_iam_prune=true"` deletes the group's STS role, its bucket if empty, and its catalog role (a bucket with data is kept and named).
-- **Removing a user** (from every group, or from Keycloak): the next token has no group, so STS, Trino and Kubernetes refuse it; a job already running keeps its token until it ends.
+- **One domain controller.** The directory has a single controller (a second one means AD replication between pods). While its pod moves to another node (a drain, a node failure) nobody logs in with a password: Keycloak answers "unexpected error". Tokens already issued and service accounts go on. A token refresh works while the user is in Keycloak's cache (5 minutes, `dataplatform_directory_cache_lifespan`), then it is refused ("User disabled") until the controller is back; the session itself is kept, so the same refresh works again afterwards. iam-sync keeps what it had applied (Keycloak answers it with empty groups meanwhile, which it does not apply).
+- **No password reset by e-mail, no desktop logins.** People change their own password in Keycloak while they know it; a forgotten one is set by an administrator (the console, or `user passwd`). Keycloak sends no mail, and the directory is not reachable from the LAN (no domain join, no Kerberos login).
+- **Groups and the Keycloak console.** Keycloak creates a group in the directory only when its first member joins, and never deletes one there. So an empty group made in the console is dropped at the next sync (within a minute), and a group deleted in the console comes back: make and remove groups with `make dataplatform-directory`.
+- **A user outside the directory** cannot be made any more: Keycloak creates every new user there. `make dataplatform-iam` and the smoke test (F4) still fail if the realm holds one (a user made while the federation was missing or switched off), and iam-sync ignores it.
+- **Removing a group** (`make dataplatform-directory ARGS="group remove <name>"`; Keycloak drops it at its next sync): iam-sync refuses an answer that lost a group it had seen (or has none at all), because a half-imported realm would look the same and would revoke every user. After removing a group on purpose, restart iam-sync (`kubectl -n governance rollout restart deploy/iam-sync`), then `make dataplatform-iam ARGS="-e dataplatform_iam_prune=true"` deletes the group's STS role, its bucket if empty, and its catalog role (a bucket with data is kept and named).
+- **Removing a user** (from every group, or from the directory): the next token has no group, so STS, Trino and Kubernetes refuse it; a job already running keeps its token until it ends.
 - **New Spark tables:** a table Spark creates goes to the job's directory (`-d`), whatever the schema's `location` says (see above).
 - **Spark job length:** a job lives about as long as its token. Tokens of the Keycloak client `spark` last 12 hours.
 - **`platform-admins` is the whole platform:** the group has Keycloak's `realm-admin` (every user, group and client secret), Argo CD's admin role, OpenBao's root-equivalent policy (every secret, the Git key), the whole bucket through its S3 role, every table's catalog entries. Keep it small; an OTP policy for it is a Keycloak setting you may want.
@@ -527,9 +571,9 @@ snapshot. After a restore, `make dataplatform-sync` refreshes the Secrets and
 
 | Hook | What it does |
 |---|---|
-| `hooks/rolling-start.yml` | the rolling reboot starts only when every Application is Healthy, OpenBao is 3/3 and Keycloak is ready |
+| `hooks/rolling-start.yml` | the rolling reboot starts only when every Application is Healthy, OpenBao is 3/3, Keycloak and the directory's domain controller are ready |
 | `hooks/node-enter.yml` (before the k3s drain) | waits for Spark drivers running on the node to finish (`dataplatform_drain_spark_timeout`) |
-| `hooks/node-exit.yml` (after the k3s hook) | waits until OpenBao, Keycloak, every PostgreSQL cluster and every Application are healthy again |
+| `hooks/node-exit.yml` (after the k3s hook) | waits until OpenBao, Keycloak, the domain controller (it moves with its volume when its node drains), every PostgreSQL cluster and every Application are healthy again |
 | `hooks/rolling-end.yml` | the Applications' health |
 | `post-startup.yml` (power-on) | waits until every Application is Healthy |
 
@@ -545,6 +589,14 @@ Nothing is needed before a shutdown: OpenBao unseals itself and the databases re
 | `AssumeRoleWithWebIdentity` fails with `InvalidArgument` | Ceph cannot fetch Keycloak's keys. Check that every RGW host reaches `https://keycloak.data.example.org`. A daemon that started before the network has an empty resolver: restart it (`ceph orch daemon restart rgw.<...>`); `make ceph-preflight` installs the boot-order fix |
 | `AccessDenied` on `AssumeRoleWithWebIdentity` (also `make dataplatform-s3-login`: "Ceph STS refused: AccessDenied") | The token's groups do not contain the role's group (Keycloak membership), the role does not exist (nothing in `access.yaml` grants that user or group, or the apply has not run), or the token comes from a client other than `data-cli` or `spark` |
 | `aws: [ERROR]: argument of type 'NoneType' is not a container or iterable` | Ceph refused the request (`AccessDenied`, `NoSuchBucket`, ...) and the AWS CLI crashed reading the answer: RGW sends an empty `<Message>`, which the CLI's S3 error helper (`customizations/s3errormsg.py`, 2.37) does not expect. The real code: add `--debug 2>&1 \| grep -o '<Code>[^<]*'`. Usual causes: a path without the bucket (`s3://users/you` instead of `s3://dataplatform/users/you/`) or a directory the role is not granted. boto3, `mc` and the scripts are not affected |
+| Keycloak's login page says "Unexpected error when handling authentication request" for everybody | The directory's domain controller is not answering: `kubectl -n governance get pod samba-ad-0`, `kubectl -n governance logs samba-ad-0`. It restarts on its own once after cert-manager renews its certificate (liveness probe `ad-healthy`) |
+| `samba-ad-0` is in `ImagePullBackOff` | The image's package on GHCR is private: make it public once (GitHub, Packages, samba-ad, Package settings), or the boards cannot pull it |
+| `samba-ad-0` restarts with `the directory refused: ... password` | A password in OpenBao (`governance/samba-ad`, or the first administrator's in `governance/platform-admin`) has fewer than 12 characters or fewer than three kinds: write a better one there, `kubectl -n governance annotate externalsecret samba-ad force-sync=$(date +%s)`, delete the pod |
+| Keycloak's console cannot save a user or a password: "Could not modify attribute for DN ..." or an unexpected error | The directory refused the write. The domain controller is down (`kubectl -n governance get pod samba-ad-0`), the password breaks the directory's own rule (12 characters, three kinds: the realm's password policy should have said so first), or Keycloak's account lost its right to write (the controller grants it at its start: `kubectl -n governance logs samba-ad-0 \| grep seed`) |
+| A group made in the Keycloak console disappeared | It had no member at the next sync (within a minute): Keycloak creates a group in the directory only with its first member. `make dataplatform-directory ARGS="group add <name>"` |
+| `make dataplatform-iam` stops at "The realm holds users of its own" | A user was made while the federation was missing or switched off, or the realm predates the directory: create them in the directory under the same name, then `make dataplatform-iam ARGS="-e dataplatform_iam_adopt_directory=true"` (it deletes Keycloak's own copy, the directory's comes in; the user's sessions end) |
+| `make dataplatform-iam` stops at "Keycloak cannot bind to ldaps://samba-ad..." | `AuthenticationFailure`: the controller holds another bind password than OpenBao (it reads it at its start): delete the pod `samba-ad-0`. `CommunicationError`: the controller is down, or Keycloak's pods started before the directory's certificate existed: `kubectl -n governance rollout restart statefulset keycloak` |
+| iam-sync logs "Keycloak lists no member in any group ... not applied" | The directory is down (Keycloak then answers with empty groups) or really empty; iam-sync keeps what it had applied until members come back |
 | The S3 browser says "not in platform-admins" | Log in with an administrator: its button logs you out of Keycloak first |
 | The S3 browser does not list a bucket, or refuses it | Run `make dataplatform-admin-read`: it adds the admin role's read statement to buckets made since, and refreshes the list; a tenant bucket, or one whose owner has no S3 key, stays unreadable (the list says so) |
 | Trino: `No matching S3 security mapping` | No lakehouse grants the user or any of their groups (or nobody authorized the policy yet), or iam-sync has not written the file yet (up to 40 s) |

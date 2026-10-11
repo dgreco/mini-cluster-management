@@ -4,7 +4,8 @@ derives from them.
 
 Every SYNC_INTERVAL seconds it reads the groups of the realm and their members
 (service account of the Keycloak client iam-sync: view-users, query-groups,
-query-users), ACCESS_FILE (the ConfigMap iam-access: gitops/iam/access.yaml,
+query-users; both come from the directory, Samba AD, through the realm's user
+federation, and a member the realm holds itself does not count), ACCESS_FILE (the ConfigMap iam-access: gitops/iam/access.yaml,
 the platform's own settings) and the record of grants (the ConfigMap
 GRANTS_CONFIGMAP of its namespace, which Meta Catalog's authorize and reject
 write, and which they apply to Ceph's STS roles; only grants under
@@ -43,10 +44,15 @@ The RGW roles come from the same record, through Meta Catalog
 (provisioning/lib-iam.sh); the admin groups' and the provisioner's are
 Ansible's (make dataplatform-iam).
 
-Safety: an answer with no group at all, or without a group seen earlier in
-this process, is not applied (it would empty Trino's group file and revoke
-every user), unless IAM_SYNC_ALLOW_SHRINK=true. Removing a group on purpose:
-set that, or restart iam-sync.
+Safety: an answer with no group at all, with no member in any group, or
+without a group seen earlier in this process, is not applied (it would empty
+Trino's group file and revoke every user), unless IAM_SYNC_ALLOW_SHRINK=true.
+Removing a group on purpose: set that, or restart iam-sync. While the
+directory is down Keycloak still answers, 200, with every group and no
+member (Keycloak 26.7): that is the answer with no member, whatever was seen
+before (a process that starts during the outage has seen nothing), and a
+directory that goes away in the middle of a read is caught by reading one
+group with members a second time.
 Standard library only (access.yaml is read by parse_access, a reader of the
 YAML subset the file uses; make dataplatform-iam-check proves it agrees with
 PyYAML); objects are written with server-side apply.
@@ -270,15 +276,41 @@ def keycloak_all(token: str, path: str) -> list:
         first += PAGE
 
 
+class DirectoryDown(Exception):
+    """Keycloak answered, but not from the directory."""
+
+
+_ignored_members: set = set()
+
+
+def group_members(token: str, group: dict) -> list:
+    """Sorted names of the group's enabled members that come from the
+    directory (federationLink): a user the realm holds itself is nobody here."""
+    out = []
+    for m in keycloak_all(token, f"/groups/{group['id']}/members?briefRepresentation=true"):
+        if not m.get("federationLink"):
+            if (group["name"], m["username"]) not in _ignored_members:
+                _ignored_members.add((group["name"], m["username"]))
+                log(f"{m['username']} in {group['name']} is not a user of the directory: ignored")
+        elif m.get("enabled", True):
+            out.append(m["username"])
+    return sorted(out)
+
+
 def read_groups() -> dict:
     """{group name: sorted usernames} of the top-level groups with usable names."""
     token = keycloak_token()
-    out = {}
+    out, by_name = {}, {}
     for g in keycloak_all(token, "/groups?briefRepresentation=true"):
         if not GROUP_PATTERN.match(g["name"]):
             continue
-        members = keycloak_all(token, f"/groups/{g['id']}/members?briefRepresentation=true")
-        out[g["name"]] = sorted(m["username"] for m in members if m.get("enabled", True))
+        out[g["name"]] = group_members(token, g)
+        by_name[g["name"]] = g
+    # the directory may have gone away between two of the answers above
+    witness = next((name for name, users in out.items() if users), None)
+    if witness is not None and not group_members(token, by_name[witness]):
+        raise DirectoryDown(f"{witness} had members a moment ago and has none now: the directory went away "
+                            "during the read, nothing applied")
     return out
 
 
@@ -286,12 +318,17 @@ _seen_groups: set = set()
 
 
 def plausible(groups: dict) -> bool:
-    """False for an answer that would revoke everyone: no group, or a group seen
-    earlier in this process is gone (a half-imported realm, a wrong realm)."""
+    """False for an answer that would revoke everyone: no group, no member in
+    any group (the directory is down), or a group seen earlier in this process
+    is gone (a half-imported realm, a wrong realm)."""
     if ALLOW_SHRINK:
         return True
     if not groups:
         log("Keycloak lists no group: not applied (IAM_SYNC_ALLOW_SHRINK=true to apply)")
+        return False
+    if not any(groups.values()):
+        log("Keycloak lists no member in any group, as it does while the directory is down: not applied "
+            "(IAM_SYNC_ALLOW_SHRINK=true to apply)")
         return False
     gone = _seen_groups - set(groups)
     if gone:

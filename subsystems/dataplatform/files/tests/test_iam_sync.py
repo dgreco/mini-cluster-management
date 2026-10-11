@@ -59,10 +59,69 @@ class Plausibility(unittest.TestCase):
 
     def test_a_group_that_vanished_is_refused_unless_allowed(self):
         m = load()
-        self.assertTrue(m.plausible({"a": [], "b": []}))
-        self.assertFalse(m.plausible({"a": []}))
+        self.assertTrue(m.plausible({"a": ["u"], "b": []}))
+        self.assertFalse(m.plausible({"a": ["u"]}))
         m.ALLOW_SHRINK = True
-        self.assertTrue(m.plausible({"a": []}))
+        self.assertTrue(m.plausible({"a": ["u"]}))
+
+    def test_no_member_anywhere_is_refused_even_by_a_process_that_saw_nothing(self):
+        # Keycloak 26.7 while the directory is down: every group, 200, no member
+        m = load()
+        self.assertFalse(m.plausible({"platform-admins": [], "data-engineers": [], "data-analysts": []}))
+        self.assertTrue(m.plausible({"platform-admins": ["admin"], "data-engineers": [], "data-analysts": []}))
+        self.assertFalse(m.plausible({"platform-admins": [], "data-engineers": [], "data-analysts": []}))
+        m.ALLOW_SHRINK = True
+        self.assertTrue(m.plausible({"platform-admins": [], "data-engineers": [], "data-analysts": []}))
+
+
+class KeycloakAnswers(unittest.TestCase):
+    """read_groups against a stand-in for Keycloak's admin API: answers is a
+    list of {group: [members]} dicts, one per reading of that group's members."""
+    FED = "4_HzvuIATHOsC-Q4dcZ55Q"
+
+    def keycloak(self, m, groups, readings):
+        calls = {}
+
+        def keycloak_all(token, path):
+            if path.startswith("/groups?"):
+                return [{"id": "id-" + g, "name": g} for g in groups]
+            g = path.split("/")[2][3:]
+            calls[g] = calls.get(g, 0) + 1
+            return readings[min(calls[g], len(readings)) - 1].get(g, [])
+        m.keycloak_all = keycloak_all
+        m.keycloak_token = lambda: "token"
+        return calls
+
+    def user(self, name, federated=True, enabled=True):
+        u = {"id": "id-" + name, "username": name, "enabled": enabled}
+        return {**u, "federationLink": self.FED, "origin": self.FED} if federated else u
+
+    def test_only_enabled_members_from_the_directory_count(self):
+        m = load()
+        self.keycloak(m, ["platform-admins", "data-engineers"], [{
+            "platform-admins": [self.user("admin"), self.user("mallory", federated=False)],
+            "data-engineers": [self.user("alice"), self.user("bob", enabled=False)]}])
+        self.assertEqual(m.read_groups(), {"platform-admins": ["admin"], "data-engineers": ["alice"]})
+
+    def test_a_directory_that_is_down_gives_no_member_and_nothing_is_applied(self):
+        m = load()
+        self.keycloak(m, ["platform-admins", "data-engineers"], [{}])
+        answer = m.read_groups()
+        self.assertEqual(answer, {"platform-admins": [], "data-engineers": []})
+        self.assertFalse(m.plausible(answer))
+
+    def test_a_directory_that_goes_away_during_the_read_is_an_error(self):
+        m = load()
+        # the first group is read while the directory answers, the rest is not
+        self.keycloak(m, ["platform-admins", "data-engineers"],
+                      [{"platform-admins": [self.user("admin")]}, {}])
+        with self.assertRaises(m.DirectoryDown):
+            m.read_groups()
+
+    def test_groups_with_unusable_names_are_left_out(self):
+        m = load()
+        self.keycloak(m, ["platform-admins", "Bad Name"], [{"platform-admins": [self.user("admin")]}])
+        self.assertEqual(m.read_groups(), {"platform-admins": ["admin"]})
 
 
 class AccessFile(unittest.TestCase):

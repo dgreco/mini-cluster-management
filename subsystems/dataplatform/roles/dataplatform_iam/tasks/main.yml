@@ -1,13 +1,16 @@
 ---
 # Keycloak as the identity provider of the whole platform (make dataplatform-iam),
 # on the Ceph admin host:
-# 1. the running realm follows gitops/manifests/governance/keycloak-realm;
+# 1. the running realm follows gitops/manifests/governance/keycloak-realm, and
+#    reads its people and groups from the directory (Samba AD) through a
+#    user federation;
 # 2. Ceph RGW trusts the realm (OIDC provider), and the platform's own STS
 #    roles (the admin groups', Meta Catalog's provisioner's); every other role
 #    comes from the grants administrators authorize in Meta Catalog;
 # 3. the Iceberg catalog: the Spark jobs' login;
 # 4. OpenBao accepts Keycloak logins.
-# Re-run it after adding a Keycloak group; membership changes need nothing.
+# People and groups come from the directory (make dataplatform-directory): a
+# new group or a changed membership needs no run of this.
 - name: Keycloak realm
   ansible.builtin.include_tasks: keycloak.yml
 

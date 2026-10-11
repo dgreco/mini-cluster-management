@@ -1,0 +1,382 @@
+#!/usr/bin/python3
+"""adctl: the platform's people and groups in the Samba AD directory.
+
+It works on the domain controller's own database (as root, in its pod), on
+two organizational units only: people (OU=People) and groups (OU=Groups).
+The accounts Samba needs (Administrator, krbtgt) and the platform's bind
+account (OU=Services) are out of its reach, and of Keycloak's, which manages
+people and groups in the same two units (it is the everyday way; this tool
+is the command line beside it, and the only way to make or remove a group
+that sticks).
+
+  adctl seed                          what the platform needs (the entry point runs it at every start)
+  adctl inventory                     every user and group, as JSON
+  adctl user list
+  adctl user add <name> --given-name G --surname S --mail M [--group <g>]...   password: one line on stdin
+  adctl user passwd <name>            new password: one line on stdin
+  adctl user disable|enable|remove <name>
+  adctl group list
+  adctl group add|remove <name>
+  adctl group members <name>
+  adctl group join|leave <group> <user>...
+
+A user made here needs a given name, a surname and an e-mail address (the
+profile Keycloak wants complete at a login). Names are lower case, as
+Keycloak and the platform's role names take them; a user name has at most 20
+characters (sAMAccountName). Passwords never come on the command line.
+A group's name is its cn, which is what Keycloak goes by: a group Keycloak
+made has a random sAMAccountName, and seed sets it to the cn.
+
+seed reads AD_SECRETS_DIR (admin-password, bind-password,
+first-admin-password) and AD_BIND_USER, AD_SEED_GROUPS (space separated),
+AD_FIRST_ADMIN, AD_FIRST_ADMIN_GROUP, AD_FIRST_ADMIN_MAIL: the two service
+passwords are set at every start, missing groups are created, and the first
+administrator is created once per volume (the marker .seed-first-admin), so
+a password changed since, or the account's deliberate removal, stays.
+AD_BIND_WRITES=true gives the bind account full control of the two units'
+objects and of nothing else in the domain: Keycloak then creates, changes
+and removes people, sets passwords and memberships through it.
+Standard library plus Samba's own Python modules.
+"""
+import argparse
+import json
+import os
+import re
+import secrets
+import string
+import subprocess
+import sys
+
+import ldb
+from samba.auth import system_session
+from samba.dcerpc import security
+from samba.ndr import ndr_unpack
+from samba.param import LoadParm
+from samba.samdb import SamDB
+
+PEOPLE_OU = os.environ.get("AD_PEOPLE_OU", "People")
+GROUPS_OU = os.environ.get("AD_GROUPS_OU", "Groups")
+SERVICES_OU = os.environ.get("AD_SERVICES_OU", "Services")
+STATE = "/var/lib/samba"
+USER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,18}[a-z0-9]$")
+GROUP_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}[a-z0-9]$")
+MAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+UF_ACCOUNTDISABLE = 0x2
+
+
+class Refused(Exception):
+    """A request the directory, or this tool, does not accept."""
+
+
+def open_db(path=None) -> SamDB:
+    lp = LoadParm()
+    lp.load_default()
+    return SamDB(url=path, session_info=system_session(), lp=lp)
+
+
+def ou_dn(db: SamDB, ou: str) -> ldb.Dn:
+    return ldb.Dn(db, f"OU={ou},{db.domain_dn()}")
+
+
+def first(msg, attr: str, default: str = "") -> str:
+    return str(msg[attr][0]) if attr in msg else default
+
+
+def search(db: SamDB, ou: str, expression: str, attrs: list) -> list:
+    try:
+        return list(db.search(base=ou_dn(db, ou), scope=ldb.SCOPE_ONELEVEL, expression=expression, attrs=attrs))
+    except ldb.LdbError as e:
+        if e.args[0] == ldb.ERR_NO_SUCH_OBJECT:
+            return []
+        raise
+
+
+def find_user(db: SamDB, name: str, ou: str = PEOPLE_OU):
+    found = search(db, ou, f"(&(objectClass=user)(sAMAccountName={ldb.binary_encode(name)}))", ["sAMAccountName"])
+    return found[0] if found else None
+
+
+def find_group(db: SamDB, name: str):
+    found = search(db, GROUPS_OU, f"(&(objectClass=group)(cn={ldb.binary_encode(name)}))", ["cn", "member"])
+    return found[0] if found else None
+
+
+def need_user(db: SamDB, name: str):
+    user = find_user(db, name)
+    if user is None:
+        raise Refused(f"no user {name} in OU={PEOPLE_OU}")
+    return user
+
+
+def need_group(db: SamDB, name: str):
+    group = find_group(db, name)
+    if group is None:
+        raise Refused(f"no group {name} in OU={GROUPS_OU}")
+    return group
+
+
+def inventory(db: SamDB) -> dict:
+    """{"users": [{name, enabled, mail, given_name, surname, groups}], "groups": {name: [members]}}"""
+    people = search(db, PEOPLE_OU, "(objectClass=user)",
+                    ["sAMAccountName", "mail", "givenName", "sn", "userAccountControl"])
+    by_dn = {str(u.dn).lower(): first(u, "sAMAccountName") for u in people}
+    groups, of_user = {}, {}
+    for g in search(db, GROUPS_OU, "(objectClass=group)", ["cn", "member"]):
+        name = first(g, "cn")
+        members = sorted(by_dn[str(m).lower()] for m in g.get("member", []) if str(m).lower() in by_dn)
+        groups[name] = members
+        for m in members:
+            of_user.setdefault(m, []).append(name)
+    users = [{"name": first(u, "sAMAccountName"),
+              "enabled": not int(first(u, "userAccountControl", "0")) & UF_ACCOUNTDISABLE,
+              "mail": first(u, "mail"), "given_name": first(u, "givenName"), "surname": first(u, "sn"),
+              "groups": sorted(of_user.get(first(u, "sAMAccountName"), []))} for u in people]
+    return {"users": sorted(users, key=lambda u: u["name"]), "groups": dict(sorted(groups.items()))}
+
+
+def read_password() -> str:
+    password = sys.stdin.readline().rstrip("\r\n")
+    if not password:
+        raise Refused("no password on stdin")
+    return password
+
+
+def random_password() -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(40)) + "aA1"
+
+
+def set_password(db: SamDB, name: str, password: str) -> None:
+    db.setpassword(f"(&(objectClass=user)(sAMAccountName={ldb.binary_encode(name)}))", password,
+                   force_change_at_next_login=False, username=name)
+
+
+def set_membership(db: SamDB, group, user, add: bool) -> bool:
+    """True when the group changed."""
+    has = str(user.dn).lower() in {str(m).lower() for m in group.get("member", [])}
+    if has == add:
+        return False
+    msg = ldb.Message(group.dn)
+    msg["member"] = ldb.MessageElement(str(user.dn), ldb.FLAG_MOD_ADD if add else ldb.FLAG_MOD_DELETE, "member")
+    db.modify(msg)
+    return True
+
+
+# ---------------------------------------------------------------- users ----
+def user_add(db: SamDB, a) -> None:
+    if not USER_PATTERN.match(a.name):
+        raise Refused(f"user name {a.name!r}: 2 to 20 of a-z, 0-9 and -, not at either end")
+    if not MAIL_PATTERN.match(a.mail):
+        raise Refused(f"e-mail address {a.mail!r}")
+    if not a.given_name.strip() or not a.surname.strip():
+        raise Refused("a given name and a surname are needed")
+    if db.search(base=db.domain_dn(), scope=ldb.SCOPE_SUBTREE,
+                 expression=f"(sAMAccountName={ldb.binary_encode(a.name)})", attrs=["sAMAccountName"]):
+        raise Refused(f"the name {a.name} is taken in the directory")
+    if search(db, PEOPLE_OU, f"(mail={ldb.binary_encode(a.mail)})", ["mail"]):
+        raise Refused(f"the e-mail address {a.mail} is another user's (Keycloak refuses a second one)")
+    groups = [need_group(db, g) for g in a.group]
+    password = read_password()
+    db.newuser(username=a.name, password=password, useusernameascn=True, userou=f"OU={PEOPLE_OU}",
+               givenname=a.given_name.strip(), surname=a.surname.strip(), mailaddress=a.mail)
+    user = find_user(db, a.name)
+    for g in groups:
+        set_membership(db, g, user, True)
+    print(f"user {a.name} created" + (f", in {', '.join(a.group)}" if a.group else ""))
+
+
+def user_passwd(db: SamDB, a) -> None:
+    need_user(db, a.name)
+    set_password(db, a.name, read_password())
+    print(f"password of {a.name} set")
+
+
+def user_switch(db: SamDB, a) -> None:
+    need_user(db, a.name)
+    expression = f"(&(objectClass=user)(sAMAccountName={ldb.binary_encode(a.name)}))"
+    if a.action == "disable":
+        db.disable_account(expression)
+    else:
+        db.enable_account(expression)
+    print(f"user {a.name} {a.action}d")
+
+
+def user_remove(db: SamDB, a) -> None:
+    db.delete(need_user(db, a.name).dn)
+    print(f"user {a.name} removed")
+
+
+def user_list(db: SamDB, a) -> None:
+    for u in inventory(db)["users"]:
+        missing = [k for k in ("mail", "given_name", "surname") if not u[k]]
+        print(f"{u['name']:<22}{'' if u['enabled'] else 'DISABLED ':<9}{u['mail']:<36}{', '.join(u['groups'])}"
+              + (f"   (no {', '.join(missing)}: Keycloak cannot log this user in)" if missing else ""))
+
+
+# ---------------------------------------------------------------- groups ----
+def group_add(db: SamDB, a) -> None:
+    if not GROUP_PATTERN.match(a.name):
+        raise Refused(f"group name {a.name!r}: 2 to 42 of a-z, 0-9 and -, not at either end")
+    if find_group(db, a.name) is not None or db.search(
+            base=db.domain_dn(), scope=ldb.SCOPE_SUBTREE,
+            expression=f"(sAMAccountName={ldb.binary_encode(a.name)})", attrs=["sAMAccountName"]):
+        raise Refused(f"the name {a.name} is taken in the directory")
+    db.newgroup(a.name, groupou=f"OU={GROUPS_OU}")
+    print(f"group {a.name} created")
+
+
+def group_remove(db: SamDB, a) -> None:
+    db.delete(need_group(db, a.name).dn)
+    print(f"group {a.name} removed")
+
+
+def group_list(db: SamDB, a) -> None:
+    for name, members in inventory(db)["groups"].items():
+        print(f"{name:<32}{', '.join(members)}")
+
+
+def group_members(db: SamDB, a) -> None:
+    need_group(db, a.name)
+    for member in inventory(db)["groups"][a.name]:
+        print(member)
+
+
+def group_change(db: SamDB, a) -> None:
+    users = [need_user(db, u) for u in a.users]
+    add = a.action == "join"
+    for user in users:
+        changed = set_membership(db, need_group(db, a.name), user, add)
+        name = first(user, "sAMAccountName")
+        print(f"{name} {'joined' if add else 'left'} {a.name}" if changed
+              else f"{name} was {'already' if add else 'not'} in {a.name}")
+
+
+# ---------------------------------------------------------------- seed ----
+def secret(name: str) -> str:
+    with open(os.path.join(os.environ.get("AD_SECRETS_DIR", "/run/secrets/samba-ad"), name)) as f:
+        value = f.read().strip()
+    if not value:
+        raise Refused(f"the secret {name} is empty")
+    return value
+
+
+def grant_bind_account(db: SamDB, bind: str) -> None:
+    """Full control of the people's and the groups' objects for the bind
+    account (an allow ACE on each unit, inherited by what is in it), unless it
+    is there already. Nothing above or beside the two units is touched."""
+    account = find_user(db, bind, SERVICES_OU)
+    sid = str(ndr_unpack(security.dom_sid, db.search(base=account.dn, scope=ldb.SCOPE_BASE,
+                                                     attrs=["objectSid"])[0]["objectSid"][0]))
+    for ou in (PEOPLE_OU, GROUPS_OU):
+        dn = ou_dn(db, ou)
+        raw = db.search(base=dn, scope=ldb.SCOPE_BASE, attrs=["nTSecurityDescriptor"])[0]["nTSecurityDescriptor"][0]
+        if f";;;{sid})" in ndr_unpack(security.descriptor, raw).as_sddl():
+            continue
+        subprocess.run(["samba-tool", "dsacl", "set", f"--objectdn={dn}", f"--sddl=(A;CI;GA;;;{sid})"],
+                       check=True, stdout=subprocess.DEVNULL)
+        print(f"seed: {bind} may write in OU={ou}")
+
+
+def name_groups(db: SamDB) -> None:
+    """A group Keycloak made has only a cn (Samba gives it a random
+    sAMAccountName, $...): the cn becomes the account name too."""
+    for g in search(db, GROUPS_OU, "(objectClass=group)", ["cn", "sAMAccountName"]):
+        name = first(g, "cn")
+        if first(g, "sAMAccountName") == name:
+            continue
+        if db.search(base=db.domain_dn(), scope=ldb.SCOPE_SUBTREE,
+                     expression=f"(sAMAccountName={ldb.binary_encode(name)})", attrs=["sAMAccountName"]):
+            print(f"seed: group {name} keeps the account name {first(g, 'sAMAccountName')}: {name} is taken")
+            continue
+        msg = ldb.Message(g.dn)
+        msg["sAMAccountName"] = ldb.MessageElement(name, ldb.FLAG_MOD_REPLACE, "sAMAccountName")
+        db.modify(msg)
+        print(f"seed: group {name} has its name as account name")
+
+
+def seed(db: SamDB, a) -> None:
+    for ou in (PEOPLE_OU, GROUPS_OU, SERVICES_OU):
+        try:
+            db.search(base=ou_dn(db, ou), scope=ldb.SCOPE_BASE, attrs=["ou"])
+        except ldb.LdbError as e:
+            if e.args[0] != ldb.ERR_NO_SUCH_OBJECT:
+                raise
+            db.create_ou(ou_dn(db, ou))
+            print(f"seed: OU={ou} created")
+    set_password(db, "Administrator", secret("admin-password"))
+    bind = os.environ.get("AD_BIND_USER", "keycloak-bind")
+    if find_user(db, bind, SERVICES_OU) is None:
+        db.newuser(username=bind, password=random_password(), useusernameascn=True, userou=f"OU={SERVICES_OU}",
+                   description="Keycloak reads people and groups as this account")
+        print(f"seed: bind account {bind} created")
+    set_password(db, bind, secret("bind-password"))
+    if os.environ.get("AD_BIND_WRITES", "false") == "true":
+        grant_bind_account(db, bind)
+    name_groups(db)
+    for group in os.environ.get("AD_SEED_GROUPS", "").split():
+        if find_group(db, group) is None:
+            db.newgroup(group, groupou=f"OU={GROUPS_OU}")
+            print(f"seed: group {group} created")
+    admin = os.environ.get("AD_FIRST_ADMIN", "")
+    marker = os.path.join(STATE, ".seed-first-admin")
+    if admin and not os.path.exists(marker):
+        if find_user(db, admin) is None:
+            db.newuser(username=admin, password=secret("first-admin-password"), useusernameascn=True,
+                       userou=f"OU={PEOPLE_OU}", givenname="Platform", surname="Administrator",
+                       mailaddress=os.environ["AD_FIRST_ADMIN_MAIL"])
+            print(f"seed: first administrator {admin} created")
+        group = os.environ.get("AD_FIRST_ADMIN_GROUP", "")
+        if group:
+            set_membership(db, need_group(db, group), find_user(db, admin), True)
+        with open(marker, "w") as f:
+            f.write(admin + "\n")
+    found = inventory(db)
+    print(f"seed: {len(found['users'])} users, groups {', '.join(found['groups']) or 'none'}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="adctl", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--samdb", help="another sam.ldb (a restored backup), default this controller's")
+    sub = ap.add_subparsers(dest="command", required=True)
+    sub.add_parser("seed").set_defaults(run=seed)
+    sub.add_parser("inventory").set_defaults(run=lambda db, a: print(json.dumps(inventory(db), indent=1)))
+    user = sub.add_parser("user").add_subparsers(dest="action", required=True)
+    user.add_parser("list").set_defaults(run=user_list)
+    p = user.add_parser("add")
+    p.add_argument("name")
+    p.add_argument("--given-name", required=True)
+    p.add_argument("--surname", required=True)
+    p.add_argument("--mail", required=True)
+    p.add_argument("--group", action="append", default=[])
+    p.set_defaults(run=user_add)
+    for action, run in (("passwd", user_passwd), ("disable", user_switch), ("enable", user_switch),
+                        ("remove", user_remove)):
+        p = user.add_parser(action)
+        p.add_argument("name")
+        p.set_defaults(run=run)
+    group = sub.add_parser("group").add_subparsers(dest="action", required=True)
+    group.add_parser("list").set_defaults(run=group_list)
+    for action, run in (("add", group_add), ("remove", group_remove), ("members", group_members)):
+        p = group.add_parser(action)
+        p.add_argument("name")
+        p.set_defaults(run=run)
+    for action in ("join", "leave"):
+        p = group.add_parser(action)
+        p.add_argument("name", metavar="group")
+        p.add_argument("users", nargs="+", metavar="user")
+        p.set_defaults(run=group_change)
+    a = ap.parse_args()
+    try:
+        a.run(open_db(a.samdb), a)
+    except Refused as e:
+        print(f"adctl: {e}", file=sys.stderr)
+        return 1
+    except ldb.LdbError as e:
+        # e.g. a password the domain's policy refuses
+        print(f"adctl: the directory refused: {e.args[1] if len(e.args) > 1 else e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
