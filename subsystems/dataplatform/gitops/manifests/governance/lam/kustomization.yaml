@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: governance
+resources:
+  - lam-secrets.yaml
+  - lam.yaml
+  - lam-httproute.yaml
+# The server profile and the start script; a change rolls the Deployment
+# (name hash).
+configMapGenerator:
+  - name: lam-config
+    files:
+      - lam.conf
+      - lam-start.sh

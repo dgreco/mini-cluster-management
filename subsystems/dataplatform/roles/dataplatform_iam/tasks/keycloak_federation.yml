@@ -1,10 +1,8 @@
 ---
-# People and groups are kept in the directory (Samba AD, governance/samba-ad)
-# and nowhere else. This makes and keeps the realm's user federation
+# People and groups come from the directory (Samba AD, governance/samba-ad)
+# and from nowhere else. This makes and keeps the realm's user federation
 # (dataplatform_directory_federation): Keycloak reads the two organizational
-# units over LDAPS as the bind account and writes every change back, so the
-# Keycloak console is where people are managed, and a user made there is made
-# in the directory.
+# units over LDAPS as the bind account, and can change nothing there.
 # - It is created through the admin API, never by the realm import: Keycloak
 #   starts a federation's periodic sync when one is made or its periods change
 #   through the API (and at its own start), not for a realm the operator's

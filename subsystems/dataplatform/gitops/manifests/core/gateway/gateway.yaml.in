@@ -151,3 +151,36 @@ spec:
           selector:
             matchLabels:
               kubernetes.io/metadata.name: governance
+    # LDAP Account Manager, the directory's web interface (governance/lam)
+    - name: directory-https
+      hostname: directory.<%= dataplatform_domain %>
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: gateway-tls
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: governance
+    # The directory's LDAPS, ldaps://<%= dataplatform_directory_external_host %>:636, for LDAP clients outside
+    # the cluster (the TCPRoute governance/samba-ad-ldaps). Plain TCP: the TLS
+    # connection goes to the domain controller as it is, which answers with
+    # its own certificate, so no password is in clear on the way. Not a TLS
+    # listener: one that terminates hands the controller plain LDAP, which it
+    # refuses for password logins, and one that passes through routes by SNI,
+    # which not every LDAP client sends.
+    - name: directory-ldaps
+      port: 636
+      protocol: TCP
+      allowedRoutes:
+        kinds:
+          - kind: TCPRoute
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: governance

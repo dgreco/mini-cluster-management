@@ -1,0 +1,24 @@
+# https://directory.data.example.org -> oauth2-proxy -> LDAP Account Manager (served under /lam)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: lam
+spec:
+  parentRefs:
+    - name: main-gateway
+      namespace: core
+      sectionName: directory-https
+  hostnames:
+    - directory.data.example.org
+  rules:
+    # the bare address: LAM would answer with a redirect to plain http
+    - matches:
+        - path: {type: Exact, value: /}
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            path: {type: ReplaceFullPath, replaceFullPath: /lam/}
+            statusCode: 302
+    - backendRefs:
+        - name: lam
+          port: 80

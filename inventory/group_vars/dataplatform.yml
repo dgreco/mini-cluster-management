@@ -47,26 +47,39 @@ dataplatform_keycloak_issuer: "{{ dataplatform_keycloak_url }}/realms/{{ datapla
 
 # ---------------------------------------------------------------- directory ----
 # People and groups are kept in one place, the Samba Active Directory domain
-# governance/samba-ad (one domain controller, reachable inside the cluster
-# only). Keycloak reads them from it over LDAPS and writes every change back
-# (make dataplatform-iam creates that federation), so they are managed in the
-# Keycloak console, where people also change their own password;
-# make dataplatform-directory is the command line beside it. Two
-# organizational units hold them; the accounts Samba needs and Keycloak's
-# bind account are elsewhere, so they never show up in Keycloak, and the bind
-# account may write in those two units only.
+# governance/samba-ad (one domain controller; of its protocols only LDAPS is
+# reachable from outside the cluster, through the Gateway: no machine joins
+# this domain). Keycloak reads them from it over LDAPS and can change nothing
+# there (make dataplatform-iam creates that federation). They are managed in
+# the directory's web interface, LDAP Account Manager (governance/lam,
+# https://directory.<platform domain>), where each administrator works as
+# their own directory account; make dataplatform-directory is the command
+# line beside it. Two organizational units hold them, and the members of the
+# admin groups have full control of those two units and of nothing else; the
+# accounts Samba needs and the bind account are elsewhere, so they never show
+# up in Keycloak.
 dataplatform_directory_domain: "{{ site_ad_domain }}"                  # AD DNS domain; its Kerberos realm in capitals
 dataplatform_directory_netbios_domain: "{{ site_ad_netbios_domain }}"
 dataplatform_directory_base_dn: "DC={{ dataplatform_directory_domain.split('.') | join(',DC=') }}"
 dataplatform_directory_people_ou: People
 dataplatform_directory_groups_ou: Groups
 dataplatform_directory_services_ou: Services
-dataplatform_directory_bind_user: keycloak-bind      # Keycloak's account in the directory: full control of the two units, nothing else
-# Shortest password the directory and the realm's policy take; both also want
-# capitals, small letters and digits
+# Keycloak's account in the directory, and the one LDAP Account Manager looks
+# a login's entry up with: an ordinary account, it can write nothing
+dataplatform_directory_bind_user: keycloak-bind
+# Shortest password the directory takes, and LDAP Account Manager before it
+# sends one there; both also want three kinds of characters
 dataplatform_directory_min_password_length: 12
 # The domain controller, as Keycloak reaches it (the certificate names it)
 dataplatform_directory_url: ldaps://samba-ad.governance.svc:636
+# ... and as LDAP clients outside the cluster reach it, through the Gateway:
+# ldaps://<host>:636, a name the platform's wildcard DNS record resolves. The
+# Gateway passes the connection on as it is, so the certificate is the
+# controller's own (it names this host too) and clients must trust the
+# directory's certificate authority (make dataplatform-directory ARGS=ca).
+dataplatform_directory_external_host: "ad.{{ dataplatform_domain }}"
+# Its web interface (LDAP Account Manager behind oauth2-proxy, admin groups only)
+dataplatform_directory_ui_url: "https://directory.{{ dataplatform_domain }}"
 dataplatform_directory_namespace: governance
 dataplatform_directory_pod: samba-ad-0
 # Groups the domain controller creates when they are missing, and the first
@@ -263,9 +276,10 @@ dataplatform_openbao_generated:
   governance/keycloak-db: {username: keycloak, password: null}
   governance/keycloak-admin: {username: temp-admin, password: null}      # master realm bootstrap admin
   governance/keycloak-clients: {argocd: null, grafana: null, openbao: null, trino: null, jupyterhub: null, iam-sync: null, smoke-test: null, ansible: null,
-                                s3browser: null, vmui: null, metacatalog: null, metacatalog-provisioner: null}
+                                s3browser: null, vmui: null, metacatalog: null, metacatalog-provisioner: null, directory: null}
   governance/platform-admin: {username: admin, password: null}           # first user of the directory (in the admin group)
-  governance/samba-ad: {admin-password: null, bind-password: null}       # the domain's Administrator; the account Keycloak manages the directory as
+  governance/samba-ad: {admin-password: null, bind-password: null}       # the domain's Administrator; the account Keycloak reads the directory as
+  governance/directory-proxy: {cookie-secret: null}           # oauth2-proxy's cookie key in front of LDAP Account Manager
   governance/iceberg-catalog-db: {username: iceberg, password: null}
   governance/iceberg-catalog-spark: {username: spark_writer, password: null}   # the Spark jobs' catalog login (no DDL)
   governance/metacatalog-db: {username: metacatalog, password: null}  # owner of Meta Catalog's database

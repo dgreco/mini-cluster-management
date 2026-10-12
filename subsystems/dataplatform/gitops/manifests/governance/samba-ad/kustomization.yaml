@@ -5,3 +5,4 @@ resources:
   - samba-ad-secrets.yaml
   - samba-ad-tls.yaml
   - samba-ad.yaml
+  - samba-ad-route.yaml

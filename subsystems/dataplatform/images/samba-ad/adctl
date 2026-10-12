@@ -4,10 +4,10 @@
 It works on the domain controller's own database (as root, in its pod), on
 two organizational units only: people (OU=People) and groups (OU=Groups).
 The accounts Samba needs (Administrator, krbtgt) and the platform's bind
-account (OU=Services) are out of its reach, and of Keycloak's, which manages
-people and groups in the same two units (it is the everyday way; this tool
-is the command line beside it, and the only way to make or remove a group
-that sticks).
+account (OU=Services) are out of its reach, and of Keycloak's, which reads
+people and groups from the same two units and changes nothing. The everyday
+way to manage them is LDAP Account Manager, as a member of a writer group;
+this tool is the command line beside it.
 
   adctl seed                          what the platform needs (the entry point runs it at every start)
   adctl inventory                     every user and group, as JSON
@@ -24,8 +24,9 @@ A user made here needs a given name, a surname and an e-mail address (the
 profile Keycloak wants complete at a login). Names are lower case, as
 Keycloak and the platform's role names take them; a user name has at most 20
 characters (sAMAccountName). Passwords never come on the command line.
-A group's name is its cn, which is what Keycloak goes by: a group Keycloak
-made has a random sAMAccountName, and seed sets it to the cn.
+A group's name is its cn, which is what Keycloak goes by: seed gives a
+group that has another sAMAccountName (one made over LDAP without it) its cn
+as account name.
 
 seed reads AD_SECRETS_DIR (admin-password, bind-password,
 first-admin-password) and AD_BIND_USER, AD_SEED_GROUPS (space separated),
@@ -33,9 +34,10 @@ AD_FIRST_ADMIN, AD_FIRST_ADMIN_GROUP, AD_FIRST_ADMIN_MAIL: the two service
 passwords are set at every start, missing groups are created, and the first
 administrator is created once per volume (the marker .seed-first-admin), so
 a password changed since, or the account's deliberate removal, stays.
-AD_BIND_WRITES=true gives the bind account full control of the two units'
-objects and of nothing else in the domain: Keycloak then creates, changes
-and removes people, sets passwords and memberships through it.
+AD_WRITER_GROUPS (space separated, groups of OU=Groups) names who manages
+the directory over LDAP: their members get full control of the two units'
+objects and of nothing else in the domain. seed takes that right away from
+the bind account and from every group not named.
 Standard library plus Samba's own Python modules.
 """
 import argparse
@@ -51,6 +53,7 @@ import ldb
 from samba.auth import system_session
 from samba.dcerpc import security
 from samba.ndr import ndr_unpack
+from samba.sd_utils import SDUtils
 from samba.param import LoadParm
 from samba.samdb import SamDB
 
@@ -260,25 +263,38 @@ def secret(name: str) -> str:
     return value
 
 
-def grant_bind_account(db: SamDB, bind: str) -> None:
-    """Full control of the people's and the groups' objects for the bind
-    account (an allow ACE on each unit, inherited by what is in it), unless it
-    is there already. Nothing above or beside the two units is touched."""
-    account = find_user(db, bind, SERVICES_OU)
-    sid = str(ndr_unpack(security.dom_sid, db.search(base=account.dn, scope=ldb.SCOPE_BASE,
-                                                     attrs=["objectSid"])[0]["objectSid"][0]))
+def sid_of(db: SamDB, entry) -> str:
+    raw = db.search(base=entry.dn, scope=ldb.SCOPE_BASE, attrs=["objectSid"])[0]["objectSid"][0]
+    return str(ndr_unpack(security.dom_sid, raw))
+
+
+def set_writers(db: SamDB, bind: str, writers: list) -> None:
+    """Full control of the people's and the groups' objects (an allow entry on
+    each unit, inherited by what is in it) for the members of the writer
+    groups, and for no other principal of ours: an entry of the bind account
+    or of another group of OU=Groups is removed. Nothing above or beside the
+    two units is touched, nor the entries Samba put there itself."""
+    wanted = {sid_of(db, need_group(db, g)): g for g in writers}
+    ours = {sid_of(db, g): first(g, "cn") for g in search(db, GROUPS_OU, "(objectClass=group)", ["cn"])}
+    ours[sid_of(db, find_user(db, bind, SERVICES_OU))] = bind
+    helper = SDUtils(db)
     for ou in (PEOPLE_OU, GROUPS_OU):
         dn = ou_dn(db, ou)
-        raw = db.search(base=dn, scope=ldb.SCOPE_BASE, attrs=["nTSecurityDescriptor"])[0]["nTSecurityDescriptor"][0]
-        if f";;;{sid})" in ndr_unpack(security.descriptor, raw).as_sddl():
-            continue
-        subprocess.run(["samba-tool", "dsacl", "set", f"--objectdn={dn}", f"--sddl=(A;CI;GA;;;{sid})"],
-                       check=True, stdout=subprocess.DEVNULL)
-        print(f"seed: {bind} may write in OU={ou}")
+        sd = helper.read_sd_on_dn(dn)
+        have = {str(ace.trustee) for ace in sd.dacl.aces
+                if not ace.flags & security.SEC_ACE_FLAG_INHERITED_ACE and str(ace.trustee) in ours}
+        for sid in sorted(have - set(wanted)):
+            sd.dacl_del(security.dom_sid(sid))
+            print(f"seed: {ours[sid]} may no longer write in OU={ou}")
+        if have - set(wanted):
+            helper.modify_sd_on_dn(dn, sd)
+        for sid in sorted(set(wanted) - have):
+            helper.dacl_prepend_aces(dn, f"(A;CI;GA;;;{sid})")
+            print(f"seed: members of {wanted[sid]} may write in OU={ou}")
 
 
 def name_groups(db: SamDB) -> None:
-    """A group Keycloak made has only a cn (Samba gives it a random
+    """A group made over LDAP with only a cn (Samba then gives it a random
     sAMAccountName, $...): the cn becomes the account name too."""
     for g in search(db, GROUPS_OU, "(objectClass=group)", ["cn", "sAMAccountName"]):
         name = first(g, "cn")
@@ -310,9 +326,6 @@ def seed(db: SamDB, a) -> None:
                    description="Keycloak reads people and groups as this account")
         print(f"seed: bind account {bind} created")
     set_password(db, bind, secret("bind-password"))
-    if os.environ.get("AD_BIND_WRITES", "false") == "true":
-        grant_bind_account(db, bind)
-    name_groups(db)
     for group in os.environ.get("AD_SEED_GROUPS", "").split():
         if find_group(db, group) is None:
             db.newgroup(group, groupou=f"OU={GROUPS_OU}")
@@ -330,6 +343,8 @@ def seed(db: SamDB, a) -> None:
             set_membership(db, need_group(db, group), find_user(db, admin), True)
         with open(marker, "w") as f:
             f.write(admin + "\n")
+    set_writers(db, bind, os.environ.get("AD_WRITER_GROUPS", "").split())
+    name_groups(db)
     found = inventory(db)
     print(f"seed: {len(found['users'])} users, groups {', '.join(found['groups']) or 'none'}")
 

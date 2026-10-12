@@ -40,6 +40,10 @@ ad_render_conf() {  # <dc name> [<dns forwarder>]
     [ -z "$forwarder" ] || echo "    dns forwarder = $forwarder"
     echo "    acl_xattr:security_acl_name = user.NTACL"
     echo "    ldap server require strong auth = yes"
+    # A password set by an administrator counts at once. Samba's default lets
+    # the one before it log in for another hour (meant for desktops that
+    # cached it; an LDAP bind, so every Keycloak login, takes it too).
+    echo "    old password allowed period = 0"
     echo "    tls enabled = yes"
     echo "    tls keyfile = $ad_run/tls/tls.key"
     echo "    tls certfile = $ad_run/tls/tls.crt"

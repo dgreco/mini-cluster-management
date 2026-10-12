@@ -95,13 +95,19 @@
     body: "{{ _wanted }}"
     status_code: [204]
   vars:
+    # passwordPolicy is always sent, empty unless the file has one: Keycloak
+    # keeps a setting a PUT does not name, and this realm had a policy while
+    # Keycloak wrote passwords to the directory. Keycloak's answer leaves an
+    # empty one out.
     _wanted: >-
-      {%- set out = {} -%}
+      {%- set out = {'passwordPolicy': ''} -%}
       {%- for k, v in dataplatform_iam_realm.items() if v is not mapping and (v is string or v is not iterable) -%}
       {%- set _ = out.update({k: v}) -%}
       {%- endfor -%}
       {{ out }}
-    _current: "{{ dataplatform_iam_realm_current.json | dict2items | selectattr('key', 'in', _wanted.keys()) | items2dict }}"
+    _current: >-
+      {{ {'passwordPolicy': ''}
+         | combine(dataplatform_iam_realm_current.json | dict2items | selectattr('key', 'in', _wanted.keys()) | items2dict) }}
   when: _current != _wanted
   delegate_to: "{{ dataplatform_iam_kc_host }}"
   changed_when: true

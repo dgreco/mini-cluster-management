@@ -1,12 +1,15 @@
 # The realm <%= dataplatform_keycloak_realm %>: one client per platform and the service accounts of
 # two of them (iam-sync, Meta Catalog's provisioner). It defines no person and
-# no group: both are kept in the directory (Samba AD, governance/samba-ad),
-# which Keycloak reads and writes through the user federation that make
-# dataplatform-iam creates in the running realm (a federation in this file would never sync:
-# the operator imports a realm in a process of its own, and Keycloak starts a
-# federation's periodic sync only for one made through its API, or at its own
-# start). <%= site_admin_group %> administers the realm in its own console,
-# /admin/<%= dataplatform_keycloak_realm %>/console (make dataplatform-iam gives that group its role).
+# no group: both come from the directory (Samba AD, governance/samba-ad),
+# which Keycloak only reads, through the user federation that make
+# dataplatform-iam creates in the running realm (a federation in this file
+# would never sync: the operator imports a realm in a process of its own, and
+# Keycloak starts a federation's periodic sync only for one made through its
+# API, or at its own start). People and groups are managed in the directory's
+# own web interface (LDAP Account Manager, governance/lam) or with
+# make dataplatform-directory. <%= site_admin_group %> administers the realm (clients,
+# sessions) in its own console, /admin/<%= dataplatform_keycloak_realm %>/console (make dataplatform-iam
+# gives that group its role).
 #
 # This file is the only definition of the realm's settings and clients:
 # - the Keycloak operator imports it once, when the realm does not exist yet
@@ -67,6 +70,10 @@ spec:
       secret:
         name: keycloak-realm-secrets
         key: metacatalog
+    DIRECTORY_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: directory
     METACATALOG_PROVISIONER_SECRET:
       secret:
         name: keycloak-realm-secrets
@@ -81,9 +88,6 @@ spec:
     duplicateEmailsAllowed: false
     resetPasswordAllowed: false
     bruteForceProtected: true
-    # what the directory asks of a password, said by Keycloak before it sends
-    # one there (the federation validates against this policy)
-    passwordPolicy: length(<%= dataplatform_directory_min_password_length %>) and upperCase(1) and lowerCase(1) and digits(1)
     accessTokenLifespan: 3600
     ssoSessionIdleTimeout: 28800
     ssoSessionMaxLifespan: 43200
@@ -311,6 +315,46 @@ spec:
         protocolMapper: oidc-audience-mapper
         config:
           included.client.audience: vmui
+          id.token.claim: 'false'
+          access.token.claim: 'true'
+          introspection.token.claim: 'true'
+    # oauth2-proxy in front of LDAP Account Manager, the directory's web
+    # interface (manifests/governance/lam): only <%= dataplatform_iam_admin_groups | join(', ') %> get
+    # in (--allowed-group); LAM then asks for their directory login
+    - clientId: directory
+      name: Directory (LDAP Account Manager, administrators)
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${DIRECTORY_SECRET}
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: false
+      redirectUris:
+      - https://directory.<%= dataplatform_domain %>/oauth2/callback
+      webOrigins:
+      - +
+      attributes:
+        pkce.code.challenge.method: S256
+        post.logout.redirect.uris: https://directory.<%= dataplatform_domain %>/*
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+      # oauth2-proxy's keycloak-oidc provider checks the access token's audience
+      - name: audience-directory
+        protocol: openid-connect
+        protocolMapper: oidc-audience-mapper
+        config:
+          included.client.audience: directory
           id.token.claim: 'false'
           access.token.claim: 'true'
           introspection.token.claim: 'true'

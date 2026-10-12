@@ -49,4 +49,6 @@
           - "{{ status_directory.stdout_lines | default([]) }}"
           - "Web UIs: {{ ['argocd', 'openbao', 'keycloak', 'grafana', 'trino', 'jupyter']
                         | map('regex_replace', '^(.*)$', 'https://\\1.' ~ dataplatform_domain) | join('  ') }}"
+          - "Directory for LDAP clients: ldaps://{{ dataplatform_directory_external_host }}:636 (its certificate authority:
+             make dataplatform-directory ARGS=ca)"
           - "Logins: make dataplatform-passwords"

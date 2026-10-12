@@ -38,22 +38,32 @@ C  Spark (web identity): the engineer's job reads Trino's table and writes
    account reads no Secret and starts no pod mounting another one.
 D  Kubernetes (Keycloak login): the engineer may run jobs in compute, not
    read the platform's secrets, nor write objects the Spark fence refuses.
-F  the directory is the only place people live, and Keycloak manages them
-   there: a user the directory disabled cannot log in; a membership it gives
-   after a user's first login is in a later token; a password Keycloak set
-   is the directory's (the user logs in with it); the realm holds no user of
-   its own; a user made in Keycloak is in the directory with the group
-   Keycloak gave it, and logs in. The playbook prepares these
-   (SMOKE_DISABLED_USER, SMOKE_LATE_USER, _GROUP and _PASSWORD,
-   SMOKE_KEYCLOAK_WRITE, SMOKE_LOCAL_USERS, SMOKE_KC_USER, _GROUP and
-   _IN_DIRECTORY).
+F  the directory is the only source of people, and only its administrators
+   change it: a user it disabled cannot log in; a membership it gives after
+   a user's first login is in a later token; Keycloak may not set a
+   directory user's password; the realm holds no user of its own. The
+   playbook prepares these (SMOKE_DISABLED_USER, SMOKE_LATE_USER and _GROUP,
+   SMOKE_KEYCLOAK_WRITE, SMOKE_LOCAL_USERS). The directory answers LDAP
+   clients outside the cluster, on ldaps://DIRECTORY_LDAPS_HOST:636 through
+   the Gateway, with a certificate of its own authority (DIRECTORY_CA) that
+   names that host: the engineer binds with its password, a wrong one is
+   refused. There the administrator may change an entry of the people's unit
+   (DIRECTORY_PEOPLE_DN), the engineer and the account Keycloak reads the
+   directory as (DIRECTORY_BIND_USER, _PASSWORD) may not. And its web
+   interface (DIRECTORY_UI_URL, LDAP Account Manager) is reached through a
+   Keycloak login by the administrator alone, who then logs in to it with
+   the same directory account.
 Reads use sum(), not count(*) (answered from Iceberg statistics, no data read).
 Prints one line per check and exits 1 when any check fails.
 """
 import base64
+import html
+import http.cookiejar
 import json
 import os
 import re
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -98,15 +108,87 @@ CLIENT = os.environ.get("SMOKE_CLIENT", "smoke-test")               # the test's
 CLIENT_SECRET = os.environ["SMOKE_CLIENT_SECRET"]                    # the only one with the password grant
 
 
-def token(user: str, client: str = CLIENT, id_token: bool = False, password: str = "") -> str:
+def token(user: str, client: str = CLIENT, id_token: bool = False) -> str:
     """A token of the temporary user from the smoke-test client (audiences trino
     and kubernetes, groups; RGW accepts the client); `client` is kept for the
     call sites' readability."""
     data = urllib.parse.urlencode({"grant_type": "password", "client_id": CLIENT, "client_secret": CLIENT_SECRET,
-                                   "username": user, "password": password or PASSWORD,
-                                   "scope": "openid profile"}).encode()
+                                   "username": user, "password": PASSWORD, "scope": "openid profile"}).encode()
     with urllib.request.urlopen(f"{KEYCLOAK}/protocol/openid-connect/token", data, timeout=30) as r:
         return json.load(r)["id_token" if id_token else "access_token"]
+
+
+def ber(tag: int, body: bytes) -> bytes:
+    """One BER element (LDAP's encoding): tag, length, content."""
+    n = len(body)
+    size = bytes([n]) if n < 128 else bytes([0x80 | ((n.bit_length() + 7) // 8)]) + n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([tag]) + size + body
+
+
+def ldap_result(answer: bytes, tag: int) -> int:
+    """The result code of an LDAPMessage {messageID, [APPLICATION tag] {resultCode ENUMERATED, ...}}."""
+    def skip(at: int) -> int:                           # past an element's tag and length
+        return at + (2 if answer[at + 1] < 128 else 2 + (answer[at + 1] & 0x7F))
+    at = skip(0)                                        # the message
+    at = skip(at) + answer[at + 1]                      # its id
+    if answer[at] != tag or answer[skip(at)] != 0x0A:
+        raise OSError(f"not the expected LDAP response: {answer[:24].hex()}")
+    return answer[skip(at) + 2]
+
+
+def ldap_bind(host: str, who: str, password: str, ca_pem: str, port: int = 636, change: tuple = ()) -> int:
+    """A simple LDAP bind over TLS, as an LDAP client outside the cluster does
+    it: the result code (0 accepted, 49 wrong credentials). The certificate
+    must come from ca_pem's authority and name host. With change = (dn,
+    attribute, value) the bind must succeed, and the result is that of
+    replacing the attribute of that entry (0 done, 50 no right to)."""
+    ctx = ssl.create_default_context(cadata=ca_pem)
+    bind = ber(0x60, ber(0x02, b"\x03") + ber(0x04, who.encode()) + ber(0x80, password.encode()))
+    with socket.create_connection((host, port), timeout=20) as raw, ctx.wrap_socket(raw, server_hostname=host) as tls:
+        tls.sendall(ber(0x30, ber(0x02, b"\x01") + bind))
+        code = ldap_result(tls.recv(4096), 0x61)        # BindResponse
+        if not change:
+            return code
+        if code:
+            raise OSError(f"{who} cannot bind: {code}")
+        dn, attribute, value = change
+        replace = ber(0x30, ber(0x0A, b"\x02") + ber(0x30, ber(0x04, attribute.encode()) + ber(0x31, ber(0x04, value.encode()))))
+        tls.sendall(ber(0x30, ber(0x02, b"\x02") + ber(0x66, ber(0x04, dn.encode()) + ber(0x30, replace))))
+        return ldap_result(tls.recv(4096), 0x67)        # ModifyResponse
+
+
+def directory_ui(url: str, user: str) -> tuple:
+    """A browser's way into the directory's web interface: the proxy in front
+    of it sends the visitor to Keycloak, whose form takes the user's password,
+    and lets the administrators through to LDAP Account Manager, whose own
+    login takes the same account. Returns (the proxy's answer after the
+    Keycloak login: an HTTP status, 0 when it never got that far; where LAM's
+    login led, or what went wrong)."""
+    browser = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    try:
+        with browser.open(f"{url}/", timeout=30) as r:
+            page, at = r.read().decode(errors="replace"), r.geturl()
+    except urllib.error.HTTPError as e:
+        return 0, f"{url}/ answers {e.code}"
+    form = re.search(r'<form[^>]*id="kc-form-login"[^>]*>', page)
+    action = re.search(r'action="([^"]+)"', form.group(0)) if form else None
+    if not at.startswith(f"{KEYCLOAK}/protocol/openid-connect/auth") or "client_id=directory" not in at or not action:
+        return 0, f"no Keycloak login form of the client directory at {at[:160]}"
+    login = urllib.parse.urlencode({"username": user, "password": PASSWORD, "credentialId": ""}).encode()
+    try:
+        with browser.open(html.unescape(action.group(1)), login, timeout=30) as r:
+            page, at = r.read().decode(errors="replace"), r.geturl()
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    if not at.startswith(f"{url}/lam/"):
+        return 200, f"after the Keycloak login: {at[:160]}"
+    form = dict(re.findall(r'<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"', page))
+    form.update({"username": user, "passwd": PASSWORD, "profile": "lam", "language": "en_GB.utf8", "checklogin": "Login"})
+    try:
+        with browser.open(f"{url}/lam/templates/login.php", urllib.parse.urlencode(form).encode(), timeout=30) as r:
+            return 200, urllib.parse.urlsplit(r.geturl()).path
+    except urllib.error.HTTPError as e:
+        return 200, f"LDAP Account Manager refuses the login: {e.code}"
 
 
 def sts(user: str, group: str):
@@ -614,19 +696,13 @@ print("SMOKE leaked", spark.sql("SELECT sum(x) FROM {ENG_T}").collect()[0][0])
             check(f"F1 {off}, disabled in the directory, cannot log in", False, "got a token")
         except urllib.error.HTTPError as e:
             check(f"F1 {off}, disabled in the directory, cannot log in", e.code in (400, 401), str(e.code))
-    # smoke-late's password is the one Keycloak set after the directory made the user
     late, late_group = os.environ.get("SMOKE_LATE_USER"), os.environ.get("SMOKE_LATE_GROUP")
-    late_password = os.environ.get("SMOKE_LATE_PASSWORD", "")
-
-    def groups_of(user: str, password: str = "") -> list:
-        body = token(user, password=password).split(".")[1]
-        return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))).get("groups") or []
-
     if late and late_group:
         end, seen = time.time() + int(os.environ.get("SMOKE_LATE_WAIT", "390")), []
         while True:
             try:
-                seen = groups_of(late, late_password)
+                body = token(late).split(".")[1]
+                seen = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))).get("groups") or []
             except (urllib.error.URLError, OSError) as e:
                 seen = [f"no token: {e}"]
             if late_group in seen or time.time() >= end:
@@ -634,28 +710,49 @@ print("SMOKE leaked", spark.sql("SELECT sum(x) FROM {ENG_T}").collect()[0][0])
             time.sleep(10)
         check(f"F2 {late}'s token has the group the directory gave it after its first login",
               late_group in seen, f"groups {seen}")
-    if os.environ.get("SMOKE_KEYCLOAK_WRITE") and late:
+    if os.environ.get("SMOKE_KEYCLOAK_WRITE"):
         status = os.environ["SMOKE_KEYCLOAK_WRITE"]
-        try:
-            groups_of(late, late_password)
-            took, detail = True, ""
-        except (urllib.error.URLError, OSError) as e:
-            took, detail = False, str(e)
-        check(f"F3 a password Keycloak set for {late} is the directory's", status == "204" and took,
-              f"Keycloak answered {status}; login: {detail or 'ok'}")
+        check("F3 Keycloak may not set the password of a user of the directory", status in ("400", "403"), status)
     if "SMOKE_LOCAL_USERS" in os.environ:
         local = json.loads(os.environ["SMOKE_LOCAL_USERS"])
         check("F4 every user of the realm comes from the directory", not local, ", ".join(local))
-    made, made_group = os.environ.get("SMOKE_KC_USER"), os.environ.get("SMOKE_KC_GROUP")
-    if made:
-        there = json.loads(os.environ.get("SMOKE_KC_IN_DIRECTORY", "[]"))
-        in_group = bool(there) and made_group in there[0].get("groups", [])
+    ldaps = os.environ.get("DIRECTORY_LDAPS_HOST")
+    if ldaps:
+        domain, ca = os.environ["DIRECTORY_DOMAIN"], os.environ["DIRECTORY_CA"]
+        who = f"{eng}@{domain}"
         try:
-            seen = groups_of(made)
+            right, wrong = ldap_bind(ldaps, who, PASSWORD, ca), ldap_bind(ldaps, who, PASSWORD + "x", ca)
+            detail = f"right password: {right}, wrong password: {wrong}"
+        except (OSError, ValueError, IndexError) as e:
+            right, wrong, detail = -1, -1, str(e)
+        check(f"F5 the directory answers LDAP clients on ldaps://{ldaps}:636: {eng} binds, a wrong password is refused",
+              right == 0 and wrong == 49, detail)
+        # who may change the directory: its administrators, in the people's and the groups' units
+        if late and os.environ.get("DIRECTORY_PEOPLE_DN"):
+            change = (f"CN={late},{os.environ['DIRECTORY_PEOPLE_DN']}", "description", "smoke test")
+            reader = os.environ["DIRECTORY_BIND_USER"]
+            got = {}
+            for name, password in (("smoke-adm", PASSWORD), (eng, PASSWORD), (reader, os.environ["DIRECTORY_BIND_PASSWORD"])):
+                try:
+                    got[name] = ldap_bind(ldaps, f"{name}@{domain}", password, ca, change=change)
+                except (OSError, ValueError, IndexError) as e:
+                    got[name] = str(e)
+            check(f"F6 smoke-adm ({ADMIN}) may change an entry of the directory", got["smoke-adm"] == 0, f"LDAP result {got['smoke-adm']}")
+            check(f"F7 {eng} and {reader} (Keycloak's account) may not", got[eng] == 50 and got[reader] == 50,
+                  f"LDAP results {got[eng]}, {got[reader]}")
+    ui = os.environ.get("DIRECTORY_UI_URL")
+    if ui:
+        try:
+            proxy, lam = directory_ui(ui, "smoke-adm")
         except (urllib.error.URLError, OSError) as e:
-            seen = [f"no token: {e}"]
-        check(f"F5 {made}, made in Keycloak, is in the directory with its group and logs in",
-              in_group and made_group in seen, f"directory {there}; token groups {seen}")
+            proxy, lam = 0, str(e)[:200]
+        check(f"F8 smoke-adm ({ADMIN}) reaches LDAP Account Manager through Keycloak and logs in to it",
+              proxy == 200 and lam.endswith("/lam/templates/lists/list.php"), f"proxy {proxy}; {lam}")
+        try:
+            proxy, lam = directory_ui(ui, eng)
+        except (urllib.error.URLError, OSError) as e:
+            proxy, lam = 0, str(e)[:200]
+        check(f"F9 {eng} ({ENGINEER}) is refused there after its Keycloak login", proxy == 403, f"proxy {proxy}; {lam}")
 
 
 if __name__ == "__main__":

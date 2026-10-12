@@ -1,0 +1,155 @@
+# LDAP Account Manager, the web interface for managing the directory (Samba
+# AD, governance/samba-ad) at https://directory.data.example.org: users, groups,
+# memberships and passwords. Keycloak only reads the directory; this is where
+# it is changed (make dataplatform-directory does the same on the command line).
+#
+# Two logins. oauth2-proxy (Keycloak client directory) lets only
+# platform-admins reach it. LAM then asks for the administrator's own
+# directory account and password, and works on the directory as that person:
+# the domain controller gives the members of those groups full control of the
+# people's and the groups' units and of nothing else (AD_WRITER_GROUPS,
+# samba-ad.yaml), so there is no shared administration password, and
+# Administrator is not used. LAM finds the login's entry as the read-only
+# bind account, among the members of those groups only.
+#
+# The configuration is Git's: lam.conf (the server profile) and lam-start.sh
+# put it in place at every start. One replica: LAM keeps its sessions in the
+# container, a restart logs everyone out.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lam
+  labels:
+    app.kubernetes.io/name: lam
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lam
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lam
+      annotations:
+        # oauth2-proxy's metrics go through the OTel cluster collector
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "44180"
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: lam
+          # pinned by tag and digest
+          image: ghcr.io/ldapaccountmanager/lam:9.7@sha256:eb931c83f5f2e44c9c7965231c4d7e4cebdf702957581289bdd472dc6522a63c
+          command: [/usr/bin/dumb-init, --, bash, /etc/lam/lam-start.sh]
+          env:
+            # the image's start script writes these into lam.conf: the same
+            # values the file carries
+            - {name: LDAP_SERVER, value: ldaps://samba-ad.governance.svc:636}
+            - {name: LDAP_BASE_DN, value: "DC=ad,DC=data,DC=example,DC=org"}
+            - {name: LDAP_USERS_DN, value: "OU=People,DC=ad,DC=data,DC=example,DC=org"}
+            - {name: LDAP_GROUPS_DN, value: "OU=Groups,DC=ad,DC=data,DC=example,DC=org"}
+            - {name: LDAP_USER, value: ""}
+            - {name: LAM_LANG, value: en_GB}
+            - {name: LAM_MIN_PASSWORD_LENGTH, value: "12"}
+            # the directory's own certificate authority, for LAM's LDAPS
+            - {name: LDAPTLS_CACERT, value: /run/secrets/samba-ad-ca/ca.crt}
+          ports:
+            - {name: lam, containerPort: 80}
+          # the login page: Apache and PHP both answer. Each request leaves a
+          # session file until PHP's clean-up (minutes later), hence the
+          # long periods.
+          readinessProbe:
+            httpGet: {path: /lam/templates/login.php, port: lam}
+            periodSeconds: 30
+          livenessProbe:
+            httpGet: {path: /lam/templates/login.php, port: lam}
+            periodSeconds: 60
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 20m, memory: 96Mi}
+            limits: {memory: 512Mi}
+          securityContext:
+            # the image's user (www-data); its start script edits files of the image
+            runAsUser: 33
+            runAsGroup: 33
+            allowPrivilegeEscalation: false
+            # the image's apache2 carries the file capability to bind low
+            # ports: without it in the container's set the kernel refuses to
+            # run the binary. The process itself ends up with no capability.
+            capabilities: {drop: [ALL], add: [NET_BIND_SERVICE]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/lam, readOnly: true}
+            - {name: secrets, mountPath: /run/secrets/lam, readOnly: true}
+            - {name: directory-ca, mountPath: /run/secrets/samba-ad-ca, readOnly: true}
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.4
+          args:
+            - --provider=keycloak-oidc
+            - --oidc-issuer-url=https://keycloak.data.example.org/realms/data-platform
+            - --client-id=directory
+            - --code-challenge-method=S256
+            - --scope=openid profile email
+            - --allowed-group=platform-admins
+            - --email-domain=*
+            - --redirect-url=https://directory.data.example.org/oauth2/callback
+            - --upstream=http://127.0.0.1:80/
+            - --http-address=0.0.0.0:4180
+            - --metrics-address=0.0.0.0:44180
+            - --reverse-proxy=true
+            - --skip-provider-button=true
+            - --cookie-name=_directory
+            - --cookie-secure=true
+            - --cookie-expire=8h                  # Keycloak's idle session
+            # no tokens in the cookie (LAM needs none): with them the Gateway's
+            # nginx refuses the callback's headers (502), as for VMUI
+            - --session-cookie-minimal=true
+            - --silence-ping-logging=true
+          envFrom:
+            - secretRef:
+                name: lam-proxy
+          ports:
+            - {name: http, containerPort: 4180}
+            - {name: metrics, containerPort: 44180}
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+          livenessProbe:
+            httpGet: {path: /ping, port: http}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+      volumes:
+        - name: config
+          configMap:
+            name: lam-config
+        - name: secrets
+          secret:
+            secretName: lam
+        # ca.crt alone, as for Keycloak: never the domain controller's key
+        - name: directory-ca
+          secret:
+            secretName: samba-ad-tls
+            items:
+              - {key: ca.crt, path: ca.crt}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lam
+spec:
+  selector:
+    app.kubernetes.io/name: lam
+  ports:
+    # only the proxy. LAM's own port has no Service; a pod that reaches it
+    # directly (the namespace's network policy says which) still meets LAM's
+    # login, which takes only the admin groups' directory accounts
+    - {name: http, port: 80, targetPort: http}

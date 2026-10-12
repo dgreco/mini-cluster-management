@@ -1,8 +1,11 @@
 # LDAPS of the domain controller: Samba refuses a password bind without TLS.
 # cert-manager keeps a certificate authority of the directory's own (ten
-# years) and the controller's certificate, named after its Service. Keycloak
-# trusts the authority (ca.crt of the Secret samba-ad-tls, mounted alone into
-# its truststore: keycloak.yaml), never the key. cert-manager renews the
+# years) and the controller's certificate, named after its Service and after
+# the name LDAP clients outside the cluster use (ad.data.example.org, through
+# the Gateway). Keycloak trusts the authority (ca.crt of the Secret
+# samba-ad-tls, mounted alone into its truststore: keycloak.yaml), never the
+# key; outside clients get the same ca.crt from make dataplatform-directory
+# ARGS=ca. cert-manager renews the
 # certificate two months before its end; Samba reads it at its start, so the
 # controller's liveness probe (ad-healthy) restarts it once on a renewal.
 apiVersion: cert-manager.io/v1
@@ -48,6 +51,7 @@ spec:
     - samba-ad.governance
     - samba-ad.governance.svc
     - samba-ad.governance.svc.cluster.local
+    - ad.data.example.org
   usages: [server auth]
   duration: 8760h
   renewBefore: 1440h

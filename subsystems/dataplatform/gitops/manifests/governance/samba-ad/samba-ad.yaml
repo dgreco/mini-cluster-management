@@ -1,17 +1,19 @@
 # The directory of the platform's people and groups: Samba 4.25 as the one
 # domain controller of the Active Directory domain ad.data.example.org
 # (NetBIOS DATAPLATFORM). The only place where a user or a group is kept:
-# Keycloak reads both from here over LDAPS and writes every change back (the
-# user federation made by make dataplatform-iam), so people are managed in
-# the Keycloak console; make dataplatform-directory (adctl, in this pod) is
-# the command line beside it. Reachable inside the cluster only, on LDAPS: no
-# desktop joins this domain.
+# Keycloak reads both from here over LDAPS and can change nothing (the user
+# federation made by make dataplatform-iam). People are managed in LDAP
+# Account Manager (governance/lam), where an administrator works as their
+# own account of this directory; make dataplatform-directory (adctl, in this
+# pod) is the command line beside it. Only LDAPS is reachable: inside the cluster as
+# the Service samba-ad, outside it as ldaps://ad.data.example.org:636 through
+# the Gateway (samba-ad-route.yaml). No desktop joins this domain.
 #
 # The image (subsystems/dataplatform/images/samba-ad) provisions the domain on
 # an empty volume, then at every start seeds what the platform needs (the two
-# organizational units, the bind account and its right to write in those two
-# units and nowhere else, the groups below, once the first administrator) on
-# the database itself, before the daemon listens.
+# organizational units, the read-only bind account, the groups below, the
+# admin groups' full control of those two units and of nothing else, once the
+# first administrator) on the database itself, before the daemon listens.
 #
 # Pod Security baseline holds: NT ACLs are kept in user.NTACL, so the
 # controller needs no CAP_SYS_ADMIN, only what a root daemon that binds low
@@ -61,7 +63,7 @@ spec:
       containers:
         - name: samba
           # pinned by tag and digest (make dataplatform-samba-image builds and prints it)
-          image: ghcr.io/dgreco/samba-ad:4.25.0-2@sha256:53abac4aabba68f39dcb45349c0097c321fee794a2f71d823aa65d4f6a0e218c
+          image: ghcr.io/dgreco/samba-ad:4.25.0-3@sha256:ebd2a27e9d28635cab9b4f6512b15840c257fb5766b8434b1ea031e1adea0250
           env:
             - {name: AD_REALM, value: ad.data.example.org}
             - {name: AD_NETBIOS_DOMAIN, value: DATAPLATFORM}
@@ -71,8 +73,10 @@ spec:
             - {name: AD_GROUPS_OU, value: Groups}
             - {name: AD_SERVICES_OU, value: Services}
             - {name: AD_BIND_USER, value: keycloak-bind}
-            # Keycloak manages people and groups as that account
-            - {name: AD_BIND_WRITES, value: "true"}
+            # who may change people and groups (in LDAP Account Manager, or any
+            # LDAP client): the members of these groups, in the two units only.
+            # Nobody else of the two units, the bind account included, writes.
+            - {name: AD_WRITER_GROUPS, value: "platform-admins"}
             - {name: AD_MIN_PASSWORD_LENGTH, value: "12"}
             - {name: AD_SEED_GROUPS, value: "platform-admins data-engineers data-analysts"}
             - {name: AD_FIRST_ADMIN, value: admin}

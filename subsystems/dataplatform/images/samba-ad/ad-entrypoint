@@ -62,8 +62,8 @@ fi
 dc=$(ad_dc_name)
 ad_render_conf "$dc" "$forwarder"
 
-# Passwords never expire and may change at once: people set their own in
-# Keycloak, whose realm policy asks at least what this one does.
+# Passwords never expire and may change at once. Administrators set them
+# (LDAP Account Manager, adctl): Keycloak only reads this directory.
 samba-tool domain passwordsettings set --max-pwd-age=0 --min-pwd-age=0 \
   --min-pwd-length="${AD_MIN_PASSWORD_LENGTH:-12}" --complexity=on > /dev/null
 adctl seed

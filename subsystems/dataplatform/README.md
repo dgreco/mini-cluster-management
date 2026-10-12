@@ -2,14 +2,16 @@
 
 A small lakehouse on the k3s cluster:
 - **Trino** (SQL) and **Spark** (jobs) share **Iceberg** tables stored in **Ceph S3**.
-- **Keycloak** is the only login for every tool. The people and their groups live in a directory, a **Samba Active Directory** domain, and are managed in the Keycloak console, which writes every change to it.
+- **Keycloak** is the only login for every tool. The people and their groups live in a directory, a **Samba Active Directory** domain, which Keycloak only reads; administrators manage them in the directory's own web interface, **LDAP Account Manager**.
 - **Ceph decides every data access**: users reach data only through STS roles that the lakehouses' policies in Meta Catalog grant directories of the one platform bucket to (once a member of `platform-admins` authorized them there), never with a shared key.
 
 Argo CD installs everything from Git. Secrets live in **OpenBao**, not in Git. **OpenTelemetry** collects the metrics and logs, stored in **VictoriaMetrics** and **VictoriaLogs**, and shown in **Grafana**. The logs of the Stackable platforms (Trino, Spark) travel through **Vector** and arrive over OpenTelemetry (OTLP) in a place of their own.
 
 | Web UI | Address | Login |
 |---|---|---|
-| Keycloak (users, groups, clients, sessions; *Users and groups* below) | https://keycloak.data.example.org/admin/data-platform/console/ | a user in `platform-admins` (role `realm-admin` of the realm). The master realm (its console and its admin API) is not served through the Gateway, has no human user (Ansible logs in as the client `ansible`, and `make dataplatform-iam` deletes the temporary bootstrap admin), and is reached only through `kubectl -n governance port-forward svc/keycloak-service 8080`. Break-glass: `kubectl -n governance exec keycloak-0 -- /opt/keycloak/bin/kc.sh bootstrap-admin user --username tmp --password:env PW` with `PW` set, then http://localhost:8080/admin/master/console/ |
+| LDAP Account Manager (users, groups, passwords; *Users and groups* below) | https://directory.data.example.org | two logins with the same account: Keycloak, `platform-admins` only (others get 403), then LDAP Account Manager's own form, user name and password again (it changes the directory as you); log out at `/oauth2/sign_out` |
+| Keycloak (clients, sessions; users and groups as it reads them from the directory) | https://keycloak.data.example.org/admin/data-platform/console/ | a user in `platform-admins` (role `realm-admin` of the realm). The master realm (its console and its admin API) is not served through the Gateway, has no human user (Ansible logs in as the client `ansible`, and `make dataplatform-iam` deletes the temporary bootstrap admin), and is reached only through `kubectl -n governance port-forward svc/keycloak-service 8080`. Break-glass: `kubectl -n governance exec keycloak-0 -- /opt/keycloak/bin/kc.sh bootstrap-admin user --username tmp --password:env PW` with `PW` set, then http://localhost:8080/admin/master/console/ |
+| The directory, for LDAP clients (not a web page) | `ldaps://ad.data.example.org:636` | a user of the directory, as `<user>@ad.data.example.org`, `DATAPLATFORM\<user>` or the entry's DN; the client must trust the directory's certificate authority (*LDAP clients* under *Everyday use*) |
 | Trino | https://trino.data.example.org | Keycloak |
 | Grafana | https://grafana.data.example.org | Keycloak (`platform-admins` = Admin, `data-engineers` = Editor) |
 | Argo CD | https://argocd.data.example.org | Keycloak (`platform-admins` = admin, `data-engineers` = viewer: everything but the pod logs); the local admin account is off |
@@ -88,21 +90,26 @@ make dataplatform-passwords     # the bootstrap and break-glass logins
 | `make dataplatform-openbao` | initialises OpenBao once, saving the keys in `.secrets/openbao-init.json`, and creates the platform's generated secrets |
 | `make dataplatform-cert` | issues the wildcard certificate with a daily renewal timer; every new certificate goes into OpenBao, and from there to the Gateway |
 | `make dataplatform-ceph` | creates the S3 service users and buckets of the platform; their keys go into OpenBao |
-| `make dataplatform-iam` | brings the Keycloak realm in line with Git, makes it keep people and groups in the directory (a user federation that reads and writes), makes Ceph's IAM account trust Keycloak, keeps the platform's own roles (the admin group's, the provisioner's), prepares the catalog and enables OpenBao's Keycloak login |
+| `make dataplatform-iam` | brings the Keycloak realm in line with Git, makes it take people and groups from the directory (a user federation that only reads), makes Ceph's IAM account trust Keycloak, keeps the platform's own roles (the admin group's, the provisioner's), prepares the catalog and enables OpenBao's Keycloak login |
 
 On the first install, Argo CD stops at OpenBao (wave -3) until the `openbao` step has initialised it. This is expected.
 
 ## Everyday use
 
-**Users and groups.** They are kept in one place, the directory (Samba AD, the pod `governance/samba-ad-0`), and managed in the **Keycloak console** (https://keycloak.data.example.org/admin/data-platform/console/, a `platform-admins` login), which writes every change to the directory:
+**Users and groups.** They are kept in one place, the directory (Samba AD, the pod `governance/samba-ad-0`). Keycloak reads them from it and can change nothing there. You manage them in **LDAP Account Manager** (LAM) at https://directory.data.example.org, as a member of `platform-admins`:
 
-- **Add a user:** *Users*, *Add user*: a user name, an e-mail address, first and last name. Then *Credentials*, *Set password*; leave *Temporary* on and the user must choose their own at the first login. Then *Groups*, *Join group*.
-- **Everything else about a user** is on the same pages: a new password, leaving a group, disabling (*Enabled* off: no login from then on), deleting. Each is the directory's at once.
-- **People change their own password** at https://keycloak.data.example.org/realms/data-platform/account/ (*Account security*, *Signing in*).
-- **Passwords:** at least 12 characters with a capital, a small letter and a digit; Keycloak says what is missing. They do not expire.
-- **Groups are made and removed on the command line** (below): a group made in the console exists in the directory only from its first member on, and disappears within a minute when it has none by then; a group deleted in the console comes back from the directory.
+- **Logging in** takes two steps with the same account. Keycloak first: only `platform-admins` get past it. Then LAM's own form: your user name and password again. LAM works on the directory as you, and the directory lets the members of `platform-admins` change people and groups, and nothing else of the domain.
+- **Add a user:** *Users*, *New user*. Fill in *User name*, *First name*, *Last name* and *Email address*, then *Set password*, then *Save*. *Edit groups* on the same page puts the user into groups.
+  - The user name is the login name everywhere: 2 to 20 small letters, digits and `-`, starting and ending with a letter or digit. LAM does not check this; role names and Kubernetes objects are built from it.
+  - Keycloak logs nobody in without a first name, a last name and an e-mail address of their own.
+- **Everything else about a user** is on the user's page: a new password (*Set password*), groups (*Edit groups*), *Account is deactivated* (no login from then on), *Delete*.
+- **Groups:** *Groups*, *New group*: a name (small letters, digits and `-`), scope and type as they are (global, security); *Edit members*. Keycloak has a new group within a minute. Before deleting one, read *Removing a group* under *Known limits*.
+- **Passwords:** at least 12 characters with a capital, a small letter and a digit. They do not expire. A new one counts at once, and the old one is refused from then on.
+- **Only administrators set passwords.** Nobody changes their own, in Keycloak or anywhere else: a user asks an administrator. An administrator changes their own in LAM, on their own page.
+- **Leave *Force password change* off**, in *Set password* and as the button of that name. With it the directory refuses the password until the user changes it, and nothing here lets a user do that: Keycloak then says "Invalid username or password". To undo it: *Clear password expiration* on the user's page, or set the password again without it.
+- LAM's other tools (the tree view, the schema browser) show the whole domain, read-only outside the two units of people and groups. Two are switched off: the profile editor (its default for new users is a forced password change) and the unit editor (Keycloak reads only the two units themselves, not units made below them). LAM's own settings pages ask for a configuration password nobody has: the configuration is in Git (`manifests/governance/lam`).
 
-The same on the command line, with `make dataplatform-directory` (it needs `kubectl`: `make k3s-kubeconfig`), and the way to make or remove a group:
+The same on the command line, with `make dataplatform-directory`. It needs `kubectl` (`make k3s-kubeconfig`) instead of a directory login, and it checks the names:
 
 ```bash
 make dataplatform-directory ARGS="user list"
@@ -119,7 +126,20 @@ make dataplatform-directory ARGS="group join data-analysts alice"  # also: group
   - a disabled or removed user: refused at the next login; a token already issued lasts until it expires.
 - A **new group** gets data access when a lakehouse's policy grants it a layer: add it to the policy in Meta Catalog and have a member of `platform-admins` authorize it (its role appears at once).
 - Removing a user from every group, or removing the account, takes its access away with its next token; removing it from every lakehouse policy (then authorize) removes its own role. A JupyterHub server it left running stops after an hour idle, and its home volume stays until you delete it.
-- Keycloak writes to the directory as one account (`keycloak-bind`), which may change what is in the two units of people and groups and nothing else of the domain. The two service accounts of the realm (`service-account-iam-sync`, `service-account-metacatalog-provisioner`) are Keycloak's own, not the directory's.
+- Keycloak reads the directory as one account (`keycloak-bind`), which can change nothing in it; LAM uses the same account only to find the entry of whoever logs in. The two service accounts of the realm (`service-account-iam-sync`, `service-account-metacatalog-provisioner`) are Keycloak's own, not the directory's.
+
+**LDAP clients.** An LDAP browser or an application that looks users up over LDAP reaches the directory at `ldaps://ad.data.example.org:636`, from wherever the platform's web addresses are reachable. Only LDAPS is exposed: nothing else of Active Directory (no domain join, no Kerberos, no file shares).
+
+```bash
+make dataplatform-directory ARGS=ca > samba-ad-ca.crt        # the certificate authority the client has to trust (not a secret)
+LDAPTLS_CACERT=samba-ad-ca.crt ldapsearch -H ldaps://ad.data.example.org:636 \
+  -D 'alice@ad.data.example.org' -W -b 'OU=People,DC=ad,DC=data,DC=example,DC=org' '(objectClass=user)' sAMAccountName mail
+```
+
+- The certificate is the directory's own, not the web addresses' Let's Encrypt one: the Gateway passes the encrypted connection to the domain controller as it is, so a password is never in clear on the way. Import `samba-ad-ca.crt` into the client once; it is valid for ten years.
+- Log in as `<user>@ad.data.example.org`, as `DATAPLATFORM\<user>`, or with the entry's DN. People are under `OU=People`, groups under `OU=Groups` (a group's members are its `member` values).
+- An ordinary user reads the directory and changes nothing. The members of `platform-admins` may change people and groups with any LDAP client, as in LDAP Account Manager. Do not hand out `Administrator` (its password is in OpenBao, `governance/samba-ad`).
+- Logins here are checked by the directory alone: Keycloak's protection against password guessing does not see them, and the directory locks no account after wrong passwords.
 
 **SQL with Trino.**
 - Web UI: https://trino.data.example.org.
@@ -369,7 +389,7 @@ gitops/helm-values/<chart>-values.yaml
 | -1 | VictoriaMetrics, VictoriaLogs, OpenTelemetry collectors, the Vector aggregator, kube-state-metrics |
 | 0 | Keycloak (+ PostgreSQL), the directory (Samba AD, one domain controller), Iceberg catalog database |
 | 1 | the Keycloak realm, iam-sync, Grafana |
-| 2 | Trino, Spark (history server, job RBAC), JupyterHub, VMUI |
+| 2 | Trino, Spark (history server, job RBAC), JupyterHub, VMUI, LDAP Account Manager |
 | 3 | Meta Catalog (with the CronJob iam-reconcile, which applies the record of grants every hour), the OpenBao snapshot CronJob, the directory's backup CronJob and the CronJob that purges finished Spark jobs: last, because Argo CD rates a CronJob whose last run failed (or is still waiting) unhealthy, and the root app waits for each wave to be healthy |
 
 **What Ansible owns on the cluster** (everything else is Argo CD's, from `gitops/`):
@@ -378,7 +398,7 @@ gitops/helm-values/<chart>-values.yaml
 - OpenBao's initialisation and everything inside it (`make dataplatform-openbao`, `-ceph`, `-cert`, `-iam`);
 - the RGW IAM account, its service users and the bucket (`make dataplatform-ceph`), and the platform's own roles (the admin group's, the provisioner's: `make dataplatform-iam`); every other role is Meta Catalog's (its authorize and the CronJob iam-reconcile, from the record of grants);
 - the servicelb node labels and the public DNS records (`make dataplatform-edge`);
-- the running Keycloak realm, converged from the same file the operator imported, and its user federation `samba-ad`, through which it reads and writes the directory (`make dataplatform-iam`; the directory itself is Argo CD's, and seeds its own groups and first administrator);
+- the running Keycloak realm, converged from the same file the operator imported, and its user federation `samba-ad`, through which it reads the directory (`make dataplatform-iam`; the directory itself is Argo CD's, and seeds its own groups and first administrator);
 - the annotations `make dataplatform-sync` writes on Argo CD's Applications (`refresh`) and on the ExternalSecrets (`force-sync`).
 
 **Where each setting lives:**
@@ -392,7 +412,7 @@ gitops/helm-values/<chart>-values.yaml
 - **The Keycloak realm** is `gitops/manifests/governance/keycloak-realm/realm-import.yaml`.
   - The operator imports it once.
   - `make dataplatform-iam` applies later changes to realm settings and clients.
-  - It defines no user and no group: those are the directory's, read and written through the user federation that `make dataplatform-iam` creates (settings: `dataplatform_iam_federation_*` in the role's defaults, `dataplatform_directory_*` in `inventory/group_vars/dataplatform.yml`).
+  - It defines no user and no group: those are the directory's, read through the user federation that `make dataplatform-iam` creates (settings: `dataplatform_iam_federation_*` in the role's defaults, `dataplatform_directory_*` in `inventory/group_vars/dataplatform.yml`).
 - **The directory's image** is built from `images/samba-ad` (Samba from Debian testing, pinned by a snapshot of the archive) by `make dataplatform-samba-image ARGS="<samba version>-<build>"`, pushed to GHCR and pinned by digest in `gitops/manifests/governance/samba-ad/samba-ad.yaml.in`. The AD domain's name and its short name are `site_ad_domain` and `site_ad_netbios_domain` (install-time).
   - Signing keys are never touched, because Ceph trusts the realm's certificate.
 
@@ -548,10 +568,11 @@ snapshot. After a restore, `make dataplatform-sync` refreshes the Secrets and
   - Directly on S3 and in Spark, a session has one role, and you pick it (`-g <group>` or `-u`).
 - **No password logins from scripts:** the public clients (`data-cli`, `spark`, `kubernetes`) accept only the device or browser flows; a password can be tried only through the smoke test's confidential client, whose secret is in OpenBao. `kubectl oidc-login` with `--grant-type=password` no longer works.
 - **One domain controller.** The directory has a single controller (a second one means AD replication between pods). While its pod moves to another node (a drain, a node failure) nobody logs in with a password: Keycloak answers "unexpected error". Tokens already issued and service accounts go on. A token refresh works while the user is in Keycloak's cache (5 minutes, `dataplatform_directory_cache_lifespan`), then it is refused ("User disabled") until the controller is back; the session itself is kept, so the same refresh works again afterwards. iam-sync keeps what it had applied (Keycloak answers it with empty groups meanwhile, which it does not apply).
-- **No password reset by e-mail, no desktop logins.** People change their own password in Keycloak while they know it; a forgotten one is set by an administrator (the console, or `user passwd`). Keycloak sends no mail, and the directory is not reachable from the LAN (no domain join, no Kerberos login).
-- **Groups and the Keycloak console.** Keycloak creates a group in the directory only when its first member joins, and never deletes one there. So an empty group made in the console is dropped at the next sync (within a minute), and a group deleted in the console comes back: make and remove groups with `make dataplatform-directory`.
-- **A user outside the directory** cannot be made any more: Keycloak creates every new user there. `make dataplatform-iam` and the smoke test (F4) still fail if the realm holds one (a user made while the federation was missing or switched off), and iam-sync ignores it.
-- **Removing a group** (`make dataplatform-directory ARGS="group remove <name>"`; Keycloak drops it at its next sync): iam-sync refuses an answer that lost a group it had seen (or has none at all), because a half-imported realm would look the same and would revoke every user. After removing a group on purpose, restart iam-sync (`kubectl -n governance rollout restart deploy/iam-sync`), then `make dataplatform-iam ARGS="-e dataplatform_iam_prune=true"` deletes the group's STS role, its bucket if empty, and its catalog role (a bucket with data is kept and named).
+- **Nobody changes their own password.** Keycloak only reads the directory, and LDAP Account Manager lets in administrators only: a password is set by an administrator (LAM, or `user passwd`), who has to hand it over. There is no reset by e-mail (Keycloak sends no mail) and no desktop login: of the directory only LDAPS is reachable from outside the cluster (no domain join, no Kerberos login).
+- **The Keycloak console still shows *Add user*, and it works**: the user it makes is the realm's own, not the directory's. Do not use it. Such a user is ignored by iam-sync, and `make dataplatform-iam` and the smoke test (F4) fail while one exists. A change to a user of the directory is refused there ("read only"), and a group made in the console is dropped at the next sync (within a minute).
+- **LDAP Account Manager checks no names.** A user or group name with capitals, dots or spaces is accepted by the directory and breaks role names and Kubernetes objects built from it: keep to small letters, digits and `-` (`make dataplatform-directory` refuses anything else).
+- **One LDAP Account Manager, no state.** It keeps its sessions in the pod: a restart logs its users out, nothing else is lost.
+- **Removing a group** (in LDAP Account Manager, or `make dataplatform-directory ARGS="group remove <name>"`; Keycloak drops it at its next sync): iam-sync refuses an answer that lost a group it had seen (or has none at all), because a half-imported realm would look the same and would revoke every user. After removing a group on purpose, restart iam-sync (`kubectl -n governance rollout restart deploy/iam-sync`), then `make dataplatform-iam ARGS="-e dataplatform_iam_prune=true"` deletes the group's STS role, its bucket if empty, and its catalog role (a bucket with data is kept and named).
 - **Removing a user** (from every group, or from the directory): the next token has no group, so STS, Trino and Kubernetes refuse it; a job already running keeps its token until it ends.
 - **New Spark tables:** a table Spark creates goes to the job's directory (`-d`), whatever the schema's `location` says (see above).
 - **Spark job length:** a job lives about as long as its token. Tokens of the Keycloak client `spark` last 12 hours.
@@ -592,9 +613,15 @@ Nothing is needed before a shutdown: OpenBao unseals itself and the databases re
 | Keycloak's login page says "Unexpected error when handling authentication request" for everybody | The directory's domain controller is not answering: `kubectl -n governance get pod samba-ad-0`, `kubectl -n governance logs samba-ad-0`. It restarts on its own once after cert-manager renews its certificate (liveness probe `ad-healthy`) |
 | `samba-ad-0` is in `ImagePullBackOff` | The image's package on GHCR is private: make it public once (GitHub, Packages, samba-ad, Package settings), or the boards cannot pull it |
 | `samba-ad-0` restarts with `the directory refused: ... password` | A password in OpenBao (`governance/samba-ad`, or the first administrator's in `governance/platform-admin`) has fewer than 12 characters or fewer than three kinds: write a better one there, `kubectl -n governance annotate externalsecret samba-ad force-sync=$(date +%s)`, delete the pod |
-| Keycloak's console cannot save a user or a password: "Could not modify attribute for DN ..." or an unexpected error | The directory refused the write. The domain controller is down (`kubectl -n governance get pod samba-ad-0`), the password breaks the directory's own rule (12 characters, three kinds: the realm's password policy should have said so first), or Keycloak's account lost its right to write (the controller grants it at its start: `kubectl -n governance logs samba-ad-0 \| grep seed`) |
-| A group made in the Keycloak console disappeared | It had no member at the next sync (within a minute): Keycloak creates a group in the directory only with its first member. `make dataplatform-directory ARGS="group add <name>"` |
-| `make dataplatform-iam` stops at "The realm holds users of its own" | A user was made while the federation was missing or switched off, or the realm predates the directory: create them in the directory under the same name, then `make dataplatform-iam ARGS="-e dataplatform_iam_adopt_directory=true"` (it deletes Keycloak's own copy, the directory's comes in; the user's sessions end) |
+| Keycloak's console refuses a change to a user: "read only", or `Can't reset password as account is read only` | As it should: Keycloak only reads the directory. Change the user in LDAP Account Manager (https://directory.data.example.org) or with `make dataplatform-directory` |
+| https://directory.data.example.org answers 403 after the Keycloak login | You are not in `platform-admins`. Log out at `/oauth2/sign_out` to try another account |
+| LDAP Account Manager's own login refuses you: "Unable to find the user name in LDAP", or "Wrong password/user name combination" | The first: you are not in `platform-admins` (it takes nobody else). The second: it wants the directory's user name and password, the ones Keycloak just took. If nobody gets in: the domain controller (`kubectl -n governance get pod samba-ad-0`), or LAM lost the account it looks logins up with: `kubectl -n governance logs deploy/lam -c lam`, `kubectl -n governance rollout restart deploy/lam` (it reads the password at its start) |
+| LDAP Account Manager cannot save: an LDAP error with "Insufficient access" | The entry is outside the two units of people and groups, or the controller did not give `platform-admins` its rights (it does at its start: `kubectl -n governance logs samba-ad-0 \| grep seed`) |
+| A user gets "Invalid username or password" right after an administrator set the password | *Force password change* was on: the directory wants a change nothing here can make. In LDAP Account Manager, the user's page, *Clear password expiration*; or set the password again without it |
+| An LDAP client refuses `ldaps://ad.data.example.org:636`: unknown certificate authority, or the name does not match | It must trust the directory's own authority: `make dataplatform-directory ARGS=ca > samba-ad-ca.crt`, and connect by that name, not by an address. Right after cert-manager renewed the certificate the controller restarts once to serve it (a minute) |
+| An LDAP client cannot connect to port 636 at all | `kubectl -n core get gateway main-gateway -o yaml` (listener `directory-ldaps` must be Programmed), `kubectl -n governance get tcproute samba-ad-ldaps -o yaml` (Accepted, ResolvedRefs), `kubectl -n governance get pod samba-ad-0` |
+| A group made in the Keycloak console disappeared | Keycloak cannot write to the directory, and drops what the directory does not have at its next sync. Make groups in LDAP Account Manager or with `make dataplatform-directory ARGS="group add <name>"` |
+| `make dataplatform-iam` stops at "The realm holds users of its own" | A user was made with *Add user* in the Keycloak console, or the realm predates the directory: create them in the directory under the same name, then `make dataplatform-iam ARGS="-e dataplatform_iam_adopt_directory=true"` (it deletes Keycloak's own copy, the directory's comes in; the user's sessions end) |
 | `make dataplatform-iam` stops at "Keycloak cannot bind to ldaps://samba-ad..." | `AuthenticationFailure`: the controller holds another bind password than OpenBao (it reads it at its start): delete the pod `samba-ad-0`. `CommunicationError`: the controller is down, or Keycloak's pods started before the directory's certificate existed: `kubectl -n governance rollout restart statefulset keycloak` |
 | iam-sync logs "Keycloak lists no member in any group ... not applied" | The directory is down (Keycloak then answers with empty groups) or really empty; iam-sync keeps what it had applied until members come back |
 | The S3 browser says "not in platform-admins" | Log in with an administrator: its button logs you out of Keycloak first |

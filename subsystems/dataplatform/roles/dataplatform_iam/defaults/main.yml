@@ -14,12 +14,10 @@ dataplatform_iam_group_pattern: '^[a-z0-9][a-z0-9-]{0,40}[a-z0-9]$'
 # temporary admin is then deleted (Keycloak nags about it until it is)
 dataplatform_iam_kc_client: ansible
 dataplatform_iam_delete_temp_admin: true
-# The realm's user federation: people and groups live in the directory (Samba
-# AD, group_vars dataplatform_directory_*) and nowhere else, and Keycloak is
-# the way to manage them: it reads them from the directory and writes every
-# change back (WRITABLE; a user made in Keycloak is made in the directory:
-# syncRegistrations). tasks/keycloak_federation.yml makes and keeps it; values
-# go to the admin API as strings.
+# The realm's user federation: Keycloak reads people and groups from the
+# directory (Samba AD, group_vars dataplatform_directory_*), read-only.
+# tasks/keycloak_federation.yml makes and keeps it; values go to the admin
+# API as strings.
 dataplatform_iam_federation_config:
   enabled: "true"
   priority: "0"
@@ -36,9 +34,9 @@ dataplatform_iam_federation_config:
   rdnLDAPAttribute: cn
   uuidLDAPAttribute: objectGUID
   userObjectClasses: person, organizationalPerson, user
-  editMode: WRITABLE
+  editMode: READ_ONLY
   importEnabled: "true"
-  syncRegistrations: "true"
+  syncRegistrations: "false"
   trustEmail: "true"
   connectionPooling: "true"
   pagination: "true"
@@ -52,37 +50,31 @@ dataplatform_iam_federation_config:
   # reaches the next token within this time (ms)
   cachePolicy: MAX_LIFESPAN
   maxLifespan: "{{ dataplatform_directory_cache_lifespan | int * 1000 }}"
-  # the realm's password policy (realm-import.yaml) is checked before a
-  # password goes to the directory, whose own rule it satisfies
-  validatePasswordPolicy: "true"
+  validatePasswordPolicy: "false"
   allowKerberosAuthentication: "false"
   useKerberosForPasswordAuthentication: "false"
   usePasswordModifyExtendedOp: "false"
 # Its mappers, by name: the whole list (any other mapper is deleted).
-# full name: write-only, it gives a user made in Keycloak its cn (the RDN) and
-# leaves the reading to the first and last name mappers.
-# groups: mode LDAP_ONLY keeps memberships in the directory alone (a join or
-# a leave in Keycloak is written there).
+# groups: mode LDAP_ONLY keeps memberships in the directory alone (Keycloak
+# cannot add one: the bind account writes nothing); groups the directory does
+# not have are dropped from the realm at every sync.
 dataplatform_iam_federation_mappers:
   username:
     providerId: user-attribute-ldap-mapper
-    config: {ldap.attribute: sAMAccountName, user.model.attribute: username, read.only: "false",
+    config: {ldap.attribute: sAMAccountName, user.model.attribute: username, read.only: "true",
              always.read.value.from.ldap: "false", is.mandatory.in.ldap: "true"}
   email:
     providerId: user-attribute-ldap-mapper
-    config: {ldap.attribute: mail, user.model.attribute: email, read.only: "false",
+    config: {ldap.attribute: mail, user.model.attribute: email, read.only: "true",
              always.read.value.from.ldap: "false", is.mandatory.in.ldap: "false"}
   first name:
     providerId: user-attribute-ldap-mapper
-    config: {ldap.attribute: givenName, user.model.attribute: firstName, read.only: "false",
+    config: {ldap.attribute: givenName, user.model.attribute: firstName, read.only: "true",
              always.read.value.from.ldap: "false", is.mandatory.in.ldap: "false"}
   last name:
     providerId: user-attribute-ldap-mapper
-    config: {ldap.attribute: sn, user.model.attribute: lastName, read.only: "false",
+    config: {ldap.attribute: sn, user.model.attribute: lastName, read.only: "true",
              always.read.value.from.ldap: "false", is.mandatory.in.ldap: "false"}
-  full name:
-    providerId: full-name-ldap-mapper
-    config: {ldap.full.name.attribute: cn, read.only: "false", write.only: "true"}
   creation date:
     providerId: user-attribute-ldap-mapper
     config: {ldap.attribute: whenCreated, user.model.attribute: createTimestamp, read.only: "true",
@@ -91,8 +83,7 @@ dataplatform_iam_federation_mappers:
     providerId: user-attribute-ldap-mapper
     config: {ldap.attribute: whenChanged, user.model.attribute: modifyTimestamp, read.only: "true",
              always.read.value.from.ldap: "false", is.mandatory.in.ldap: "false"}
-  # a disabled account of the directory is a disabled user here, and the other
-  # way round; a password set in Keycloak enables the account it made
+  # a disabled account of the directory is a disabled user here
   MSAD account controls:
     providerId: msad-user-account-control-mapper
     config: {}

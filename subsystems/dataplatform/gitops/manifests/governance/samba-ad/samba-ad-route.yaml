@@ -1,0 +1,16 @@
+# LDAPS from outside the cluster: the Gateway's TCP listener directory-ldaps
+# (port 636 of the gateway nodes) hands every connection to the domain
+# controller's own LDAPS port, encrypted as it came.
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata:
+  name: samba-ad-ldaps
+spec:
+  parentRefs:
+    - name: main-gateway
+      namespace: core
+      sectionName: directory-ldaps
+  rules:
+    - backendRefs:
+        - name: samba-ad
+          port: 636
