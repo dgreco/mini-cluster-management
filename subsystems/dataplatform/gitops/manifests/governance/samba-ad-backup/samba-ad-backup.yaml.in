@@ -55,14 +55,18 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      # a pod that fails (the controller is not up yet) is tried again, with
-      # a growing pause: about an hour in all
+      # an attempt that fails (the controller is not up yet) is made again in
+      # the same pod (restartPolicy below), with a growing pause, 5 minutes at
+      # most: about 40 minutes in all. So a run that had to wait leaves one
+      # Completed pod with its restarts counted, not a row of Error pods. At
+      # the limit the job is Failed and Kubernetes removes its pod: what the
+      # attempts printed is then in VictoriaLogs only
       backoffLimit: 12
       activeDeadlineSeconds: 7200
       template:
         spec:
           serviceAccountName: samba-ad-backup
-          restartPolicy: Never
+          restartPolicy: OnFailure
           securityContext:
             runAsNonRoot: true
             runAsUser: 65534
