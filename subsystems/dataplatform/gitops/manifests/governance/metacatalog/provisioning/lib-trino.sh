@@ -1,5 +1,5 @@
 # Trino over its HTTP protocol, as the provisioner's Keycloak service account.
-# Sourced by medallion.sh; needs bash, curl and jq (all in Meta Catalog's image).
+# Sourced by table.sh; needs bash, curl and jq (all in Meta Catalog's image).
 #
 #   trino_login              gets an access token (client credentials of
 #                            $PROVISIONER_CLIENT_ID, audience trino); once per run
@@ -30,7 +30,7 @@ trino_http() { # <method> <url> [<body>]
   for i in $(seq 1 12); do
     code=$(curl -sS --max-time 60 -o "$body" -w '%{http_code}' -X "$1" \
       -K <(printf 'header = "Authorization: Bearer %s"\n' "$TRINO_TOKEN") \
-      -H "X-Trino-Source: metacatalog" -H "X-Trino-Catalog: $MEDALLION_CATALOG" \
+      -H "X-Trino-Source: metacatalog" -H "X-Trino-Catalog: $LAKEHOUSE_CATALOG" \
       ${3:+--data-binary "$3"} "$2") || code=000
     case $code in
       200) cat "$body"; rm -f "$body"; return 0 ;;

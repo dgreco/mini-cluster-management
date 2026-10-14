@@ -1,0 +1,316 @@
+# The data model of the platform, in Meta Catalog's bulk format (traits,
+# relationships, entity types, mappings). Loaded once into the running Meta
+# Catalog by `make dataplatform-tables ARGS="load ..."`, which skips what is
+# already there.
+#
+# The artifact is a table. A table is an aggregate of its own: the unit that
+# is provisioned and the subject of authorization (its root carries the access
+# policy: principals, permissions, grants). What a table says about itself:
+#
+#   domain, subdomain   where it belongs (the entities DomainType and
+#                       SubdomainType hold it: Domain HAS_PART Subdomain
+#                       HAS_PART Table)
+#   layer               its place in the medallion: bronze, silver or gold
+#   format              how its files are written: parquet, avro or iceberg
+#   name, description, owner
+#   its schema          a part (TableSchemaType): the columns
+#   its lineage         DEPENDS_ON other tables (`dependsOn` in a file)
+#
+# The mappings derive the two physical resources of a table:
+#
+#   table   -> S3FolderType:  the table's folder,
+#              s3://dataplatform/lakehouse/<domain>/<subdomain>/<layer>/<name>
+#   schema  -> HiveTableType: the table in the Hive Metastore (Trino:
+#              lakehouse.<domain>_<subdomain>_<layer>.<name>), at that folder
+#
+# Both are handled by Meta Catalog's `script` task
+# (gitops/manifests/governance/metacatalog/provisioning). Provision makes the
+# folder, then registers the table (the schema's mapping reaches the folder
+# through its table, which is what puts the folder first; unprovision goes
+# the other way round). Authorize turns the table's grants into rights where
+# each resource is enforced: on the folder, Ceph's STS roles; on the table,
+# Trino's rules in the Open Policy Agent (platform-admins only). Reject
+# withdraws them.
+#
+# The folder and the names are built from domain, subdomain, layer and name:
+# they identify the table and are not to be changed afterwards (a table with
+# another name is another table). Domain and subdomain names have no '_', so
+# that <domain>_<subdomain>_<layer> names one schema only. Everything ends up
+# in SQL identifiers and S3 keys: lower-case letters, digits and (table and
+# column names) '_'; the provisioning script checks them again.
+
+Traits:
+  # A domain of the business, and one of its subdomains. The relationships
+  # below let a domain hold subdomains and a subdomain hold tables.
+  - name: DataDomain
+    schema:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          pattern: "^[a-z][a-z0-9]{0,23}$"
+        description:
+          type: string
+        owner:
+          type: string
+
+  - name: DataSubdomain
+    schema:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          pattern: "^[a-z][a-z0-9]{0,23}$"
+        description:
+          type: string
+
+  # Whatever belongs to a subdomain of a domain says which, by name: the
+  # mappings build the folder and the schema name from these two values.
+  - name: DomainMember
+    schema:
+      type: object
+      required: [domain, subdomain]
+      properties:
+        domain:
+          type: string
+          pattern: "^[a-z][a-z0-9]{0,23}$"
+        subdomain:
+          type: string
+          pattern: "^[a-z][a-z0-9]{0,23}$"
+
+  # A named set of data; the lineage relationship below is between datasets.
+  - name: Dataset
+    schema:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          pattern: "^[a-z][a-z0-9_]{0,62}$"
+        description:
+          type: string
+        owner:
+          type: string
+
+  # The medallion architecture: as it arrived, cleaned, ready for the business.
+  - name: MedallionLayered
+    schema:
+      type: object
+      required: [layer]
+      properties:
+        layer:
+          type: string
+          enum: [bronze, silver, gold]
+
+  # How the files are written. parquet and avro are plain files in the folder
+  # (a Hive table); iceberg keeps its own metadata next to the data.
+  - name: StorageFormatted
+    schema:
+      type: object
+      required: [format]
+      properties:
+        format:
+          type: string
+          enum: [parquet, avro, iceberg]
+
+  # Columns. The types are written once, for every format (string, long, int,
+  # double, decimal(p,s), date, timestamp, boolean, binary, ...); the script
+  # maps them to Trino's and refuses what a format cannot hold.
+  - name: Structured
+    schema:
+      type: object
+      required: [columns]
+      properties:
+        columns:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [name, type]
+            properties:
+              name:
+                type: string
+                pattern: "^[a-z_][a-z0-9_]{0,62}$"
+              type:
+                type: string
+              description:
+                type: string
+              pii:
+                type: boolean
+
+---
+Relationships:
+
+  - sourceTrait: DataDomain
+    relationshipType: HAS_PART
+    targetTrait: DataSubdomain
+
+  - sourceTrait: DataSubdomain
+    relationshipType: HAS_PART
+    targetTrait: DomainMember
+
+  # Lineage: a silver table depends on the bronze one it is built from.
+  - sourceTrait: Dataset
+    relationshipType: DEPENDS_ON
+    targetTrait: Dataset
+
+---
+EntityTypes:
+
+  # Neither is part of an aggregate: they only hold what belongs to them, so
+  # a table stays an aggregate of its own under its subdomain.
+  - name: DomainType
+    schema:
+      type: object
+      properties: {}
+    traits:
+      - DataDomain
+
+  - name: SubdomainType
+    schema:
+      type: object
+      properties: {}
+    traits:
+      - DataSubdomain
+
+  # The table: the aggregate root. Provisionable, and Authorizable: its
+  # principals, permissions and grants are the one access policy of its folder
+  # and of its entry in the metastore.
+  - name: TableType
+    schema:
+      type: object
+      properties:
+        retentionDays:
+          type: integer
+    traits:
+      - Provisionable
+      - Authorizable
+      - Dataset
+      - DomainMember
+      - MedallionLayered
+      - StorageFormatted
+
+  # The table's schema, its one part. It carries Aggregate as well as
+  # AggregateElement: provisioning collects derived resources from the
+  # Aggregate carriers of the tree, so the metastore table of a pure leaf
+  # would never be provisioned. A table without a schema is a folder only.
+  - name: TableSchemaType
+    schema:
+      type: object
+      properties:
+        primaryKey:
+          type: array
+          items:
+            type: string
+    traits:
+      - Aggregate
+      - AggregateElement
+      - Structured
+
+  # The physical side, derived by the mappings below and never written by
+  # hand. Mapped values are plain strings (`columns` is the schema's column
+  # list as JSON text); `kind` tells the two apart, for the script and for a
+  # grant that selects one of them (resources: {values: {kind: folder}}).
+  - name: S3FolderType
+    schema:
+      type: object
+      properties:
+        kind:
+          type: string
+        bucket:
+          type: string
+        path:
+          type: string
+        location:
+          type: string
+        domain:
+          type: string
+        subdomain:
+          type: string
+        layer:
+          type: string
+        table:
+          type: string
+    traits:
+      - ProvisionableResource
+      - AuthorizableResource
+
+  - name: HiveTableType
+    schema:
+      type: object
+      properties:
+        kind:
+          type: string
+        catalog:
+          type: string
+        schema:
+          type: string
+        table:
+          type: string
+        format:
+          type: string
+        location:
+          type: string
+        schemaLocation:
+          type: string
+        columns:
+          type: string
+        domain:
+          type: string
+        subdomain:
+          type: string
+        layer:
+          type: string
+    traits:
+      - ProvisionableResource
+      - AuthorizableResource
+
+---
+Mappings:
+
+  # Table -> its folder.
+  - sourceEntityType: TableType
+    targetEntityType: S3FolderType
+    mappingValues:
+      kind: "'folder'"
+      bucket: "'dataplatform'"
+      domain: "#source.getValue('$.domain').asText()"
+      subdomain: "#source.getValue('$.subdomain').asText()"
+      layer: "#source.getValue('$.layer').asText()"
+      table: "#source.getValue('$.name').asText()"
+      path: >-
+        'lakehouse/' + #source.getValue('$.domain').asText() + '/' + #source.getValue('$.subdomain').asText()
+        + '/' + #source.getValue('$.layer').asText() + '/' + #source.getValue('$.name').asText()
+      location: >-
+        's3://dataplatform/lakehouse/' + #source.getValue('$.domain').asText() + '/' + #source.getValue('$.subdomain').asText()
+        + '/' + #source.getValue('$.layer').asText() + '/' + #source.getValue('$.name').asText()
+    entityPathReferences: []
+
+  # Schema -> the table in the metastore. `table` walks up to the table the
+  # schema is part of; `folder` goes on to the folder derived from it, so the
+  # table is registered after its folder exists and dropped before it goes.
+  - sourceEntityType: TableSchemaType
+    targetEntityType: HiveTableType
+    mappingValues:
+      kind: "'table'"
+      catalog: "'lakehouse'"
+      domain: "#table.getValue('$.domain').asText()"
+      subdomain: "#table.getValue('$.subdomain').asText()"
+      layer: "#table.getValue('$.layer').asText()"
+      schema: >-
+        #table.getValue('$.domain').asText() + '_' + #table.getValue('$.subdomain').asText()
+        + '_' + #table.getValue('$.layer').asText()
+      table: "#table.getValue('$.name').asText()"
+      format: "#table.getValue('$.format').asText()"
+      location: "#folder.getValue('$.location').asText()"
+      schemaLocation: >-
+        's3://dataplatform/lakehouse/' + #table.getValue('$.domain').asText() + '/' + #table.getValue('$.subdomain').asText()
+        + '/' + #table.getValue('$.layer').asText()
+      columns: "#source.getValue('$.columns').toString()"
+    entityPathReferences:
+      - alias: "table"
+        referencePath: "HAS_PART{$}"
+      - alias: "folder"
+        referencePath: "HAS_PART{$}/MAPPED_TO{$}"

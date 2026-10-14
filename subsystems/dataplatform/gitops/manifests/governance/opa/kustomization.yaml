@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: governance
+resources:
+  - opa.yaml
+# Trino's policy, as a ConfigMap the Agent builds its bundle from (the
+# label). A fixed name: with a name hash a change would leave the old
+# ConfigMap next to the new one for a moment, two copies of the same rules
+# in one bundle, which does not compile. The data the policy decides with is
+# another ConfigMap, trino-grants (gitops/iam), which iam-sync writes.
+configMapGenerator:
+  - name: trino-policy
+    options:
+      disableNameSuffixHash: true
+      labels:
+        opa.stackable.tech/bundle: "true"
+    files:
+      - trino.rego

@@ -3,14 +3,17 @@
 #   authenticates over HTTPS); the Gateway re-encrypts (trino-httproute.yaml).
 # - Login with Keycloak (trino-authentication.yaml); groups from the file
 #   provider (trino-group-provider.yaml + ConfigMap trino-iam from iam-sync).
-# - Data access is decided by Ceph RGW through the STS role the S3 security
+# - Statements are decided by the Open Policy Agent (authorization.opa: the
+#   Agent of governance, through the ConfigMap opa of trino-opa.yaml; the
+#   rules, manifests/governance/opa/trino.rego): schema and table DDL for
+#   Meta Catalog's provisioner only, nobody else, admins included; a table is
+#   read and changed by those its grants in Meta Catalog name. The same rules
+#   let a worker that is told to stop finish its queries first (Stackable's
+#   graceful shutdown).
+# - The files are decided by Ceph RGW through the STS role the S3 security
 #   mapping picks for the user and the file's directory: their own or a
-#   group's, from the grants authorized in Meta Catalog
-#   (trino-catalog-lakehouse.yaml). Trino's own file-based access control
-#   (rules.json, written by iam-sync from access.yaml's
-#   metacatalog.provisioner) allows schema and table DDL to Meta Catalog's
-#   provisioner only, nobody else, admins included; data statements to
-#   everyone: Ceph refuses the files their roles do not reach.
+#   group's, from the same grants (trino-catalog-lakehouse.yaml). So a grant
+#   holds twice: Trino refuses the statement, and Ceph the file.
 apiVersion: trino.stackable.tech/v1alpha1
 kind: TrinoCluster
 metadata:
@@ -30,6 +33,12 @@ spec:
       - authenticationClass: keycloak
         oidc:
           clientCredentialsSecret: trino-oidc
+    authorization:
+      opa:
+        configMapName: opa
+        package: trino
+        # no column is masked (trino.rego has no such rule): do not ask
+        enableColumnMasking: false
     # product logs: a Vector agent per pod -> the aggregator -> VictoriaLogs
     # (tenant Stackable); see helm-values/vector-aggregator-values.yaml
     vectorAggregatorConfigMapName: vector-aggregator-discovery
@@ -45,10 +54,6 @@ spec:
         # a live SSO session: a JupyterHub logout ends that session while the
         # token the hub gave the notebook server is still valid for hours.
         http-server.authentication.oauth2.oidc.use-userinfo-endpoint: "false"
-      access-control.properties:
-        access-control.name: file
-        security.config-file: /stackable/mount/iam/rules.json
-        security.refresh-period: 30s
     config:
       resources:
         cpu: {min: 500m, max: "2"}

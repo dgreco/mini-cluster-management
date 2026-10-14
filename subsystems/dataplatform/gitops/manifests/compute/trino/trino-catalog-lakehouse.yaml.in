@@ -1,20 +1,28 @@
-# Catalog lakehouse: Iceberg tables whose catalog is the JDBC catalog in
-# PostgreSQL (governance/iceberg-catalog) and whose files are on Ceph S3.
+# Catalog lakehouse: every table of the platform, whatever its format. The
+# lakehouse connector reads Hive tables (parquet, avro) and Iceberg tables
+# from one metastore, the Hive Metastore of governance
+# (manifests/governance/hive-metastore), and their files from Ceph S3. A
+# table says its kind when it is made (type = 'HIVE' or 'ICEBERG'); only Meta
+# Catalog's provisioner makes any (manifests/governance/opa/trino.rego).
 #
 # Trino never reads data with its own key (the RGW user trino may only
 # assume roles): the S3 security mapping (s3-security-mapping.json in the
 # ConfigMap trino-iam, which iam-sync writes from the record of grants that
 # Meta Catalog's authorize and reject keep in governance/metacatalog-grants,
-# grants under access.yaml's metacatalog.prefix only) maps a user and a
+# folders under access.yaml's metacatalog.prefix only) maps a user and a
 # file's directory to the user's STS role granted that directory
 # (usr-<user> or a group's grp-<group>), elsewhere to their default (their
 # own, else their first group's), and Trino assumes it for that user at
 # RGW's STS (session name = the user). RGW then decides with that role's
 # policy. A user with no grant matches no rule and gets no S3 access at all.
 #
-# iceberg.metadata-cache.enabled=false: the metadata cache is shared between
-# users and would let one user's cached manifests serve another user without
-# RGW deciding.
+# - hive.non-managed-table-writes-enabled: the Hive tables are external (the
+#   metastore never deletes a file, nor needs to write one), and Trino writes
+#   them all the same.
+# - iceberg.metadata-cache.enabled=false: the metadata cache is shared
+#   between users and would let one user's cached manifests serve another
+#   user without RGW deciding. The metastore cache stays off for the same
+#   reason (hive.metastore-cache-ttl, its default).
 apiVersion: trino.stackable.tech/v1alpha1
 kind: TrinoCatalog
 metadata:
@@ -25,15 +33,11 @@ metadata:
 spec:
   connector:
     generic:
-      connectorName: iceberg
+      connectorName: lakehouse
       properties:
-        iceberg.catalog.type: {value: jdbc}
-        iceberg.jdbc-catalog.driver-class: {value: org.postgresql.Driver}
-        iceberg.jdbc-catalog.connection-url: {value: "jdbc:postgresql://iceberg-catalog-rw.governance.svc:5432/iceberg"}
-        iceberg.jdbc-catalog.connection-user: {valueFromSecret: {name: iceberg-catalog, key: username}}
-        iceberg.jdbc-catalog.connection-password: {valueFromSecret: {name: iceberg-catalog, key: password}}
-        iceberg.jdbc-catalog.catalog-name: {value: lakehouse}
-        iceberg.jdbc-catalog.default-warehouse-dir: {value: "s3://<%= dataplatform_bucket %>/warehouse/"}
+        hive.metastore.uri: {value: "thrift://hive-metastore.governance.svc.cluster.local:9083"}
+        hive.metastore-cache-ttl: {value: 0s}
+        hive.non-managed-table-writes-enabled: {value: "true"}
         iceberg.metadata-cache.enabled: {value: "false"}
         fs.native-s3.enabled: {value: "true"}
         s3.endpoint: {value: "https://<%= site_s3_host %>"}

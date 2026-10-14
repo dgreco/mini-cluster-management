@@ -11,8 +11,8 @@ resources:
   - iam-reconcile.yaml
   - metacatalog-proxy.yaml
   - metacatalog-httproute.yaml
-# The scripts of Meta Catalog's `script` provisioning task (the medallion
-# lakehouses). A fixed name: the task reads them at each run and the kubelet
+# The scripts of Meta Catalog's `script` provisioning task (the platform's
+# tables). A fixed name: the task reads them at each run and the kubelet
 # refreshes the mounted files within a minute, so no restart is needed; a
 # name hash would leave the old ConfigMaps behind (the app does not prune).
 configMapGenerator:
@@ -20,8 +20,9 @@ configMapGenerator:
     options:
       disableNameSuffixHash: true
     files:
-      - provisioning/medallion.sh
+      - provisioning/table.sh
       - provisioning/lib-trino.sh
+      - provisioning/lib-s3.sh
       - provisioning/lib-grants.sh
       - provisioning/lib-iam.sh
       - provisioning/reconcile.sh

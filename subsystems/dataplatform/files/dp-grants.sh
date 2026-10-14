@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # The record of what is granted on the platform's data (ConfigMap
 # governance/metacatalog-grants), for platform administrators: what Meta
-# Catalog's authorize and reject wrote, and what Ceph's STS roles and Trino's
-# S3 mapping follow. Grants are given and taken in Meta Catalog; this is for
-# looking at them and for repairs. Needs kubectl (context k3s: make
+# Catalog's authorize and reject wrote. A table has two entries: its folder
+# (folder.<domain>.<subdomain>.<layer>.<table>), which Ceph's STS roles and
+# Trino's S3 mapping follow, and the table in the metastore
+# (table.<schema>.<table>), which Trino's rules in the Open Policy Agent
+# follow. Grants are given and taken in Meta Catalog; this is for looking at
+# them and for repairs. Needs kubectl (context k3s: make
 # k3s-kubeconfig), jq, and for import python3 with PyYAML (requirements.txt).
 #
-#   dp-grants.sh list               every resource with its directory and grants
+#   dp-grants.sh list               every resource with its folder or table and its grants
 #   dp-grants.sh export [<file>]    the record as JSON (standard output without a file)
 #   dp-grants.sh plan               what the roles in Ceph lack against the record (changes nothing)
 #   dp-grants.sh apply              bring the roles to the record now (iam-reconcile does it hourly)
-#   dp-grants.sh remove <resource>  drop one resource's grants, then apply: for a lakehouse
+#   dp-grants.sh remove <resource>  drop one resource's grants, then apply: for a table
 #                                   deleted in Meta Catalog without a reject first
 #   dp-grants.sh import <file>      put the resources of a copy into the record, then apply:
 #                                   a restore from s3://<backup bucket>/metacatalog-grants/
@@ -27,7 +30,7 @@ in_pod() { kubectl -n "$NS" exec deploy/metacatalog -c metacatalog -- bash /opt/
 
 case ${1:-} in
   list)
-    record | jq -r 'to_entries[] | "\(.key)\t\(.value.path)\t\(.value.grants | map(.access + ": " + ((.groups | map("group " + .)) + (.users | map("user " + .)) | join(", "))) | join("; "))"' \
+    record | jq -r 'to_entries[] | "\(.key)\t\(.value.path // "\(.value.catalog).\(.value.schema).\(.value.table)")\t\(.value.grants | map(.access + ": " + ((.groups | map("group " + .)) + (.users | map("user " + .)) | join(", "))) | join("; "))"' \
       | column -t -s $'\t' ;;
   export)
     if [ -n "${2:-}" ]; then record >"$2"; echo "written to $2"; else record; fi ;;
@@ -40,7 +43,9 @@ case ${1:-} in
     record | jq -e --arg r "$2" 'has($r)' >/dev/null || die "$2 is not in the record"
     kubectl -n "$NS" patch configmap "$CM" --type merge -p "$(jq -cn --arg r "$2" '{data: {($r): null}}')" >/dev/null
     echo "removed $2 from the record"
-    in_pod apply ;;
+    # taken out on purpose: should the record now be empty, the roles go too
+    kubectl -n "$NS" exec deploy/metacatalog -c metacatalog -- \
+      env IAM_ENTRY_REMOVED=true bash /opt/metacatalog/provisioning/reconcile.sh apply ;;
   import)
     [ -f "${2:-}" ] || die "usage: dp-grants.sh import <file>"
     python3 "$HERE/check_access.py" --record "$2" >/dev/null

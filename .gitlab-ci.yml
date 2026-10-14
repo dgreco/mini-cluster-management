@@ -2,8 +2,9 @@
 # ansible-lint, --syntax-check, the unit tests, gitops/iam/access.yaml, the
 # files rendered from the site's settings (make configure), and
 # every Argo CD Application rendered (kubectl kustomize, helm template) with
-# the collector's config validated by otelcol-contrib. Data grants are not
-# here: Meta Catalog applies them (make dataplatform-grants).
+# the collector's config validated by otelcol-contrib, and Trino's access
+# rules tested with opa. Data grants are not here: Meta Catalog applies them
+# (make dataplatform-grants).
 stages: [check]
 
 ansible:
@@ -64,3 +65,21 @@ otelcol:
     # the config names the pod's service account files; validate wants them to exist
     - sa=/var/run/secrets/kubernetes.io/serviceaccount; mkdir -p $sa; touch $sa/token $sa/ca.crt
     - ./otelcol-contrib validate --config=otel-cluster.yaml
+
+# Trino's access rules for the Open Policy Agent, with their unit tests. The
+# release binary of the version the platform runs (productVersion in
+# gitops/manifests/governance/opa/opa.yaml); bump it with that.
+opa:
+  stage: check
+  image: alpine:3.22
+  variables:
+    OPA_VERSION: "1.16.2"
+  script:
+    - case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "unsupported $(uname -m)"; exit 1 ;; esac
+    - f="opa_linux_${arch}_static"
+    - url="https://github.com/open-policy-agent/opa/releases/download/v${OPA_VERSION}"
+    - wget -q "$url/$f" "$url/$f.sha256"
+    - sha256sum -c "$f.sha256"
+    - install -m 0755 "$f" /usr/local/bin/opa
+    - apk add --no-cache -q make
+    - make dataplatform-policy-test

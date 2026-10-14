@@ -6,13 +6,15 @@
 # (metacatalog-proxy.yaml) lets only <%= site_admin_group %> and <%= site_engineer_group %>
 # through. One replica: login sessions live in memory.
 #
-# Its `script` provisioning task builds the medallion lakehouses
+# Its `script` provisioning task builds the platform's tables
 # (subsystems/dataplatform/metacatalog): the scripts in provisioning/, for the
-# physical types MedallionSchemaType and MedallionTableType, create and drop
-# Iceberg schemas and tables through Trino, and apply the lakehouse's grants:
-# authorize writes them into the record of grants and Ceph's STS roles
-# (metacatalog-grants.yaml), reject takes them back. Only <%= site_admin_group %> may
-# authorize or reject (the gate in metacatalog-proxy.yaml).
+# physical types S3FolderType and HiveTableType, make and empty a table's
+# folder in the bucket, register and drop the table in the Hive Metastore
+# through Trino, and apply the table's grants: authorize writes them into the
+# record of grants, from which Ceph's STS roles (the files) and Trino's rules
+# in the Open Policy Agent (the statements) follow; reject takes them back.
+# Only <%= site_admin_group %> may authorize or reject (the gate in
+# metacatalog-proxy.yaml).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -73,21 +75,21 @@ spec:
             # to SerialGC, and the image's AOT cache was trained with G1.
             - {name: JDK_JAVA_OPTIONS, value: "-XX:MaxRAMPercentage=50"}
             # The `script` provisioning task: one script for both physical
-            # types of the medallion model, which tells them apart itself
+            # types of the table model, which tells them apart itself
             - name: SPRING_APPLICATION_JSON
               value: >-
                 {"application": {"config": {"provisioning": {"tasks": {"script": {
-                "entity-types": ["MedallionSchemaType", "MedallionTableType"],
-                "path": "/opt/metacatalog/provisioning/medallion.sh"}}}}}}
-            # ... and what the scripts need (provisioning/medallion.sh; the
-            # bucket and prefix come with the IAM settings below)
-            - {name: MEDALLION_CATALOG, value: lakehouse}
+                "entity-types": ["S3FolderType", "HiveTableType"],
+                "path": "/opt/metacatalog/provisioning/table.sh"}}}}}}
+            # ... and what the scripts need (provisioning/table.sh; the
+            # bucket, the prefix, the catalog and Ceph come with the IAM
+            # settings below)
             - {name: TRINO_URL, value: https://trino.<%= dataplatform_domain %>}
             - {name: KEYCLOAK_TOKEN_URL, value: https://keycloak.<%= dataplatform_domain %>/realms/<%= dataplatform_keycloak_realm %>/protocol/openid-connect/token}
             - {name: PROVISIONER_CLIENT_ID, value: metacatalog-provisioner}
             - {name: PROVISIONER_CLIENT_SECRET_FILE, value: /etc/metacatalog/provisioner/client-secret}
-          # ... the record of grants and Ceph's IAM (authorize, reject),
-          # with MEDALLION_BUCKET and MEDALLION_PREFIX (metacatalog-grants.yaml)
+          # ... the record of grants, Ceph and the names of the platform's
+          # tables (metacatalog-grants.yaml)
           envFrom:
             - configMapRef: {name: metacatalog-iam}
           # Liveness and readiness include the database; the start (Flyway,

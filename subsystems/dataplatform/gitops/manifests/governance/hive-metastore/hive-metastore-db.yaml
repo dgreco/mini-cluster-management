@@ -1,0 +1,34 @@
+# The database of the Hive Metastore: which tables exist, their columns,
+# their format and where their files are. It never holds data: files are read
+# and written by Trino and Spark with the user's STS credentials. The
+# metastore makes and upgrades its own schema in it.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: hive-metastore-db
+spec:
+  instances: 2
+  storage:
+    storageClass: ceph-rbd
+    size: 2Gi
+  bootstrap:
+    initdb:
+      database: hive
+      owner: hive
+      secret:
+        name: hive-metastore-db-owner
+  # Continuous WAL archiving and the nightly base backups go through the
+  # Barman Cloud plugin to the ObjectStore hive-metastore-db (hive-metastore-db-objectstore.yaml):
+  # s3://platform-backups/cnpg/hive-metastore-db/hive-metastore-db/, with the backup key.
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: hive-metastore-db
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+    limits: {memory: 512Mi}
+  inheritedMetadata:
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9187"

@@ -142,6 +142,9 @@ dataplatform_backup_kv_path: governance/backup-s3
 #   metacatalog-iam: Meta Catalog's authorize, reject and iam-reconcile: the
 #                   roles of the approved grants (usr-*, grp-*), never the
 #                   platform's own
+#   hive:           the Hive Metastore: it sees which directories exist under
+#                   the tables' prefix, and reads and writes the Iceberg
+#                   metadata of the tables (a Spark job's commit), no data file
 # account_root: true makes the user the account's administrator; policy: the
 # IAM user policy of the others (what they may do in the account).
 dataplatform_s3_users:
@@ -195,6 +198,33 @@ dataplatform_s3_users:
         Action: ["iam:*"]
         Resource: "{{ dataplatform_iam_platform_roles | map('regex_replace', '^', 'arn:aws:iam::' ~ dataplatform_rgw_account_id ~ ':role/') | list }}"
     openbao: [governance/metacatalog-iam]
+  # The Hive Metastore (gitops/manifests/governance/hive-metastore).
+  # - When a table is registered it asks S3 whether the table's directory
+  #   exists (and would make it otherwise: Meta Catalog makes it first, so it
+  #   never has to). For that it lists the bucket.
+  # - When a Spark job commits to an Iceberg table (the metastore's REST
+  #   catalog), the metastore reads the table's metadata and writes the new
+  #   metadata file itself: <prefix>/<domain>/<subdomain>/<layer>/<table>/
+  #   metadata/. Nothing else of a table: no data file, and nothing deleted.
+  # lakehouse is access.yaml's metacatalog.prefix.
+  # Not tried on Ceph yet. The first question is asked by name (a HEAD on a
+  # key that is no object); RGW should answer "not found" to whoever may list
+  # the bucket. If it answers "access denied" instead, making a table fails
+  # at the metastore: add a statement that allows s3:GetObject on
+  # <bucket>/lakehouse/*, and say here that the key then reads every file.
+  - uid: hive
+    display_name: hive
+    max_buckets: -1
+    policy:
+      - Sid: SeeTheDirectories
+        Effect: Allow
+        Action: ["s3:ListBucket", "s3:GetBucketLocation"]
+        Resource: ["arn:aws:s3:::{{ dataplatform_bucket }}"]
+      - Sid: TheTablesIcebergMetadata
+        Effect: Allow
+        Action: ["s3:GetObject", "s3:PutObject"]
+        Resource: ["arn:aws:s3:::{{ dataplatform_bucket }}/lakehouse/*/*/*/*/metadata/*"]
+    openbao: [governance/hive-s3]
 # Service users that are gone: make dataplatform-ceph deletes them from RGW
 # (their objects stay the bucket's) and their key files from .secrets/.
 #   dataplatform-rw: the permanent read-write key for desktop tools, removed
@@ -208,22 +238,23 @@ dataplatform_s3_users_removed:
   - {uid: iam-terraform, secrets_file: s3-iam-terraform}
 
 # ---------------------------------------------------------------- iam ----
-# Who may use which directory of the bucket is decided in Meta Catalog: a
-# member of the admin group authorizes a lakehouse, its grants go into the
-# record governance/metacatalog-grants, and every user (usr-<user>) and group
-# (grp-<group>) they name gets an STS role in the account with those
-# directories (make dataplatform-grants shows them). Members assume their role
+# Who may use which table is decided in Meta Catalog: a member of the admin
+# group authorizes a table, its grants go into the record
+# governance/metacatalog-grants, and every user (usr-<user>) and group
+# (grp-<group>) they name gets an STS role in the account with the tables'
+# folders (make dataplatform-grants shows them). Members assume their role
 # with their Keycloak token (AssumeRoleWithWebIdentity); Trino assumes it for
 # them (AssumeRole as the RGW user trino). gitops/iam/access.yaml keeps the
 # platform's part; make dataplatform-iam keeps the rest: the Keycloak realm,
-# the OIDC provider RGW trusts, the platform's own roles, the catalog,
-# OpenBao's login.
+# the OIDC provider RGW trusts, the platform's own roles, OpenBao's login.
 dataplatform_iam_user_role_prefix: usr-
 dataplatform_iam_group_role_prefix: grp-
 # Keycloak clients whose tokens RGW accepts for AssumeRoleWithWebIdentity
 # (smoke-test: the confidential client of make dataplatform-smoke-test;
-# jupyterhub: the hub hands its login token to the notebook servers)
-dataplatform_iam_client_ids: [data-cli, spark, smoke-test, jupyterhub, s3browser]
+# jupyterhub: the hub hands its login token to the notebook servers;
+# metacatalog-provisioner: Meta Catalog makes and empties the tables' folders
+# with its provisioner's own role)
+dataplatform_iam_client_ids: [data-cli, spark, smoke-test, jupyterhub, s3browser, metacatalog-provisioner]
 # Longest STS session any role grants (s); RGW's own limit is ceph_rgw_sts_max_session_duration
 dataplatform_sts_max_session_duration: 43200
 # Groups with every permission on the bucket (access.yaml's admins.groups
@@ -280,8 +311,7 @@ dataplatform_openbao_generated:
   governance/platform-admin: {username: admin, password: null}           # first user of the directory (in the admin group)
   governance/samba-ad: {admin-password: null, bind-password: null}       # the domain's Administrator; the account Keycloak reads the directory as
   governance/directory-proxy: {cookie-secret: null}           # oauth2-proxy's cookie key in front of LDAP Account Manager
-  governance/iceberg-catalog-db: {username: iceberg, password: null}
-  governance/iceberg-catalog-spark: {username: spark_writer, password: null}   # the Spark jobs' catalog login (no DDL)
+  governance/hive-metastore-db: {username: hive, password: null}     # owner of the Hive Metastore's database
   governance/metacatalog-db: {username: metacatalog, password: null}  # owner of Meta Catalog's database
   governance/metacatalog-proxy: {cookie-secret: null}         # oauth2-proxy's cookie key in front of Meta Catalog
   observability/grafana-admin: {admin-user: admin, admin-password: null}
@@ -295,6 +325,4 @@ dataplatform_openbao_copies:
   tools/jupyterhub-oidc: {client-secret: "governance/keycloak-clients#jupyterhub"}
   tools/s3browser-oidc: {client-secret: "governance/keycloak-clients#s3browser"}
   observability/vmui-oidc: {client-secret: "governance/keycloak-clients#vmui"}
-  compute/iceberg-catalog: {username: "governance/iceberg-catalog-db#username", password: "governance/iceberg-catalog-db#password"}
-  compute/iceberg-catalog-spark: {username: "governance/iceberg-catalog-spark#username", password: "governance/iceberg-catalog-spark#password"}
   governance/iam-sync: {client-secret: "governance/keycloak-clients#iam-sync"}

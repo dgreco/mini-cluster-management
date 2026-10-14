@@ -15,10 +15,14 @@ spec:
     path: subsystems/dataplatform/gitops/iam
   destination:
     server: https://kubernetes.default.svc
-  # the record of grants: Argo CD creates it, Meta Catalog's scripts write it
+  # the record of grants: Argo CD creates it, Meta Catalog's scripts write it;
+  # the grants as the Open Policy Agent reads them: iam-sync writes them
   ignoreDifferences:
     - kind: ConfigMap
       name: metacatalog-grants
+      jsonPointers: [/data]
+    - kind: ConfigMap
+      name: trino-grants
       jsonPointers: [/data]
   syncPolicy:
     automated:

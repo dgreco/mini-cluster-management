@@ -1,0 +1,10 @@
+# Where the Vector agents of the Stackable products of this namespace (the
+# Hive Metastore, the Open Policy Agent) send their logs. The operators read
+# this discovery ConfigMap (key ADDRESS) from the product's own namespace:
+# compute has one of its own (manifests/observability/vector).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-aggregator-discovery
+data:
+  ADDRESS: vector-aggregator.observability.svc.cluster.local:6000

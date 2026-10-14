@@ -4,5 +4,4 @@ resources:
   - spark-history.yaml
   - spark-template.yaml
   - spark-rbac.yaml
-  - spark-secrets.yaml
   - spark-fence.yaml

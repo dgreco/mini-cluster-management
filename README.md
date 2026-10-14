@@ -14,9 +14,11 @@ off. From one laptop, with one command each, you can:
 - run **Kubernetes** (k3s) on the four boards, with persistent volumes stored
   in Ceph;
 - run a **data platform** on Kubernetes: **Trino** (SQL) and **Spark** on
-  Iceberg tables in Ceph S3, one login for everything (**Keycloak**), every
-  data access decided by Ceph through the user's group (STS roles), secrets in
-  **OpenBao**, metrics and logs in **Grafana**.
+  tables in Ceph S3 (Iceberg, Parquet, Avro), each described in
+  **Meta Catalog** and registered in a **Hive Metastore**, one login for
+  everything (**Keycloak**), every statement decided by the
+  **Open Policy Agent** and every file by Ceph through the user's group
+  (STS roles), secrets in **OpenBao**, metrics and logs in **Grafana**.
 
 Everything is done by [Ansible](https://docs.ansible.com) playbooks, started
 through `make`. You do not need to know either tool: this page tells you what
@@ -301,9 +303,10 @@ The short version:
 
 ```bash
 make dataplatform-install        # Argo CD, then everything from Git (30-60 min)
-make dataplatform-smoke-test     # proves that Ceph decides every data access
+make dataplatform-smoke-test     # proves that Trino and Ceph refuse whatever is not granted
 make dataplatform-passwords      # bootstrap logins; everyday logins go through Keycloak
 make dataplatform-status         # what runs, and the web addresses
+make dataplatform-tables ARGS=list   # the tables in Meta Catalog (also: load, provision, authorize, status)
 make dataplatform-grants ARGS=list   # what is granted (administrators; grants are given in Meta Catalog)
 make dataplatform-iam-check      # validate gitops/iam/access.yaml (the platform's part of the access model)
 make dataplatform-directory ARGS="user list"   # users and groups on the command line (LDAP Account Manager is the web interface)
@@ -314,11 +317,11 @@ make dataplatform-kubeconfig     # kubectl with your Keycloak login (Spark jobs)
 Users and groups are kept in one place, the platform's directory (a Samba
 Active Directory domain on the cluster). You manage them in its web interface,
 LDAP Account Manager (`make dataplatform-directory` does the same on the
-command line); Keycloak reads them from it and logs everybody in. Who may use which directory of the platform's bucket `s3://dataplatform`
-is decided in Meta Catalog, where an administrator authorizes each lakehouse's
-policy. A user reads and writes the directories granted to them or their
-groups, and the tables in them, through Trino, Spark, JupyterHub notebooks or
-S3 directly.
+command line); Keycloak reads them from it and logs everybody in. Who may use which table is decided in Meta Catalog, where every table is
+described and an administrator authorizes its policy
+(`make dataplatform-tables`). A user reads and writes the tables granted to
+them or their groups through Trino, Spark and JupyterHub notebooks, and their
+files in the platform's bucket `s3://dataplatform` directly.
 
 ### Monitoring
 

@@ -3,14 +3,41 @@
 # A job is a SparkApplication <user>-<name>. The operator gives it a service
 # account of the same name (bound to spark-k8s-clusterrole: pods, services
 # and configmaps only, manifests/operators/spark-k8s-operator), and its pods
-# (spark-submit, driver, executors) run as that account. A job may use two
-# Secrets: the catalog login spark-catalog-logins and its own Keycloak token
-# spark-token-<job> (dp-spark-submit.sh writes it).
+# (spark-submit, driver, executors) run as that account. A job may use one
+# Secret: its own Keycloak token spark-token-<job> (dp-spark-submit.sh
+# writes it).
 #
 # dataplatform-spark-pods: every pod a job creates, or the Job controller
-# creates for it, uses only those Secrets, the event-log key of the
+# creates for it, uses only that Secret, the event-log key of the
 # SecretClass s3-spark, configmaps, empty directories and its own service
 # account token, and runs as the job's own service account.
+# A job's account has every verb on the pods, ConfigMaps and Services of
+# compute (the driver makes its executors, their configuration and its own
+# Service; the operator's role cannot say which), and Trino lives next
+# door. So that a job touches nothing that decides who may do what:
+# dataplatform-compute-configmaps: the ConfigMaps Trino lives by are closed
+# to every service account of compute: trino-iam (Trino's group file and S3
+# role mapping, iam-sync's: a job that rewrote it would put its owner into
+# any group, and the Open Policy Agent and the catalog gate decide from
+# those groups), Trino's and the history server's own configuration, the
+# discovery ConfigMaps and the cleanup job's program. iam-sync (governance),
+# Argo CD and the operators are not compute's accounts and write them as
+# before.
+# dataplatform-compute-pods: a service account of compute changes and
+# deletes only the pods that run as itself (a driver its executors). It
+# could otherwise put an image of its own into Trino's pods, which hold
+# Trino's secrets and are the only ones the Hive Metastore and the Open
+# Policy Agent listen to.
+# dataplatform-compute-pod-labels: only Trino's and the history server's
+# pods carry their names (app.kubernetes.io/name) and the listener
+# operator's labels, whoever writes the pod. Those labels are what the
+# network policies know Trino by (manifests/namespaces/network-policies.yaml)
+# and what the Services select: a job's pod with them would reach the
+# metastore and the Agent, and be sent the requests of Trino's users, their
+# tokens included.
+# dataplatform-compute-services: the Services of Trino, the history server
+# and the listener operator are closed to every service account of compute
+# (one that changed a selector would take those requests the same way).
 # dataplatform-spark-submitter-jobs, -secrets, -code (one per kind: a
 # policy's expressions are type-checked against every kind it matches): a
 # Keycloak user (oidc:<user>) names jobs, tokens and job code after
@@ -43,7 +70,7 @@ spec:
     - name: platform
       expression: "variables.sa in ['trino-serviceaccount', 'spark-history-serviceaccount', 'spark-cleanup']"
     - name: secrets
-      expression: "['spark-catalog-logins', 'spark-token-' + variables.sa]"
+      expression: "['spark-token-' + variables.sa]"
   validations:
     - expression: "variables.creator == '' || variables.sa == variables.creator"
       messageExpression: "'a Spark job creates pods only under its own service account ' + variables.creator"
@@ -62,7 +89,7 @@ spec:
               && !has(v.ephemeral.volumeClaimTemplate.spec.dataSource)
               && !has(v.ephemeral.volumeClaimTemplate.spec.dataSourceRef)))
       messageExpression: >-
-        'a Spark job mounts only spark-catalog-logins, spark-token-' + variables.sa
+        'a Spark job mounts only spark-token-' + variables.sa
         + ', the s3-spark SecretClass, configmaps, empty directories and its service account token'
       reason: Forbidden
     - expression: >-
@@ -86,6 +113,167 @@ metadata:
   name: dataplatform-spark-pods
 spec:
   policyName: dataplatform-spark-pods
+  validationActions: [Deny]
+---
+# The platform's ConfigMaps in compute are not a job's to write.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dataplatform-compute-configmaps
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: compute}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [configmaps]
+  # only compute's own service accounts are judged (the jobs', Trino's, the
+  # history server's): none of them has a reason to write these
+  matchConditions:
+    - name: service-accounts-of-compute
+      expression: request.userInfo.username.startsWith('system:serviceaccount:compute:')
+  validations:
+    # by name: what Git and iam-sync put here; by label: what the Trino and
+    # Spark operators keep for Trino and the history server (a job's own
+    # ConfigMaps carry neither)
+    - expression: >-
+        !(request.name in ['trino-iam', 'trino-group-provider', 'opa', 'vector-aggregator-discovery',
+                           'stackable-tls-ca', 'kube-root-ca.crt']
+          || request.name.startsWith('spark-cleanup-script-')
+          || (request.operation != 'CREATE' && has(oldObject.metadata.labels)
+              && 'app.kubernetes.io/name' in oldObject.metadata.labels
+              && oldObject.metadata.labels['app.kubernetes.io/name'] in ['trino', 'spark-history']))
+      messageExpression: >-
+        'the ConfigMap ' + request.name + ' is the platform\'s: no service account of compute writes it'
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dataplatform-compute-configmaps
+spec:
+  policyName: dataplatform-compute-configmaps
+  validationActions: [Deny]
+---
+# A service account of compute changes and deletes only its own pods.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dataplatform-compute-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: compute}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [UPDATE, DELETE]
+        resources: [pods]
+  # compute's own service accounts only: the kubelet, the controllers and the
+  # operators are not judged here (creating a pod: dataplatform-spark-pods)
+  matchConditions:
+    - name: service-accounts-of-compute
+      expression: request.userInfo.username.startsWith('system:serviceaccount:compute:')
+  validations:
+    - expression: >-
+        (has(oldObject.spec.serviceAccountName) ? oldObject.spec.serviceAccountName : 'default')
+        == request.userInfo.username.substring(30)
+      messageExpression: >-
+        'the pod ' + request.name + ' is not one of ' + request.userInfo.username.substring(30)
+        + ': a service account of compute changes and deletes only its own pods'
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dataplatform-compute-pods
+spec:
+  policyName: dataplatform-compute-pods
+  validationActions: [Deny]
+---
+# The labels Trino and the history server are known by are theirs alone.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dataplatform-compute-pod-labels
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: compute}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods]
+  # whoever sends the request: a submitter may set a job's pod labels
+  # (podOverrides), and it is then the Job controller or the job's own
+  # account that writes the pod
+  variables:
+    - name: sa
+      expression: "has(object.spec.serviceAccountName) ? object.spec.serviceAccountName : 'default'"
+  validations:
+    - expression: >-
+        !has(object.metadata.labels) || !('app.kubernetes.io/name' in object.metadata.labels)
+        || !(object.metadata.labels['app.kubernetes.io/name'] in ['trino', 'spark-history'])
+        || variables.sa == object.metadata.labels['app.kubernetes.io/name'] + '-serviceaccount'
+      messageExpression: >-
+        'only the pods of ' + object.metadata.labels['app.kubernetes.io/name']
+        + ' carry the label app.kubernetes.io/name: ' + object.metadata.labels['app.kubernetes.io/name']
+      reason: Forbidden
+    - expression: >-
+        variables.sa in ['trino-serviceaccount', 'spark-history-serviceaccount']
+        || !has(object.metadata.labels)
+        || !object.metadata.labels.exists(k, k.startsWith('listener.stackable.tech/'))
+      message: only the pods of Trino and the history server carry the listener operator's labels (listener.stackable.tech/...)
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dataplatform-compute-pod-labels
+spec:
+  policyName: dataplatform-compute-pod-labels
+  validationActions: [Deny]
+---
+# The platform's Services in compute are not a job's to change.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dataplatform-compute-services
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels: {kubernetes.io/metadata.name: compute}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [UPDATE, DELETE]
+        resources: [services]
+  matchConditions:
+    - name: service-accounts-of-compute
+      expression: request.userInfo.username.startsWith('system:serviceaccount:compute:')
+  validations:
+    # what the Trino, Spark and listener operators keep (a driver's own
+    # Service carries none of these names)
+    - expression: >-
+        !(has(oldObject.metadata.labels) && 'app.kubernetes.io/name' in oldObject.metadata.labels
+          && oldObject.metadata.labels['app.kubernetes.io/name'] in ['trino', 'spark-history', 'listener'])
+      messageExpression: >-
+        'the Service ' + request.name + ' is the platform\'s: no service account of compute changes it'
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dataplatform-compute-services
+spec:
+  policyName: dataplatform-compute-services
   validationActions: [Deny]
 ---
 # A Keycloak user's Spark jobs: named after the user, under the operator's service account.

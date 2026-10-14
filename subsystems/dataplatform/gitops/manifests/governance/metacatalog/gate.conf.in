@@ -1,5 +1,5 @@
 # The gate between oauth2-proxy and Meta Catalog (metacatalog-proxy.yaml).
-# Authorizing and rejecting a lakehouse give and take data access (they write
+# Authorizing and rejecting a table give and take data access (they write
 # the record of grants and Ceph's roles: provisioning/lib-grants.sh), so only
 # members of <%= site_admin_group %> may, in the API and in the UI; every other
 # request passes. Meta Catalog itself has no roles.

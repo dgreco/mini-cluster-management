@@ -13,15 +13,17 @@
 #    (-n, default the file's name and the time; your name is put in front).
 #    The job's driver and executors exchange that token at Ceph's STS
 #    (AssumeRoleWithWebIdentity) for the role you chose themselves: your
-#    group's grp-<group> (-g) or your own usr-<you> (-u), the roles Meta
-#    Catalog's lakehouse policies grant directories of the platform bucket
-#    to. Ceph decides what the job may read and write.
+#    group's grp-<group> (-g) or your own usr-<you> (-u), the roles the
+#    tables' policies in Meta Catalog grant their folders in the platform
+#    bucket to. Ceph decides what the job may read and write.
 # 3. Creates the SparkApplication <name> from the template lakehouse (Iceberg
-#    catalog lakehouse, web identity) and uploads job.py as the ConfigMap
-#    job-<name>, owned by the job. The job reads and writes the tables Meta
-#    Catalog made (lakehouse.<lakehouse>_<layer>.<table>); it creates,
-#    drops and renames none: its catalog login (spark_writer, Secret
-#    spark-catalog-logins) only commits to existing tables.
+#    catalog lakehouse on the Hive Metastore's REST catalog, web identity) and
+#    uploads job.py
+#    as the ConfigMap job-<name>, owned by the job. The job reads and writes
+#    the Iceberg tables Meta Catalog made
+#    (lakehouse.<domain>_<subdomain>_<layer>.<table>). Tables are Meta
+#    Catalog's to make and drop: the metastore has no login and would let a
+#    job do it, so do not.
 # 4. With -w, waits for the job and prints the driver's log. -m raises the
 #    driver's memory limit above the template's 1Gi (Iceberg maintenance on a
 #    big table plans on the driver).
@@ -72,9 +74,8 @@ secret=spark-token-$name
 # Secrets may be created and deleted by name, never read: no apply here.
 kubectl -n "$ns" delete secret "$secret" --ignore-not-found >/dev/null
 kubectl -n "$ns" create secret generic "$secret" --from-literal=token="$token" >/dev/null
-# What differs per job sits here; the template lakehouse holds the rest (the
-# catalog login, password from PGPASSFILE). The token file and the role are
-# what the AWS SDK's web identity provider reads.
+# What differs per job sits here; the template lakehouse holds the rest. The
+# token file and the role are what the AWS SDK's web identity provider reads.
 pod_overrides() {
   cat <<EOF
     podOverrides:
@@ -84,11 +85,6 @@ pod_overrides() {
             secret:
               secretName: $secret
               items: [{key: token, path: token}]
-          - name: iceberg-catalog
-            secret:
-              secretName: spark-catalog-logins
-              defaultMode: 288
-              items: [{key: pgpass, path: pgpass}]
         containers:
           - name: spark
             env:
@@ -97,10 +93,8 @@ pod_overrides() {
               - {name: AWS_ROLE_SESSION_NAME, value: "$user"}
               - {name: AWS_REGION, value: "${S3_REGION}"}
               - {name: AWS_ENDPOINT_URL_STS, value: "${S3_ENDPOINT}"}
-              - {name: PGPASSFILE, value: /stackable/iceberg-catalog/pgpass}
             volumeMounts:
               - {name: keycloak-token, mountPath: /stackable/keycloak, readOnly: true}
-              - {name: iceberg-catalog, mountPath: /stackable/iceberg-catalog, readOnly: true}
 EOF
 }
 kubectl create -f - >/dev/null <<EOF

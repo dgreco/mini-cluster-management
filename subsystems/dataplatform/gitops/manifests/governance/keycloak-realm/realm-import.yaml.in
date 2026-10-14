@@ -394,9 +394,11 @@ spec:
           userinfo.token.claim: 'true'
           introspection.token.claim: 'true'
     # Meta Catalog's provisioning scripts (manifests/governance/metacatalog/
-    # provisioning) create the medallion lakehouses' schemas and tables in
-    # Trino as this client's service account, service-account-metacatalog-
-    # provisioner: access.yaml grants it rw on lakehouse/. No realm roles.
+    # provisioning) make the tables as this client's service account,
+    # service-account-metacatalog-provisioner: their folders with its own STS
+    # role (access.yaml grants it rw on lakehouse/; Ceph takes its token:
+    # dataplatform_iam_client_ids), the tables themselves in Trino. No realm
+    # roles.
     - clientId: metacatalog-provisioner
       name: Meta Catalog provisioning (service account)
       enabled: true

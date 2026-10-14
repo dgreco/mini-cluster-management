@@ -3,11 +3,13 @@ kind: Kustomization
 namespace: governance
 # access.yaml as the ConfigMap governance/iam-access for iam-sync (the grants
 # themselves come from the record Meta Catalog writes, ConfigMap
-# metacatalog-grants). A fixed name: iam-sync lives in another Argo CD
+# metacatalog-grants; iam-sync writes what Trino's policy needs of them into
+# the ConfigMap trino-grants). A fixed name: iam-sync lives in another Argo CD
 # Application, which a name hash would not reach; it re-reads the file on
 # every round, so a change needs no restart.
 resources:
   - metacatalog-grants.yaml       # the record of grants Meta Catalog writes
+  - trino-grants.yaml             # ... and what the Open Policy Agent reads of it (iam-sync)
 generatorOptions:
   disableNameSuffixHash: true
 configMapGenerator:

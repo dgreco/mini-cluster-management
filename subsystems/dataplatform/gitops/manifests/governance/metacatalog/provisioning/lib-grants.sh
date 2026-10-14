@@ -1,33 +1,46 @@
 # Meta Catalog's access decisions -> the platform's data access model.
-# Sourced by medallion.sh on authorize and reject, after lib-iam.sh; needs
-# bash, curl and jq.
+# Sourced by table.sh on authorize and reject, after lib-iam.sh; needs bash,
+# curl and jq.
 #
-# Ceph decides every data access of the platform. Authorizing a resource
-# writes its grants into the record of what is granted (the ConfigMap
-# $GRANTS_CONFIGMAP, lib-iam.sh), then brings the STS roles in Ceph to the
-# whole record; iam-sync reads the same record (Trino's S3 mapping). The
-# entry of a resource:
+# A table's policy in Meta Catalog (its principals, permissions and grants)
+# reaches each of its two resources as the grants in force there. Authorizing
+# a resource writes them into the record of what is granted (the ConfigMap
+# $GRANTS_CONFIGMAP, lib-iam.sh); what enforces them follows the record:
 #
-#   {"path": "lakehouse/acme_retail/gold",
-#    "grants": [{"access": "rw", "users": [], "groups": ["data-engineers"]},
-#               {"access": "ro", "users": [], "groups": ["data-analysts"]}]}
+#   the folder   Ceph. The STS roles of the users and groups named get the
+#                directory, here and at once (lib-iam.sh); iam-sync gives
+#                Trino the role to use there (its S3 mapping).
+#   the table    Trino. iam-sync writes the rules the Open Policy Agent
+#                decides Trino's statements with, within a minute.
 #
-# READ -> ro (read and list), WRITE -> rw (also write and delete; DDL stays
-# Meta Catalog's provisioner's). GROUP and USER are Keycloak groups and users; SERVICE <id> is
-# the service account of the Keycloak client <id> (service-account-<id>).
-# Anything else fails the resource: a permission or principal this platform
-# cannot enforce must not read as granted. Rejecting removes the entry.
+# The entries of a table:
+#
+#   folder.sales.orders.gold.daily_revenue
+#     {"path": "lakehouse/sales/orders/gold/daily_revenue",
+#      "grants": [{"access": "rw", "users": [], "groups": ["data-engineers"]},
+#                 {"access": "ro", "users": [], "groups": ["data-analysts"]}]}
+#   table.sales_orders_gold.daily_revenue
+#     {"catalog": "lakehouse", "schema": "sales_orders_gold", "table": "daily_revenue",
+#      "grants": [... the same shape ...]}
+#
+# READ -> ro (the files: read and list; the table: SELECT), WRITE -> rw (the
+# files: also write and delete; the table: also INSERT, UPDATE, DELETE,
+# MERGE; DDL stays Meta Catalog's provisioner's). GROUP and USER are Keycloak
+# groups and users; SERVICE <id> is the service account of the Keycloak
+# client <id> (service-account-<id>). Anything else fails the resource: a
+# permission or principal this platform cannot enforce must not read as
+# granted. Rejecting removes the entry.
 #
 # Only platform-admins may authorize and reject: the gate in front of Meta
 # Catalog (metacatalog-proxy.yaml) refuses everyone else these two calls, in
-# the API and in the UI. Every realm user of Meta Catalog may edit a
-# lakehouse's policy; it counts once an administrator authorizes it. An
-# unchanged entry changes nothing, so authorizing again is a no-op.
+# the API and in the UI. Every user of Meta Catalog may edit a table's
+# policy; it counts once an administrator authorizes it. An unchanged entry
+# changes nothing, so authorizing again is a no-op.
 
 GRANTS_NAME_RE=$IAM_NAME_RE                     # users and groups, as check_access.py
 
-# The grants of METACATALOG_ACCESS as entries of the file (JSON), or a failure
-# naming what cannot be translated.
+# The grants of METACATALOG_ACCESS as entries of the record (JSON), or a
+# failure naming what cannot be translated.
 grants_entries() {
   local out
   if ! out=$(jq -c --arg re "$GRANTS_NAME_RE" '
@@ -54,7 +67,9 @@ grants_entries() {
 }
 
 # Puts this resource's entry (JSON, or "null" to remove it) into the record,
-# after checking the record as it would then be, and brings Ceph's roles to it.
+# after checking the record as it would then be. A folder's entry changes
+# who reaches which files: Ceph's roles are brought to the record here. A
+# table's changes no role: iam-sync reads it.
 grants_write() { # <entry JSON | null>
   local before
   record_read
@@ -66,6 +81,9 @@ grants_write() { # <entry JSON | null>
   else
     record_put "$RESOURCE" "$1"
     echo "grants of $RESOURCE: written to the record"
+    # a reject took a present entry out: should the record now be empty, the
+    # last grant went, and the roles go with it (lib-iam.sh)
+    [ "$1" != null ] || IAM_ENTRY_REMOVED=true
   fi
-  iam_apply
+  [ "$KIND" != folder ] || iam_apply
 }

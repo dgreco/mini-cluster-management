@@ -29,8 +29,60 @@ spec:
         - {namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: nginx-gateway}}}
     - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: operators}}}]       # External Secrets (OpenBao), CloudNativePG (its instances)
     - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: observability}}}]   # scrapes
-    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: compute}}}]         # Trino and the Spark jobs: the Iceberg catalog
-      ports: [{protocol: TCP, port: 5432}]
+---
+# Three doors from compute into governance, each to its own pods only and
+# from no wider than it must be. Neither the Hive Metastore nor the Open
+# Policy Agent has a login, so who reaches them is what decides:
+# - the metastore's Thrift API (9083) and the Agent (8081): Trino's pods
+#   only. A pod is Trino's by its label app.kubernetes.io/name, which the
+#   admission policy dataplatform-compute-pod-labels lets nobody else carry
+#   (manifests/compute/spark/spark-fence.yaml): a Spark job reaches neither;
+# - the catalog gate (8080): every pod of compute, that is the Spark jobs
+#   (the gate tells them apart and refuses everybody else). The metastore's
+#   REST catalog behind it (9001) is reached from governance only (the
+#   policy above): by the gate.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hive-metastore-from-trino
+  namespace: governance
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: hive}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: compute}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: trino}}
+      ports: [{protocol: TCP, port: 9083}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: opa-from-trino
+  namespace: governance
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: opa}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: compute}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: trino}}
+      ports: [{protocol: TCP, port: 8081}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: catalog-gate-from-compute
+  namespace: governance
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: catalog-gate}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: compute}}}]
+      ports: [{protocol: TCP, port: 8080}]
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -52,6 +104,8 @@ spec:
         - {namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: core}}}
         - {namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: nginx-gateway}}}
     - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: compute}}}]         # the Vector agents of Trino, the Spark history server and the jobs
+      ports: [{protocol: TCP, port: 6000}]
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: governance}}}]      # the Vector agents of the Hive Metastore and the Open Policy Agent
       ports: [{protocol: TCP, port: 6000}]
 ---
 apiVersion: networking.k8s.io/v1

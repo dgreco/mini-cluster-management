@@ -1,12 +1,22 @@
 # The template every job of dp-spark-submit.sh starts from (annotation
-# spark-application.template.0.name: lakehouse): the Iceberg JDBC catalog
-# lakehouse on the catalog database (login: spark_writer, Secret
-# spark-catalog-logins; it commits to existing tables, creates none), S3
-# through web identity (the job's Keycloak token, exchanged at Ceph STS for
-# the user's or group's role), event logs to system/spark-events/ of the
-# bucket, product logs through Vector. What differs per job (the token
-# Secret, the role, the warehouse directory, the code) is in the
-# SparkApplication the script writes.
+# spark-application.template.0.name: lakehouse): the Iceberg catalog
+# lakehouse on the Hive Metastore of governance, through the metastore's
+# Iceberg REST catalog and the gate in front of it (the Iceberg tables Meta
+# Catalog made; the same entries Trino reads over Thrift, which Spark cannot
+# use with Hive 4: manifests/governance/hive-metastore), S3 through web
+# identity (the job's Keycloak token, exchanged at Ceph STS for the user's
+# or group's role), event logs to system/spark-events/ of the bucket,
+# product logs through Vector. What differs per job (the token Secret, the
+# role, the code) is in the SparkApplication the script writes.
+#
+# The gate knows whose job is calling (its pod, its SparkApplication's user
+# label) and asks the Open Policy Agent what Trino asks: a job sees the
+# tables its user may read and commits data to those its user may write, as
+# granted in Meta Catalog. It makes, changes, renames and drops none: the
+# gate refuses (CREATE TABLE, ALTER TABLE, DROP TABLE answer 403), those are
+# Meta Catalog's. The files are Ceph's to guard, by the role the job took.
+# The parquet and avro tables are Trino's to read: Spark reads only the
+# Iceberg ones through this catalog.
 apiVersion: spark.stackable.tech/v1alpha1
 kind: SparkApplicationTemplate
 metadata:
@@ -20,19 +30,12 @@ spec:
   deps:
     packages:
     - org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0
-    - org.postgresql:postgresql:42.7.7
   sparkConf:
     spark.sql.extensions: org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
     spark.sql.defaultCatalog: lakehouse
     spark.sql.catalog.lakehouse: org.apache.iceberg.spark.SparkCatalog
-    spark.sql.catalog.lakehouse.type: jdbc
-    spark.sql.catalog.lakehouse.uri: jdbc:postgresql://iceberg-catalog-rw.governance.svc:5432/iceberg
-    spark.sql.catalog.lakehouse.jdbc.schema-version: V1
-    spark.sql.catalog.lakehouse.jdbc.user: spark_writer      # no DDL: Meta Catalog makes the tables
-    # the catalog's own bookkeeping tables exist (iceberg-catalog-db.yaml):
-    # never try to create them, which spark_writer may not
-    spark.sql.catalog.lakehouse.jdbc.init-catalog-tables: 'false'
-    spark.sql.catalog.lakehouse.warehouse: s3://dataplatform/warehouse/
+    spark.sql.catalog.lakehouse.type: rest
+    spark.sql.catalog.lakehouse.uri: http://catalog-gate.governance.svc.cluster.local/iceberg
     spark.sql.catalog.lakehouse.io-impl: org.apache.iceberg.aws.s3.S3FileIO
     spark.sql.catalog.lakehouse.s3.endpoint: https://s3.example.org
     spark.sql.catalog.lakehouse.s3.path-style-access: 'true'

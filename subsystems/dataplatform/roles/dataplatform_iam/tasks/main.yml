@@ -7,8 +7,7 @@
 # 2. Ceph RGW trusts the realm (OIDC provider), and the platform's own STS
 #    roles (the admin groups', Meta Catalog's provisioner's); every other role
 #    comes from the grants administrators authorize in Meta Catalog;
-# 3. the Iceberg catalog: the Spark jobs' login;
-# 4. OpenBao accepts Keycloak logins.
+# 3. OpenBao accepts Keycloak logins.
 # People and groups come from the directory (make dataplatform-directory): a
 # new group or a changed membership needs no run of this.
 - name: Keycloak realm
@@ -16,9 +15,6 @@
 
 - name: Ceph RGW trusts the realm; the platform's own roles
   ansible.builtin.include_tasks: rgw.yml
-
-- name: The Iceberg catalog - row-level security, one role per group
-  ansible.builtin.include_tasks: catalog.yml
 
 - name: OpenBao logins through Keycloak
   ansible.builtin.include_tasks: openbao.yml

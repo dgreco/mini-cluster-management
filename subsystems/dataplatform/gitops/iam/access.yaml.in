@@ -1,23 +1,25 @@
 # The platform's own part of the data authorization model.
 #
-# Meta Catalog is the only place where data access is managed: every schema
-# and table is a medallion lakehouse's, created by Meta Catalog's
-# provisioner, and every grant comes from a lakehouse's policy once a member
-# of <%= site_admin_group %> authorizes it there (subsystems/dataplatform/metacatalog).
-# Authorize writes the grants into the record of grants (ConfigMap
-# governance/metacatalog-grants) and gives the Ceph RGW roles their
-# directories; iam-sync derives Trino's S3 mapping from the same record. This
-# file keeps only what the platform itself needs; Argo CD hands it to
+# Meta Catalog is the only place where data access is managed: every table
+# is modelled there (subsystems/dataplatform/metacatalog), made by Meta
+# Catalog's provisioner, and every grant comes from a table's policy once a
+# member of <%= site_admin_group %> authorizes it there. Authorize writes the
+# grants into the record of grants (ConfigMap governance/metacatalog-grants)
+# and gives the Ceph RGW roles the table's folder; iam-sync derives Trino's
+# S3 mapping and Trino's rules in the Open Policy Agent from the same record.
+# This file keeps only what the platform itself needs; Argo CD hands it to
 # iam-sync, make dataplatform-iam reads it for the platform's own roles.
 #
 #   bucket   the one bucket of the platform (created by make dataplatform-ceph)
 #   admins   groups with every permission on the whole bucket (role
-#            grp-<group>, kept by make dataplatform-iam); they create no schema
-#            or table either: Trino gives DDL to the provisioner only, and only
-#            they may authorize or reject in Meta Catalog
+#            grp-<group>, kept by make dataplatform-iam) and on every table in
+#            Trino; they create no schema or table either: Trino gives DDL to
+#            the provisioner only, and only they may authorize or reject in
+#            Meta Catalog
 #   metacatalog
-#     prefix       the directory under which Meta Catalog creates and grants;
-#                  nothing else can be granted
+#     prefix       the directory under which Meta Catalog makes the tables'
+#                  folders (<prefix>/<domain>/<subdomain>/<layer>/<table>) and
+#                  grants them; nothing else can be granted
 #     provisioner  the Keycloak user that creates every schema and table, the
 #                  only one with DDL in Trino; it has rw on the prefix (role
 #                  usr-<provisioner>, kept by make dataplatform-iam)

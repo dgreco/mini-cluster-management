@@ -1,7 +1,6 @@
-# What iam-sync may do: read the record of grants in governance (below), and
-# in compute write the ConfigMap trino-iam,
-# the Secret spark-catalog-logins (server-side apply, and delete when an immutable
-# field must change; never read) and the RoleBinding spark-submitter, whose
+# What iam-sync may do: in governance, read the record of grants and patch
+# the ConfigMap trino-grants (both below); in compute, write the ConfigMap
+# trino-iam and the RoleBinding spark-submitter (server-side apply), whose
 # only allowed role is dataplatform-spark-submitter. The admission policy in
 # iam-sync-policy.yaml pins it to those three names.
 apiVersion: v1
@@ -63,6 +62,34 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: iam-sync-grants-reader
+subjects:
+  - kind: ServiceAccount
+    name: iam-sync
+    namespace: governance
+---
+# What the Open Policy Agent reads of the record (governance/trino-grants,
+# gitops/iam/trino-grants.yaml: Argo CD makes it): iam-sync writes its data,
+# and can neither make nor delete a ConfigMap here.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: iam-sync-trino-grants
+  namespace: governance
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [trino-grants]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: iam-sync-trino-grants
+  namespace: governance
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: iam-sync-trino-grants
 subjects:
   - kind: ServiceAccount
     name: iam-sync

@@ -1,0 +1,10 @@
+# The smoke test's own domain (make dataplatform-smoke-test loads it when it
+# is missing); its tables are in tables/smoke.yaml.
+entityType: "DomainType"
+values:
+  name: "smoke"
+  description: "The tables of make dataplatform-smoke-test"
+  owner: "the platform"
+parts:
+  - entityType: "SubdomainType"
+    values: { name: "test", description: "Written and emptied at every run" }

@@ -6,6 +6,7 @@ resources:
   - trino-secrets.yaml
   - trino-authentication.yaml
   - trino-group-provider.yaml
+  - trino-opa.yaml
   - trino-catalog-lakehouse.yaml
   - trino.yaml
   - trino-httproute.yaml

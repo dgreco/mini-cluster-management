@@ -1,0 +1,12 @@
+# Where Trino finds the Open Policy Agent. The Agent runs in governance
+# (manifests/governance/opa: nobody but Argo CD and iam-sync writes its rules
+# there), and the operator reads this discovery ConfigMap from Trino's own
+# namespace, so it is written here by hand: the Agent's Service, as its own
+# discovery ConfigMap governance/opa names it (<cluster>-server).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opa
+  namespace: compute
+data:
+  OPA: http://opa-server.governance.svc.cluster.local:8081/

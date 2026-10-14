@@ -1,0 +1,17 @@
+# Where the Barman Cloud plugin archives hive-metastore-db's WAL and base backups:
+# s3://<%= site_backup_bucket %>/cnpg/hive-metastore-db/hive-metastore-db/ (the server name is the cluster's),
+# with the backup key (governance/backup-s3); 14 days kept.
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: hive-metastore-db
+spec:
+  configuration:
+    destinationPath: s3://<%= site_backup_bucket %>/cnpg/hive-metastore-db
+    endpointURL: https://<%= site_s3_host %>
+    s3Credentials:
+      accessKeyId: {name: backup-s3, key: access-key}
+      secretAccessKey: {name: backup-s3, key: secret-key}
+    wal: {compression: gzip}
+    data: {compression: gzip}
+  retentionPolicy: 14d

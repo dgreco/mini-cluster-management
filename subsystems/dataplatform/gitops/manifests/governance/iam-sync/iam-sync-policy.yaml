@@ -1,7 +1,8 @@
 # The fence around iam-sync's rights (iam-sync-rbac.yaml): every object it
-# creates, changes or deletes must be one of two named objects of compute.
-# Anything else (another Secret of compute, a RoleBinding to a wider role) is
-# refused by the API server, whatever the Role says.
+# creates, changes or deletes must be one of two named objects of compute or
+# the ConfigMap governance/trino-grants. Anything else (another Secret of
+# compute, a RoleBinding to a wider role, another ConfigMap the Open Policy
+# Agent would load) is refused by the API server, whatever the Roles say.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -19,11 +20,15 @@ spec:
       expression: request.userInfo.username == 'system:serviceaccount:governance:iam-sync'
   validations:
     - expression: >-
-        request.namespace == 'compute'
-        && ((request.kind.group == '' && request.kind.kind == 'ConfigMap' && request.name == 'trino-iam')
-            || (request.kind.group == 'rbac.authorization.k8s.io' && request.kind.kind == 'RoleBinding'
-                && request.name == 'spark-submitter'))
-      message: iam-sync may only write compute/trino-iam and the RoleBinding compute/spark-submitter
+        (request.namespace == 'compute'
+         && ((request.kind.group == '' && request.kind.kind == 'ConfigMap' && request.name == 'trino-iam')
+             || (request.kind.group == 'rbac.authorization.k8s.io' && request.kind.kind == 'RoleBinding'
+                 && request.name == 'spark-submitter')))
+        || (request.namespace == 'governance' && request.kind.group == '' && request.kind.kind == 'ConfigMap'
+            && request.name == 'trino-grants' && request.operation == 'UPDATE')
+      message: >-
+        iam-sync may only write compute/trino-iam and the RoleBinding compute/spark-submitter, and update
+        governance/trino-grants
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import tempfile
 import unittest
 
@@ -142,6 +143,17 @@ class AccessFile(unittest.TestCase):
         self.assertEqual(m.principals(m.read_access()), (["alice"], ["data-analysts", "data-engineers", "platform-admins"]))
 
 
+def pick(rules, user, place):
+    """The role Trino takes for a user's access to s3://dataplatform/<place>:
+    the first rule, in file order, whose user pattern matches and whose
+    prefix the location starts with (a rule without one matches all)."""
+    location = f"s3://dataplatform/{place}"
+    for r in rules:
+        if "user" in r and re.fullmatch(r["user"].strip("^$"), user) and location.startswith(r.get("prefix", "")):
+            return r["iamRole"].rsplit("/", 1)[1]
+    return None
+
+
 class Trino(unittest.TestCase):
     def test_group_file_takes_only_usable_usernames(self):
         m = load()
@@ -174,15 +186,21 @@ class Trino(unittest.TestCase):
             return [(r.get("prefix"), r["iamRole"].rsplit("/", 1)[1]) for r in rules if r.get("user") == f"^{user}$"]
 
         # alice: lake/projects/ana is granted rw to her and to her group: her own
-        # role wins the tie; shared only through her group; then her default
+        # role wins the tie; shared only through her group; then her default.
+        # Each directory twice: what is in it, and itself (no slash)
         self.assertEqual(of("alice"), [("s3://dataplatform/lake/projects/ana/", "usr-alice"),
+                                       ("s3://dataplatform/lake/projects/ana", "usr-alice"),
                                        ("s3://dataplatform/lake/shared/", "grp-data-analysts"),
+                                       ("s3://dataplatform/lake/shared", "grp-data-analysts"),
                                        (None, "usr-alice")])
         # carol: each project directory with its group's role, the most
         # specific (longest) first; shared is ro to both groups: alphabetical
         self.assertEqual(of("carol"), [("s3://dataplatform/lake/projects/ana/", "grp-data-analysts"),
                                        ("s3://dataplatform/lake/projects/eng/", "grp-data-engineers"),
+                                       ("s3://dataplatform/lake/projects/ana", "grp-data-analysts"),
+                                       ("s3://dataplatform/lake/projects/eng", "grp-data-engineers"),
                                        ("s3://dataplatform/lake/shared/", "grp-data-analysts"),
+                                       ("s3://dataplatform/lake/shared", "grp-data-analysts"),
                                        (None, "grp-data-analysts")])
         # every rule of a user allows all their roles: s3_role still pins one
         for r in rules:
@@ -206,71 +224,112 @@ class Trino(unittest.TestCase):
         # bob: data/archive is granted ro to his group, but his own rw grant
         # on data covers it: the rw role wins
         self.assertEqual(of("bob"), [("s3://dataplatform/lake/data/archive/", "usr-bob"),
+                                     ("s3://dataplatform/lake/data/archive", "usr-bob"),
                                      ("s3://dataplatform/lake/data-x/", "grp-readers"),
+                                     ("s3://dataplatform/lake/data-x", "grp-readers"),
                                      ("s3://dataplatform/lake/data/", "usr-bob"),
+                                     ("s3://dataplatform/lake/data", "usr-bob"),
                                      (None, "usr-bob")])
         # zed: the rw grant below the ro one; the admin role only where a grant
         # names the admin group (shared, ro), never for data/ (its s3:* is not
         # a grant); default: the first group alphabetically
-        self.assertEqual(of("zed"), [("s3://dataplatform/lake/data/archive/2025/", "grp-writers"),
-                                     ("s3://dataplatform/lake/data/archive/", "grp-readers"),
-                                     ("s3://dataplatform/lake/data-x/", "grp-readers"),
-                                     ("s3://dataplatform/lake/shared/", "grp-platform-admins"),
-                                     (None, "grp-platform-admins")])
-        # a prefix always ends with a slash (data must not match data-x), and a
-        # user's directory rules come before their default rule
-        for r in rules:
-            if "prefix" in r:
-                self.assertRegex(r["prefix"], r"^s3://dataplatform/.+/$")
+        self.assertEqual([p for p in of("zed") if p[0] is None or p[0].endswith("/")],
+                         [("s3://dataplatform/lake/data/archive/2025/", "grp-writers"),
+                          ("s3://dataplatform/lake/data/archive/", "grp-readers"),
+                          ("s3://dataplatform/lake/data-x/", "grp-readers"),
+                          ("s3://dataplatform/lake/shared/", "grp-platform-admins"),
+                          (None, "grp-platform-admins")])
+        # data must not match data-x: Trino's pick for each place
+        self.assertEqual(pick(rules, "bob", "lake/data-x/f"), "grp-readers")
+        self.assertEqual(pick(rules, "bob", "lake/data/f"), "usr-bob")
+        self.assertEqual(pick(rules, "zed", "lake/data/archive/2025"), "grp-writers")
+        self.assertEqual(pick(rules, "zed", "lake/data/archive/2026/f"), "grp-readers")
+        # a user's directory rules come before their default rule
         for user in ("bob", "zed"):
             mine = [r for r in rules if r.get("user") == f"^{user}$"]
             self.assertTrue(all("prefix" in r for r in mine[:-1]) and "prefix" not in mine[-1])
 
-    def test_only_meta_catalogs_provisioner_has_ddl(self):
-        m = load(access=LAKE_ACCESS)
-        rules = m.trino_rules(m.read_access())
-        prov = "^service\\-account\\-metacatalog\\-provisioner$"
-        self.assertEqual(rules["schemas"], [{"user": prov, "owner": True}, {"owner": False}])
-        self.assertEqual(rules["tables"], [
-            {"user": prov, "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP"]},
-            {"privileges": ["SELECT", "INSERT", "DELETE", "UPDATE"]}])
-        self.assertNotIn("group", json.dumps(rules))       # admins included: no DDL by group
-
-    def test_without_a_provisioner_nobody_has_ddl(self):
-        m = load()
-        rules = m.trino_rules(m.read_access())
-        self.assertEqual(rules["schemas"], [{"owner": False}])
-        self.assertEqual(rules["tables"], [{"privileges": ["SELECT", "INSERT", "DELETE", "UPDATE"]}])
+    def test_a_table_directory_itself_gets_the_role_granted_it(self):
+        # Trino lists a parquet or avro table at its location, which has no
+        # trailing slash: a member of two groups must not fall back to the
+        # default role there (smoke check B6). A sibling whose name starts
+        # with the table's keeps what it had.
+        def entry(path, group):
+            return {"path": path, "grants": [{"access": "rw", "users": [], "groups": [group]}]}
+        m = load(access=LAKE_ACCESS, record={
+            "folder.d.s.bronze.t": entry("lake/d/s/bronze/t", "data-engineers"),
+            "folder.d.s.bronze.t_raw": entry("lake/d/s/bronze/t_raw", "data-stewards"),
+            "folder.d.s.bronze.t_raw2": entry("lake/d/s/bronze/t_raw2", "data-engineers"),
+            "folder.d.s.gold.g": entry("lake/d/s/gold/g", "data-analysts"),
+            "folder.d.s.gold.g_old": entry("lake/d/s/gold/g_old", "data-stewards")})
+        groups = {"data-analysts": ["both", "ana"], "data-engineers": ["both"], "data-stewards": ["sam"]}
+        rules = json.loads(m.trino_objects(groups, m.read_access())["data"]["s3-security-mapping.json"])["mappings"]
+        # both: default is the analysts' role (first alphabetically)
+        for place, role in (("lake/d/s/bronze/t", "grp-data-engineers"),           # the listing
+                            ("lake/d/s/bronze/t/part-0.avro", "grp-data-engineers"),
+                            ("lake/d/s/bronze/t_raw", "grp-data-analysts"),        # not theirs: default
+                            ("lake/d/s/bronze/t_raw/part-0.avro", "grp-data-analysts"),
+                            ("lake/d/s/bronze/t_raw2", "grp-data-engineers"),      # theirs again
+                            ("lake/d/s/bronze/t_raw2/f", "grp-data-engineers"),
+                            ("lake/d/s/gold/g", "grp-data-analysts"),
+                            ("lake/d/s/gold/g_old/f", "grp-data-analysts"),
+                            ("lake/d/s/silver/x/f", "grp-data-analysts")):
+            self.assertEqual(pick(rules, "both", place), role, place)
+        # ana: only g, and g_old is not hers
+        self.assertEqual(pick(rules, "ana", "lake/d/s/gold/g"), "grp-data-analysts")
+        self.assertEqual(pick(rules, "ana", "lake/d/s/gold/g_old/f"), "grp-data-analysts")
+        # every rule of a user names one of that user's own roles
+        for r in rules:
+            if "user" in r:
+                self.assertIn(r["iamRole"], r["allowedIamRoles"])
 
 
 LAKE_ACCESS = ACCESS + """  provisioner: service-account-metacatalog-provisioner
 """
 LAKE_RECORD = {
-    "lake.acme_gold": {"path": "lake/acme/gold", "grants": [
+    "folder.acme.sales.gold.daily": {"path": "lake/acme/sales/gold/daily", "grants": [
         {"access": "rw", "users": [], "groups": ["data-engineers"]},
         {"access": "ro", "users": ["bob"], "groups": ["data-analysts"]}]},
-    "lake.acme_silver": {"path": "lake/acme/silver", "grants": [
+    "table.acme_sales_gold.daily": {"catalog": "lakehouse", "schema": "acme_sales_gold", "table": "daily", "grants": [
+        {"access": "rw", "users": [], "groups": ["data-engineers"]},
+        {"access": "ro", "users": ["bob"], "groups": ["data-analysts"]}]},
+    "folder.acme.sales.silver.orders": {"path": "lake/acme/sales/silver/orders", "grants": [
         {"access": "rw", "users": [], "groups": ["data-engineers"]}]},
-    "lake.evil": {"path": "projects/eng/stolen", "grants": [
+    "table.acme_sales_silver.orders": {"catalog": "lakehouse", "schema": "acme_sales_silver", "table": "orders", "grants": [
+        {"access": "rw", "users": [], "groups": ["data-engineers"]}]},
+    "folder.evil": {"path": "projects/eng/stolen", "grants": [
         {"access": "rw", "users": ["mallory"], "groups": []}]},
-    "lake.dots": {"path": "lake/../projects/eng", "grants": [
+    "folder.dots": {"path": "lake/../projects/eng", "grants": [
         {"access": "rw", "users": ["mallory"], "groups": []}]},
-    "lake.odd": {"path": "lake/acme/odd", "grants": [
+    "folder.odd": {"path": "lake/acme/sales/gold/odd", "grants": [
         {"access": "admin", "users": ["mallory"], "groups": []}]},
-    "lake.notjson": "{not json"}
+    "table.other_catalog": {"catalog": "system", "schema": "runtime", "table": "queries", "grants": [
+        {"access": "rw", "users": ["mallory"], "groups": []}]},
+    "table.bad_name": {"catalog": "lakehouse", "schema": "acme_sales_gold", "table": "x\" OR 1=1", "grants": [
+        {"access": "rw", "users": ["mallory"], "groups": []}]},
+    "neither": {"grants": [{"access": "rw", "users": ["mallory"], "groups": []}]},
+    "notjson": "{not json"}
 
 
 class RecordOfGrants(unittest.TestCase):
-    def test_grants_under_the_prefix_count_after_the_provisioners(self):
+    def test_folders_under_the_prefix_count_after_the_provisioners(self):
         a = load(access=LAKE_ACCESS, record=LAKE_RECORD).read_access()
         self.assertEqual(a["grants"], [
             {"path": "lake", "access": "rw", "users": ["service-account-metacatalog-provisioner"], "groups": []},
-            {"path": "lake/acme/gold", "access": "rw", "users": [], "groups": ["data-engineers"]},
-            {"path": "lake/acme/gold", "access": "ro", "users": ["bob"], "groups": ["data-analysts"]},
-            {"path": "lake/acme/silver", "access": "rw", "users": [], "groups": ["data-engineers"]}])
+            {"path": "lake/acme/sales/gold/daily", "access": "rw", "users": [], "groups": ["data-engineers"]},
+            {"path": "lake/acme/sales/gold/daily", "access": "ro", "users": ["bob"], "groups": ["data-analysts"]},
+            {"path": "lake/acme/sales/silver/orders", "access": "rw", "users": [], "groups": ["data-engineers"]}])
+
+    def test_tables_of_the_catalog_count(self):
+        a = load(access=LAKE_ACCESS, record=LAKE_RECORD).read_access()
+        self.assertEqual(a["tables"], [
+            {"schema": "acme_sales_gold", "table": "daily", "access": "rw", "users": [], "groups": ["data-engineers"]},
+            {"schema": "acme_sales_gold", "table": "daily", "access": "ro", "users": ["bob"], "groups": ["data-analysts"]},
+            {"schema": "acme_sales_silver", "table": "orders", "access": "rw", "users": [], "groups": ["data-engineers"]}])
 
     def test_without_a_prefix_there_are_none(self):
-        self.assertEqual(load(access="bucket: dataplatform\n").read_access()["grants"], [])
+        a = load(access="bucket: dataplatform\n", record=LAKE_RECORD).read_access()
+        self.assertEqual((a["grants"], a["tables"]), ([], []))
 
     def test_an_unreadable_record_keeps_the_last_one_and_fails_before_a_first(self):
         m = load(record=RuntimeError("API down"))
@@ -281,15 +340,75 @@ class RecordOfGrants(unittest.TestCase):
         m.answer = RuntimeError("API down")
         self.assertEqual(len(m.read_access()["grants"]), 3)
 
-    def test_trino_reads_a_granted_layer_with_the_granted_role(self):
+    def test_trino_reads_a_granted_folder_with_the_granted_role(self):
         m = load(access=LAKE_ACCESS, record=LAKE_RECORD)
         rules = json.loads(m.trino_objects({"data-analysts": ["ann"], "data-engineers": ["eve"]},
                                            m.read_access())["data"]["s3-security-mapping.json"])["mappings"]
         ann = {r["prefix"]: r["iamRole"].rsplit("/", 1)[1] for r in rules if r.get("user") == "^ann$" and "prefix" in r}
-        self.assertEqual(ann["s3://dataplatform/lake/acme/gold/"], "grp-data-analysts")
-        self.assertNotIn("s3://dataplatform/lake/acme/silver/", ann)
+        self.assertEqual(ann["s3://dataplatform/lake/acme/sales/gold/daily/"], "grp-data-analysts")
+        self.assertNotIn("s3://dataplatform/lake/acme/sales/silver/orders/", ann)
         bot = [r for r in rules if r.get("user") == "^service\\-account\\-metacatalog\\-provisioner$"]
         self.assertEqual(bot[0]["prefix"], "s3://dataplatform/lake/")
+
+    def test_the_mapping_no_longer_carries_trinos_rules(self):
+        m = load(access=LAKE_ACCESS, record=LAKE_RECORD)
+        data = m.trino_objects({"data-engineers": ["eve"]}, m.read_access())["data"]
+        self.assertEqual(sorted(data), ["groups.txt", "s3-security-mapping.json"])
+
+
+def rego_values(text: str) -> dict:
+    """The values of the generated module: `name := <JSON>` statements."""
+    out = {}
+    for block in text.split("\n\n"):
+        lines = [line for line in block.splitlines() if not line.startswith("#")]
+        if lines and " := " in lines[0]:
+            name, _, first = lines[0].partition(" := ")
+            out[name] = json.loads("\n".join([first] + lines[1:]))
+    return out
+
+
+class OpenPolicyAgent(unittest.TestCase):
+    def test_the_module_is_the_package_the_policy_imports(self):
+        m = load(access=LAKE_ACCESS, record=LAKE_RECORD)
+        text = m.opa_grants(m.read_access())
+        self.assertIn("\npackage dataplatform\n", text)
+        self.assertEqual(sorted(rego_values(text)), ["admin_groups", "catalog", "provisioner", "tables"])
+
+    def test_only_meta_catalogs_provisioner_is_named_for_ddl(self):
+        m = load(access=LAKE_ACCESS, record=LAKE_RECORD)
+        v = rego_values(m.opa_grants(m.read_access()))
+        self.assertEqual(v["provisioner"], "service-account-metacatalog-provisioner")
+        self.assertEqual(v["admin_groups"], ["platform-admins"])
+        self.assertEqual(v["catalog"], "lakehouse")
+
+    def test_without_a_provisioner_nobody_is(self):
+        m = load()
+        self.assertEqual(rego_values(m.opa_grants(m.read_access()))["provisioner"], "")
+
+    def test_each_table_names_who_reads_and_who_writes(self):
+        m = load(access=LAKE_ACCESS, record=LAKE_RECORD)
+        tables = rego_values(m.opa_grants(m.read_access()))["tables"]
+        self.assertEqual(tables, {
+            "acme_sales_gold": {"daily": {"rw": {"users": [], "groups": ["data-engineers"]},
+                                          "ro": {"users": ["bob"], "groups": ["data-analysts"]}}},
+            "acme_sales_silver": {"orders": {"rw": {"users": [], "groups": ["data-engineers"]}}}})
+
+    def test_what_is_not_a_table_of_the_catalog_grants_nothing(self):
+        m = load(access=LAKE_ACCESS, record=LAKE_RECORD)
+        text = m.opa_grants(m.read_access())
+        self.assertNotIn("mallory", text)
+        self.assertNotIn("runtime", text)
+
+    def test_an_empty_record_grants_no_table(self):
+        m = load(access=LAKE_ACCESS, record={})
+        self.assertEqual(rego_values(m.opa_grants(m.read_access()))["tables"], {})
+
+    def test_the_configmap_is_a_bundle_of_the_agents_namespace(self):
+        m = load(access=LAKE_ACCESS, record=LAKE_RECORD)
+        cm = m.opa_objects(m.read_access())
+        self.assertEqual((cm["metadata"]["namespace"], cm["metadata"]["name"]), ("governance", "trino-grants"))
+        self.assertEqual(cm["metadata"]["labels"], {"opa.stackable.tech/bundle": "true"})
+        self.assertEqual(list(cm["data"]), ["grants.rego"])
 
 
 class Spark(unittest.TestCase):

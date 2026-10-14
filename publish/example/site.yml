@@ -42,7 +42,7 @@ site_git_host_keys:
 # ---------------------------------------------------------------- identity ----
 site_keycloak_realm: data-platform       # (install-time) Ceph trusts the realm's keys; the roles trust its tokens
 site_admin_group: platform-admins        # every permission on the bucket; the only group that may authorize in Meta Catalog
-site_engineer_group: data-engineers      # the example lakehouses' and the smoke test's teams
+site_engineer_group: data-engineers      # the example tables' and the smoke test's teams
 site_analyst_group: data-analysts
 site_ad_domain: ad.data.example.org      # (install-time) the Active Directory domain of people and groups (Samba): a name of its own, known inside the cluster
 site_ad_netbios_domain: DATAPLATFORM     # (install-time) its short (NetBIOS) name: at most 15 of A-Z, 0-9 and -

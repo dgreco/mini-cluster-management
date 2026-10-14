@@ -1,5 +1,5 @@
 ---
-# Restore the CloudNativePG clusters (keycloak-db, iceberg-catalog,
+# Restore the CloudNativePG clusters (keycloak-db, hive-metastore-db,
 # metacatalog-db) from their Barman Cloud backups,
 # s3://<backup bucket>/cnpg/<cluster>/<cluster>/ (roles/dataplatform_pg_restore).
 #

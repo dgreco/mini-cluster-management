@@ -1,32 +1,39 @@
-# The applied grants -> Ceph RGW's IAM. Sourced by lib-grants.sh (authorize,
-# reject) and reconcile.sh (the hourly CronJob iam-reconcile); needs bash,
-# curl and jq.
+# The applied grants -> Ceph RGW's IAM. Sourced by table.sh (authorize,
+# reject, with lib-grants.sh) and reconcile.sh (the hourly CronJob
+# iam-reconcile); needs bash, curl and jq.
 #
 # The record of what is granted is the ConfigMap $GRANTS_CONFIGMAP of this
 # namespace: one key per resource an administrator authorized in Meta
-# Catalog, its value the resource's directory and grants,
+# Catalog. A table has two, its folder and its entry in the metastore:
 #
-#   lakehouse.acme_retail_gold: {"path": "lakehouse/acme_retail/gold",
+#   folder.sales.orders.gold.daily_revenue: {"path": "lakehouse/sales/orders/gold/daily_revenue",
 #     "grants": [{"access": "rw", "users": [], "groups": ["<%= site_engineer_group %>"]},
 #                {"access": "ro", "users": [], "groups": ["<%= site_analyst_group %>"]}]}
+#   table.sales_orders_gold.daily_revenue: {"catalog": "lakehouse", "schema": "sales_orders_gold",
+#     "table": "daily_revenue", "grants": [... the same shape ...]}
 #
 # Only these scripts write it (authorize puts the resource's key, reject
-# removes it); iam-sync reads it (Trino's S3 mapping). It is what was
+# removes it); iam-sync reads it (Trino's S3 mapping from the folders,
+# Trino's rules in the Open Policy Agent from the tables). It is what was
 # approved, not Meta Catalog's current policy: an edited policy counts only
 # once an administrator authorizes it again.
 #
-# From the whole record, every user and group named in a grant gets an STS
-# role in the platform's account, usr-<user> or grp-<group>, whose policy
-# `access` is the union of its grants (rw: read, write, delete under the
-# directory; ro: read; both list it); a grant a directory above already
-# covers is left out. Its trust: the principal's Keycloak token
-# (AssumeRoleWithWebIdentity) and Trino on behalf of an authenticated user
-# (AssumeRole by the RGW user $IAM_TRINO_USER). A role no grant names any
-# more is deleted. The roles of $IAM_PLATFORM_ROLES (the admin groups', Meta
-# Catalog's provisioner's) are Ansible's (make dataplatform-iam) and never
-# touched: grants naming them are kept in the record for iam-sync only. The
-# RGW user of $IAM_KEY_DIR may manage usr-* and grp-* roles and nothing
-# else, the platform roles excepted (make dataplatform-ceph).
+# Here the folders become roles. From the whole record, every user and group
+# named in a folder's grant gets an STS role in the platform's account,
+# usr-<user> or grp-<group>, whose policy `access` is the union of its grants
+# (rw: read, write, delete under the directory; ro: read; both list it); a
+# grant a directory above already covers is left out. Its trust: the
+# principal's Keycloak token (AssumeRoleWithWebIdentity) and Trino on behalf
+# of an authenticated user (AssumeRole by the RGW user $IAM_TRINO_USER). A
+# role no grant names any more loses its policies and is kept (never deleted:
+# iam_empty_role says why); while the record is empty only by a run right
+# after an entry was taken out on purpose (IAM_ENTRY_REMOVED), never by the
+# hourly reconcile. The roles of $IAM_PLATFORM_ROLES
+# (the admin groups', Meta Catalog's provisioner's) are Ansible's (make
+# dataplatform-iam) and never touched: grants naming them are kept in the
+# record for iam-sync only. The RGW user of $IAM_KEY_DIR may manage usr-* and
+# grp-* roles and nothing else, the platform roles excepted (make
+# dataplatform-ceph).
 #
 # Every run converges all roles, so a run that failed half-way is repaired
 # by the next. Runs in parallel (the resources of one authorize, the hourly
@@ -36,7 +43,7 @@
 IAM_NAME_RE='^[a-z0-9][a-z0-9-]{0,40}[a-z0-9]$'      # Keycloak users and groups, as check_access.py
 IAM_SA=/var/run/secrets/kubernetes.io/serviceaccount
 
-: "${GRANTS_CONFIGMAP:?}" "${MEDALLION_BUCKET:?}" "${MEDALLION_PREFIX:?}" \
+: "${GRANTS_CONFIGMAP:?}" "${LAKEHOUSE_BUCKET:?}" "${LAKEHOUSE_PREFIX:?}" "${LAKEHOUSE_CATALOG:?}" \
   "${IAM_ENDPOINT:?}" "${IAM_REGION:?}" "${IAM_ACCOUNT_ID:?}" "${IAM_OIDC_PROVIDER:?}" \
   "${IAM_TRINO_USER:?}" "${IAM_MAX_SESSION:?}" "${IAM_KEY_DIR:?}" "${IAM_PLATFORM_ROLES?}"
 
@@ -80,15 +87,20 @@ record_put() { # <resource> <entry JSON | null>
 # write only valid ones, so anything else was edited by hand.
 record_check() {
   local problems
-  problems=$(jq -r --arg prefix "$MEDALLION_PREFIX" --arg re "$IAM_NAME_RE" '
+  problems=$(jq -r --arg prefix "$LAKEHOUSE_PREFIX" --arg catalog "$LAKEHOUSE_CATALOG" --arg re "$IAM_NAME_RE" '
     to_entries[] | .key as $k | .value as $e
-    | if ($e | type) != "object" or ($e.path | type) != "string" or ($e.grants | type) != "array" then
-        "\($k): not {path, grants}"
+    | if ($e | type) != "object" or ($e.grants | type) != "array" then
+        "\($k): not {path, grants} nor {catalog, schema, table, grants}"
       else
-        (if ($e.path | test("^[a-z0-9._-]+(/[a-z0-9._-]+)*$") | not)
-            or ($e.path | split("/") | any(. == "." or . == ".."))
-            or ($e.path | startswith($prefix + "/") | not)
-         then "\($k): path \($e.path | tojson) is not a directory under \($prefix)/" else empty end),
+        (if ($e.path | type) == "string" then
+           (if ($e.path | test("^[a-z0-9._-]+(/[a-z0-9._-]+)*$") | not)
+               or ($e.path | split("/") | any(. == "." or . == ".."))
+               or ($e.path | startswith($prefix + "/") | not)
+            then "\($k): path \($e.path | tojson) is not a directory under \($prefix)/" else empty end)
+         elif ($e.schema | type) == "string" and ($e.table | type) == "string" then
+           (if $e.catalog != $catalog then "\($k): catalog \($e.catalog | tojson) is not \($catalog)" else empty end),
+           ([$e.schema, $e.table][] | select(test("^[a-z][a-z0-9_]{0,62}$") | not) | "\($k): \(tojson) is not a schema or table name")
+         else "\($k): neither a folder (path) nor a table (catalog, schema, table)" end),
         ($e.grants[] | if type != "object" then "\($k): a grant is not an object" else
           (if (.access | IN("ro", "rw")) then empty else "\($k): access \(.access | tojson) (ro or rw)" end),
           (((.users // []), (.groups // [])) | if type != "array" then "\($k): users and groups are lists"
@@ -99,9 +111,10 @@ record_check() {
 }
 
 # ---------------------------------------------------------------- the desired roles ----
-# {role: {kind, name, trust, policy}} from the record (jq; RECORD on input).
+# {role: {kind, name, trust, policy}} from the folders of the record (jq;
+# RECORD on input); a table's entry grants no file.
 IAM_DESIRED_JQ='
-def grants: [to_entries | sort_by(.key)[] | .value as $e | $e.grants[]
+def grants: [to_entries | sort_by(.key)[] | .value as $e | select($e.path != null) | $e.grants[]
              | {path: $e.path, access, users: (.users // []), groups: (.groups // [])}];
 # without the grants a directory above already covers (rw covers both)
 def essential: . as $all | [.[] | . as $g
@@ -134,7 +147,7 @@ grants as $g
 | from_entries'
 
 iam_desired() {
-  jq -c --arg bucket "$MEDALLION_BUCKET" --arg account "$IAM_ACCOUNT_ID" --arg idp "$IAM_OIDC_PROVIDER" \
+  jq -c --arg bucket "$LAKEHOUSE_BUCKET" --arg account "$IAM_ACCOUNT_ID" --arg idp "$IAM_OIDC_PROVIDER" \
     --arg trino "$IAM_TRINO_USER" --argjson platform "$(jq -cn --arg p "$IAM_PLATFORM_ROLES" '$p | split(" ") | map(select(. != ""))')" \
     "$IAM_DESIRED_JQ" <<<"$RECORD"
 }
@@ -260,16 +273,23 @@ iam_converge_role() { # <role> <spec JSON>
   done
 }
 
-iam_drop_role() { # <role>
-  local n
-  iam_change "delete role $1 (no grant names it any more)"
+# A role no grant names any more loses its policies and grants nothing from
+# then on, but keeps its name and its ID: it is never deleted. RGW finds the
+# role of a session by its ID, and Trino keeps a session for an hour, so
+# after a delete the sessions Trino holds would be refused even once a new
+# grant made the role again, and its users locked out of Trino until they
+# expire (measured with the smoke test, 2026-10-14). A later grant puts the
+# policy back into the same role.
+iam_empty_role() { # <role>
+  local policies n
+  policies=$(iam_role_policies "$1")
+  [ -n "$policies" ] || return 0                    # empty already: nothing to do
+  iam_change "empty role $1 (no grant names it any more: its policies go, the role stays)"
   [ "$IAM_MODE" = apply ] || return 0
-  for n in $(iam_role_policies "$1"); do
+  for n in $policies; do
     iam_call DeleteRolePolicy "RoleName=$1" "PolicyName=$n"
     iam_ok "deleting the policy $n of $1" 200
   done
-  iam_call DeleteRole "RoleName=$1"
-  iam_ok "deleting role $1" 200
 }
 
 # Brings the roles to the record. plan: prints what apply would change.
@@ -289,12 +309,16 @@ iam_converge() { # plan|apply
   done
   for role in $existing; do
     grep -qx "$role" <<<"$roles" && continue
-    if [ "$(jq length <<<"$RECORD")" = 0 ]; then
-      # an empty record is far likelier a lost one than every grant rejected
-      echo "kept role $role: the record of grants is empty (if nothing is granted anywhere on purpose, delete it by hand)"
+    # An empty record is far likelier a lost one than every grant rejected,
+    # unless an entry was just taken out on purpose (IAM_ENTRY_REMOVED=true:
+    # a reject, lib-grants.sh; make dataplatform-grants ARGS="remove ..."):
+    # then it is the last grant going. The hourly reconcile never sets it.
+    if [ "$(jq length <<<"$RECORD")" = 0 ] && [ "${IAM_ENTRY_REMOVED:-false}" != true ]; then
+      [ -z "$(iam_role_policies "$role")" ] ||
+        echo "kept role $role as it is: the record of grants is empty (if nothing is granted anywhere on purpose, remove its policies by hand)"
       continue
     fi
-    iam_drop_role "$role"
+    iam_empty_role "$role"
   done
 }
 

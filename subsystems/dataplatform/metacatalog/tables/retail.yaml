@@ -1,0 +1,233 @@
+# The tables of the example domain retail (domains/retail.yaml): eight tables
+# across the medallion and the three formats. Each document is one table: its
+# place (domain, subdomain, layer), its format, its access policy, its
+# schema (the part with the columns) and what it is built from (dependsOn:
+# the `ref` of other tables of this file). Load, build and grant:
+#
+#   make dataplatform-tables ARGS="load subsystems/dataplatform/metacatalog/domains/retail.yaml subsystems/dataplatform/metacatalog/tables/retail.yaml"
+#   make dataplatform-tables ARGS="provision retail"     # each table's folder, then the table in the metastore
+#   make dataplatform-tables ARGS="authorize retail"     # each table's grants -> Ceph and Trino (platform-admins only)
+#
+# A table is granted on its own. Principals are Keycloak groups (GROUP) and
+# users (USER); a SERVICE is a Keycloak client's service account
+# (service-account-<id>). Permissions: READ (query the table, read its
+# files) and WRITE (also change its rows and its files). A grant reaches the
+# table's folder (Ceph) and its entry in the metastore (Trino) alike, unless
+# it selects one: `resources: { entityTypes: ["S3FolderType"] }` grants the
+# files without the table. Creating, altering and dropping tables is Meta
+# Catalog's alone; platform-admins reads and writes every table without a grant.
+#
+#   layer    table                     format    data-engineers   data-analysts
+#   bronze   orders_raw                avro      read, write      -
+#   bronze   customers_raw             parquet   read, write      -
+#   bronze   payments_raw              avro      read, write      -
+#   silver   orders, customers, payments  iceberg  read, write    -
+#   gold     daily_revenue             iceberg   read, write      read
+#   gold     customer_lifetime_value   parquet   read, write      read
+ref: "orders_raw"
+entityType: "TableType"
+values:
+  name: "orders_raw"
+  description: "Order events exactly as the web shop emits them"
+  domain: "retail"
+  subdomain: "orders"
+  layer: "bronze"
+  format: "avro"
+  retentionDays: 30
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      columns:
+        - { name: "payload", type: "string" }
+        - { name: "received_at", type: "timestamp" }
+---
+ref: "customers_raw"
+entityType: "TableType"
+values:
+  name: "customers_raw"
+  description: "The nightly CRM export, as it came"
+  domain: "retail"
+  subdomain: "customers"
+  layer: "bronze"
+  format: "parquet"
+  retentionDays: 30
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      columns:
+        - { name: "line", type: "string", pii: true }
+        - { name: "file_name", type: "string" }
+---
+ref: "payments_raw"
+entityType: "TableType"
+values:
+  name: "payments_raw"
+  description: "Change data capture from the payments database"
+  domain: "retail"
+  subdomain: "payments"
+  layer: "bronze"
+  format: "avro"
+  retentionDays: 30
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      columns:
+        - { name: "op", type: "string" }
+        - { name: "after", type: "string" }
+        - { name: "ts_ms", type: "long" }
+---
+ref: "orders"
+entityType: "TableType"
+dependsOn: ["orders_raw"]
+values:
+  name: "orders"
+  description: "One row per order, cleaned"
+  domain: "retail"
+  subdomain: "orders"
+  layer: "silver"
+  format: "iceberg"
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      primaryKey: ["order_id"]
+      columns:
+        - { name: "order_id", type: "long" }
+        - { name: "customer_id", type: "long" }
+        - { name: "total", type: "decimal(10,2)" }
+        - { name: "ordered_at", type: "timestamptz" }
+---
+ref: "customers"
+entityType: "TableType"
+dependsOn: ["customers_raw"]
+values:
+  name: "customers"
+  description: "One row per customer, cleaned"
+  domain: "retail"
+  subdomain: "customers"
+  layer: "silver"
+  format: "iceberg"
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      primaryKey: ["customer_id"]
+      columns:
+        - { name: "customer_id", type: "long" }
+        - { name: "full_name", type: "string", pii: true }
+        - { name: "email", type: "string", pii: true }
+        - { name: "country", type: "string" }
+---
+ref: "payments"
+entityType: "TableType"
+dependsOn: ["payments_raw"]
+values:
+  name: "payments"
+  description: "One row per payment, cleaned"
+  domain: "retail"
+  subdomain: "payments"
+  layer: "silver"
+  format: "iceberg"
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      primaryKey: ["payment_id"]
+      columns:
+        - { name: "payment_id", type: "long" }
+        - { name: "order_id", type: "long" }
+        - { name: "amount", type: "decimal(10,2)" }
+        - { name: "paid_at", type: "timestamptz" }
+---
+ref: "daily_revenue"
+entityType: "TableType"
+dependsOn: ["orders", "payments"]
+values:
+  name: "daily_revenue"
+  description: "Revenue and orders per day, for finance"
+  domain: "retail"
+  subdomain: "analytics"
+  layer: "gold"
+  format: "iceberg"
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+    - { id: "data-analysts", type: "GROUP" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
+    - { principals: ["data-analysts"], permissions: ["READ"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      columns:
+        - { name: "day", type: "date" }
+        - { name: "revenue", type: "decimal(12,2)" }
+        - { name: "orders", type: "long" }
+---
+ref: "customer_lifetime_value"
+entityType: "TableType"
+dependsOn: ["orders", "customers"]
+values:
+  name: "customer_lifetime_value"
+  description: "What each customer has spent, for marketing; rewritten every week"
+  domain: "retail"
+  subdomain: "analytics"
+  layer: "gold"
+  format: "parquet"
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+    - { id: "data-analysts", type: "GROUP" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
+    - { principals: ["data-analysts"], permissions: ["READ"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      columns:
+        - { name: "customer_id", type: "long" }
+        - { name: "country", type: "string" }
+        - { name: "lifetime_value", type: "decimal(12,2)" }

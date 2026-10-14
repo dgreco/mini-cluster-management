@@ -1,19 +1,24 @@
 # The record of grants itself (ConfigMap metacatalog-grants) is
 # gitops/iam/metacatalog-grants.yaml (governance-iam-access, wave 1).
-# What the scripts need to reach Ceph's IAM: the platform's values (as
-# inventory/group_vars/dataplatform.yml; make dataplatform-render checks the
-# endpoint, region and account). IAM_PLATFORM_ROLES are the roles Ansible
-# keeps (make dataplatform-iam: access.yaml's admin groups and Meta Catalog's
-# provisioner); the scripts never touch them, and their RGW user may not.
+# What the scripts need to reach Ceph (its IAM for the roles, its STS and S3
+# for the tables' folders) and to name the platform's tables: the platform's
+# values (as inventory/group_vars/dataplatform.yml; make dataplatform-render
+# checks the endpoint, region and account). IAM_PLATFORM_ROLES are the roles
+# Ansible keeps (make dataplatform-iam: access.yaml's admin groups and Meta
+# Catalog's provisioner); the scripts never touch them, and their RGW user
+# may not.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: metacatalog-iam
 data:
   GRANTS_CONFIGMAP: metacatalog-grants
-  MEDALLION_BUCKET: <%= dataplatform_bucket %>
-  MEDALLION_PREFIX: lakehouse                      # access.yaml metacatalog.prefix
+  LAKEHOUSE_BUCKET: <%= dataplatform_bucket %>
+  LAKEHOUSE_PREFIX: lakehouse                      # access.yaml metacatalog.prefix
+  LAKEHOUSE_CATALOG: lakehouse                     # Trino's catalog (trino-catalog-lakehouse.yaml)
   IAM_ENDPOINT: https://<%= site_s3_host %>
+  STS_ENDPOINT: https://<%= site_s3_host %>
+  S3_ENDPOINT: https://<%= site_s3_host %>
   IAM_REGION: <%= dataplatform_s3_region %>
   IAM_ACCOUNT_ID: <%= dataplatform_rgw_account_id %>
   IAM_OIDC_PROVIDER: keycloak.<%= dataplatform_domain %>/realms/<%= dataplatform_keycloak_realm %>

@@ -1,0 +1,39 @@
+# The Open Policy Agent (Stackable): it decides every statement Trino runs
+# (trino.rego, package trino; spec.clusterConfig.authorization.opa in
+# manifests/compute/trino/trino.yaml) and, by the same rules, what a Spark
+# job may ask of the catalog (the catalog gate asks for the job's user:
+# manifests/governance/catalog-gate). One pod per node, and a Service that
+# answers from the pod on the caller's own node: Trino asks it several times
+# per query.
+#
+# - It lives in governance, not next to Trino in compute: it loads the rules
+#   of every ConfigMap of its own namespace that carries the label
+#   opa.stackable.tech/bundle, and in compute a Spark job's service account
+#   writes ConfigMaps. Here only Argo CD (trino-policy) and iam-sync
+#   (trino-grants, by name) do. Trino finds it through the ConfigMap
+#   compute/opa (manifests/compute/trino/trino-opa.yaml).
+# - Its REST API has no login. Once its bundle is loaded it refuses every
+#   policy or data written through the API ("all paths owned by bundle",
+#   measured); in the seconds before the first bundle of a new pod it does
+#   not. From compute only Trino's pods reach the port
+#   (manifests/namespaces/network-policies.yaml); a Spark job's do not.
+apiVersion: opa.stackable.tech/v1alpha2
+kind: OpaCluster
+metadata:
+  name: opa
+spec:
+  image:
+    productVersion: 1.16.2
+  clusterConfig:
+    # product logs: a Vector agent in the pod -> the aggregator -> VictoriaLogs
+    # (tenant Stackable); see helm-values/vector-aggregator-values.yaml
+    vectorAggregatorConfigMapName: vector-aggregator-discovery
+  servers:
+    config:
+      resources:
+        cpu: {min: 50m, max: 500m}
+        memory: {limit: 256Mi}
+      logging:
+        enableVectorAgent: true
+    roleGroups:
+      default: {}

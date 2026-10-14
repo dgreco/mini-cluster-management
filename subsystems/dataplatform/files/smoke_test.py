@@ -6,36 +6,48 @@ temporary users of SMOKE_USERS in the directory (Samba AD; JSON {name: {group,
 groups}}, password SMOKE_PASSWORD): smoke-eng (the engineer group), smoke-ana (the analyst
 group), smoke-both (both), smoke-nogroup (none), smoke-adm (analyst,
 engineer and the admin group, last: the gate must find it among
-several groups; it authorizes the lakehouse).
+several groups; it authorizes the tables).
 
-Everything happens in the smoke test's own lakehouse, smoke_test
-(metacatalog/lakehouses/smoke_test.yaml), whose schemas and tables only
-Meta Catalog creates and whose policy grants the engineer group the bronze
-layer and the analyst group the gold layer (the site's groups: ADMIN_GROUP,
-ENGINEER_GROUP, ANALYST_GROUP). 0 loads the medallion model
-(metacatalog/medallion-model.yaml, as make dataplatform-medallion does) when
-Meta Catalog has none of it, and loads, provisions and authorizes the
-lakehouse when it is missing: a platform built from scratch needs no step
-before this test.
+Everything happens in the smoke test's own tables, the domain smoke
+(metacatalog/domains/smoke.yaml, metacatalog/tables/smoke.yaml), which only
+Meta Catalog creates and whose policies grant the engineer group the bronze
+tables (the analyst group may read one of them) and the analyst group the
+gold one (the site's groups: ADMIN_GROUP, ENGINEER_GROUP, ANALYST_GROUP). 0
+loads the model (metacatalog/table-model.yaml) when Meta Catalog lacks it,
+the domain and the tables as make dataplatform-tables does (with its script,
+DP_TABLES), and provisions them: a platform built from scratch needs no step
+before this test. Z takes them out again at the end of every run, passed or
+failed, so no grant of the test stays in the record.
 
 0  Meta Catalog lets the engineer in and refuses the analyst (only
-   the admin and engineer groups); the lakehouse: in Meta Catalog,
-   provisioned; the engineer may not authorize it (only the admin group: the
-   gate, also against tricks with the path and a forged groups header), the
-   administrator may, and its grants are in force within minutes.
-A  direct STS: each user gets their group's role only; the role reaches its
-   layer's directory, not the other group's, nor the bucket's root; make
-   dataplatform-s3-login writes working keys for the user's own group only.
-B  Trino (bearer tokens): the engineer writes and reads the bronze table; the
-   analyst is refused by Ceph; a user in no group is refused by Trino (no S3
-   security mapping); nobody may create, alter, comment or drop a schema or
-   a table (only Meta Catalog's provisioner); a member of both groups reads
-   and writes both layers in one query, each with the role granted it, and
-   is refused when s3_role pins the other role.
-C  Spark (web identity): the engineer's job reads Trino's table and writes
-   another that Trino reads back, but may not create a table (its catalog
-   login has no DDL); the analyst's job is refused by Ceph; the job's service
-   account reads no Secret and starts no pod mounting another one.
+   the admin and engineer groups); the tables: in Meta Catalog, each under
+   its subdomain, provisioned in their three formats; the engineer may not
+   authorize one (only the admin group: the gate, also against tricks with
+   the path and a forged groups header), the administrator may, and their
+   grants are in force within minutes.
+A  direct STS: each user gets their group's role only; the role reaches the
+   folders of the tables granted to it, not the other group's, nor the
+   bucket's root; a role granted READ on a table reads its files and writes
+   none; make dataplatform-s3-login writes working keys for the user's own
+   group only.
+B  Trino (bearer tokens; the Open Policy Agent decides the statements, Ceph
+   the files): the engineer writes and reads the bronze tables, iceberg and
+   avro; the analyst reads the table granted READ and may not write it, and
+   is refused the others, as is a user in no group, by Trino itself; a user
+   sees only the tables granted to them; nobody may create, alter, comment
+   or drop a schema or a table (only Meta Catalog's provisioner), an
+   administrator included; a member of both groups reads and writes both
+   layers in one query, each with the role granted it, and is refused by
+   Ceph when s3_role pins the other role.
+C  Spark (web identity; the catalog gate knows the job's user and asks the
+   Open Policy Agent, as Trino does): the engineer's job reads Trino's table
+   and writes another that Trino reads back, and may not create, alter or
+   drop a table (only Meta Catalog); the analyst's job reads the table
+   granted READ, is refused the others, and may not move a table back to an
+   older snapshot; the job's service account reads no Secret, starts no pod
+   mounting another one, changes neither Trino's group file, its pods, its
+   labels nor its Services, and reaches neither the Hive Metastore nor the
+   Open Policy Agent.
 D  Kubernetes (Keycloak login): the engineer may run jobs in compute, not
    read the platform's secrets, nor write objects the Spark fence refuses.
 F  the directory is the only source of people, and only its administrators
@@ -53,6 +65,10 @@ F  the directory is the only source of people, and only its administrators
    interface (DIRECTORY_UI_URL, LDAP Account Manager) is reached through a
    Keycloak login by the administrator alone, who then logs in to it with
    the same directory account.
+Z  the domain smoke goes out of Meta Catalog: the administrator rejects its
+   tables (their keys leave the record of grants), the engineer unprovisions
+   them (the metastore's tables and the files go) and deletes them, then its
+   subdomain and the domain.
 Reads use sum(), not count(*) (answered from Iceberg statistics, no data read).
 Prints one line per check and exits 1 when any check fails.
 """
@@ -87,13 +103,19 @@ REGION = os.environ["S3_REGION"]
 ADMIN, ENGINEER, ANALYST = os.environ["ADMIN_GROUP"], os.environ["ENGINEER_GROUP"], os.environ["ANALYST_GROUP"]
 LABEL_DOMAIN = os.environ["LABEL_DOMAIN"]               # the platform's label keys: <it>/user
 METACATALOG = os.environ["METACATALOG_URL"].rstrip("/") + "/metacatalog/v1"
-LAKEHOUSE = os.environ.get("SMOKE_LAKEHOUSE", "smoke_test")
-LAKEHOUSE_FILE = os.environ["SMOKE_LAKEHOUSE_FILE"]
-MODEL_FILE = os.environ["SMOKE_MODEL_FILE"]            # metacatalog/medallion-model.yaml
-ROOT = f"lakehouse/{LAKEHOUSE}"                      # its storageRoot, under the bucket
-BRONZE, GOLD = f"{ROOT}/bronze", f"{ROOT}/gold"     # the engineers', the analysts'
-ENG_T, SPARK_T = f"lakehouse.{LAKEHOUSE}_bronze.eng_t", f"lakehouse.{LAKEHOUSE}_bronze.spark_t"
-ANA_T = f"lakehouse.{LAKEHOUSE}_gold.ana_t"
+TABLES = os.environ["DP_TABLES"]                       # files/dp-tables.sh
+DOMAIN, SUBDOMAIN = "smoke", "test"                    # metacatalog/domains/smoke.yaml
+DOMAIN_FILE = os.environ["SMOKE_DOMAIN_FILE"]
+TABLES_FILE = os.environ["SMOKE_TABLES_FILE"]          # metacatalog/tables/smoke.yaml
+MODEL_FILE = os.environ["SMOKE_MODEL_FILE"]            # metacatalog/table-model.yaml
+ROOT = f"lakehouse/{DOMAIN}/{SUBDOMAIN}"               # where its tables' folders are, under the bucket
+BRONZE, GOLD = f"{ROOT}/bronze", f"{ROOT}/gold"
+# the tables (metacatalog/tables/smoke.yaml): the engineers' in bronze (the
+# analysts may read eng_t), the analysts' in gold
+SCHEMA_B, SCHEMA_G = f"lakehouse.{DOMAIN}_{SUBDOMAIN}_bronze", f"lakehouse.{DOMAIN}_{SUBDOMAIN}_gold"
+ENG_T, SPARK_T, AVRO_T, ANA_T = f"{SCHEMA_B}.eng_t", f"{SCHEMA_B}.spark_t", f"{SCHEMA_B}.avro_t", f"{SCHEMA_G}.ana_t"
+EXPECTED = ["eng_t", "spark_t", "avro_t", "drop_zone", "ana_t"]
+ENG_DIR, ANA_DIR = f"{BRONZE}/drop_zone", f"{GOLD}/ana_t"     # a folder of each group, for the S3 checks
 USERS = json.loads(os.environ["SMOKE_USERS"])          # {user: {"group": first group, "groups": [...]}}
 PASSWORD = os.environ["SMOKE_PASSWORD"]
 results = []
@@ -280,21 +302,30 @@ def metacatalog(user: str, method: str, path: str, body: bytes = None, ctype: st
         return e.code, e.read().decode(errors="replace")[:500]
 
 
-def resources(user: str) -> list:
-    """the lakehouse's schemas and tables (values) as Meta Catalog has them"""
-    out = []
-    for t in ("MedallionSchemaType", "MedallionTableType"):
-        q = urllib.parse.urlencode({"entityTypeName": t, "queryPath": f'$ ? (@.lakehouse == "{LAKEHOUSE}")'})
-        code, rows = metacatalog(user, "GET", f"/entity?{q}")
-        for r in rows if code == 200 else []:
-            v = r["values"]
-            out.append(json.loads(v) if isinstance(v, str) else v)
-    return out
+def entities(user: str, entity_type: str, where: str) -> tuple:
+    """(HTTP status, [{id, values}]) of the entities of a type that match"""
+    q = urllib.parse.urlencode({"entityTypeName": entity_type, "queryPath": f"$ ? ({where})"})
+    code, rows = metacatalog(user, "GET", f"/entity?{q}")
+    if code != 200:
+        return code, rows
+    return code, [{"id": r["id"], "values": json.loads(r["values"]) if isinstance(r["values"], str) else r["values"]}
+                  for r in rows]
+
+
+def tables_tool(user: str, *args) -> tuple:
+    """(ok, output) of dp-tables.sh run as the user (make dataplatform-tables)"""
+    with tempfile.TemporaryDirectory() as d:
+        tok = os.path.join(d, "token")
+        with open(tok, "w") as f:
+            f.write(token(user))
+        p = subprocess.run([TABLES, "-y", *args], capture_output=True, text=True, timeout=1800,
+                           env=dict(os.environ, TABLES_TOKEN_FILE=tok, PYTHON=sys.executable))
+    return p.returncode == 0, (p.stdout + p.stderr).strip()
 
 
 def model_types() -> list:
     """the entity types the model file defines (its EntityTypes section, read
-    like dp-medallion.sh reads it)"""
+    like dp-tables.sh reads it)"""
     names, section = [], False
     for line in open(MODEL_FILE):
         if line.startswith("EntityTypes:"):
@@ -306,86 +337,91 @@ def model_types() -> list:
     return names
 
 
-def model(eng: str) -> bool:
-    """The medallion model is in Meta Catalog: loaded by the engineer when none
-    of its entity types is there (a fresh platform); a partial model is left
-    to a person, as dp-medallion.sh leaves it."""
-    names = model_types()
-    found = {n: metacatalog(eng, "GET", f"/entity-type/{n}")[0] for n in names}
-    other = {n: c for n, c in found.items() if c not in (200, 404)}
-    present = [n for n, c in found.items() if c == 200]
-    if other or not names:
-        check(f"0 Meta Catalog answers {eng} about the model's entity types", False,
-              f"{other or 'no entity type in ' + MODEL_FILE}")
-        return False
-    if len(present) == len(names):
-        check(f"0 the medallion model is in Meta Catalog ({len(names)} entity types)", True)
-        return True
-    if present:
-        check("0 the medallion model is in Meta Catalog", False,
-              f"{len(present)} of {len(names)} entity types only: finish or undo that by hand (Meta Catalog UI)")
-        return False
-    code, out = metacatalog(eng, "POST", "/bulk-creation", open(MODEL_FILE, "rb").read(), "application/octet-stream")
-    check(f"0 Meta Catalog loads the medallion model ({len(names)} entity types)", code == 204, f"HTTP {code} {out}")
-    return code == 204
-
-
 def fixture(eng: str) -> bool:
-    """The smoke lakehouse exists, is provisioned and its grants are in force.
-    Missing pieces are made through Meta Catalog: the engineer loads the model
-    and the lakehouse and provisions, the administrator authorizes (every run:
-    unchanged grants change nothing)."""
-    if not model(eng):
-        return False
-    q = urllib.parse.urlencode({"entityTypeName": "LakehouseType", "queryPath": f'$ ? (@.name == "{LAKEHOUSE}")'})
-    code, rows = metacatalog(eng, "GET", f"/entity?{q}")
-    check(f"0a Meta Catalog answers {eng} ({METACATALOG})", code == 200, str(rows)[:200])
-    if code != 200:
+    """The smoke test's tables exist, are provisioned and their grants are in
+    force. Missing pieces are made through Meta Catalog: the engineer loads
+    the model, the domain and the tables and provisions, the administrator
+    authorizes (every run: unchanged grants change nothing)."""
+    names = model_types()
+    code, rows = entities(eng, "TableType", f'@.domain == "{DOMAIN}"')
+    check(f"0a Meta Catalog answers {eng} ({METACATALOG})", code in (200, 400, 404), str(rows)[:200])
+    if code not in (200, 400, 404):     # 400/404: the model is not there yet
         return False
     # only the admin and engineer groups get past the proxy in front of it
     ana = "smoke-ana"
     code_ana, out_ana = metacatalog(ana, "GET", "/entity-type")
     check(f"0b Meta Catalog refuses {ana} ({ANALYST}: not {ADMIN} nor {ENGINEER})",
           code_ana in (401, 403), f"HTTP {code_ana} {str(out_ana)[:200]}")
-    if not rows:
-        code, out = metacatalog(eng, "POST", "/aggregate/yaml", open(LAKEHOUSE_FILE, "rb").read(), "application/octet-stream")
-        if code != 204:
-            check(f"0c the lakehouse {LAKEHOUSE} loads into Meta Catalog", False, str(out))
+    have = sorted(r["values"]["name"] for r in rows) if code == 200 else []
+    if have != sorted(EXPECTED):
+        if have:
+            check(f"0c the tables of the domain {DOMAIN} are in Meta Catalog", False,
+                  f"{have} of {EXPECTED} only: finish or undo that by hand (make dataplatform-tables)")
             return False
-        code, rows = metacatalog(eng, "GET", f"/entity?{q}")
-    lid = rows[0]["id"]
-    end = time.time() + 120                   # the mappings derive the schemas and tables
-    while len(resources(eng)) < 6 and time.time() < end:
-        time.sleep(5)
-    code, out = metacatalog(eng, "POST", f"/aggregate/{lid}/provision")
-    check(f"0c Meta Catalog provisions {LAKEHOUSE} (3 schemas, 3 tables)", code == 204, str(out)[:300])
-    if code != 204:
+        ok, out = tables_tool(eng, "load", DOMAIN_FILE, TABLES_FILE)
+        check(f"0c Meta Catalog loads the model ({len(names)} entity types), the domain {DOMAIN} and its "
+              f"{len(EXPECTED)} tables", ok, out[-400:])
+        if not ok:
+            return False
+        code, rows = entities(eng, "TableType", f'@.domain == "{DOMAIN}"')
+    by_name = {r["values"]["name"]: r["id"] for r in rows}
+    # every table is under its subdomain
+    code, held = metacatalog(eng, "GET", f"/entity/link/{by_name['eng_t']}/IS_PART_OF")
+    under = [(h.get("values") if isinstance(h.get("values"), dict) else json.loads(h.get("values") or "{}")).get("name")
+             for h in held if h.get("entityType") == "SubdomainType"] if code == 200 else []
+    check(f"0c the table eng_t belongs to the subdomain {DOMAIN}/{SUBDOMAIN}", under == [SUBDOMAIN], f"HTTP {code} {under}")
+    ok, out = tables_tool(eng, "provision", DOMAIN)
+    check(f"0c Meta Catalog provisions them ({len(EXPECTED)} folders, {len(EXPECTED) - 1} tables in the metastore: "
+          "iceberg, avro, parquet)", ok, out[-600:])
+    if not ok:
         return False
-    gate(eng, lid)
+    tid = by_name["eng_t"]
+    gate(eng, tid)
     adm = "smoke-adm"
 
     def in_force():
         s3e = sts(eng, USERS[eng]["group"])
-        return (False, s3e) if isinstance(s3e, str) else s3_ok(lambda: s3e.list_objects_v2(Bucket=BUCKET, Prefix=f"{BRONZE}/"))
+        return (False, s3e) if isinstance(s3e, str) else s3_ok(lambda: s3e.list_objects_v2(Bucket=BUCKET, Prefix=f"{ENG_DIR}/"))
     before, _ = in_force()
-    code, out = metacatalog(eng, "POST", f"/aggregate/{lid}/authorize")
-    check(f"0d {eng} may not authorize {LAKEHOUSE} (only {ADMIN})", code == 403, f"HTTP {code} {str(out)[:200]}")
-    code, out = metacatalog(adm, "POST", f"/aggregate/{lid}/authorize")
-    check(f"0d {adm} ({ADMIN}) authorizes {LAKEHOUSE}", code == 204, f"HTTP {code} {str(out)[:300]}")
+    code, out = metacatalog(eng, "POST", f"/aggregate/{tid}/authorize")
+    check(f"0d {eng} may not authorize a table (only {ADMIN})", code == 403, f"HTTP {code} {str(out)[:200]}")
+    ok, out = tables_tool(adm, "authorize", DOMAIN)
+    check(f"0d {adm} ({ADMIN}) authorizes them", ok, out[-600:])
     # Ceph's roles change during the call; iam-sync's next round (30 s) gives
-    # Trino the mapping
+    # Trino the mapping and the Open Policy Agent the tables' grants
     end, ok, err = time.time() + 180, False, ""
     while time.time() < end:
         ok, err = in_force()
         if ok:
             break
         time.sleep(10)
-    check(f"0e the grants of {LAKEHOUSE} are in force", ok, f"s3: {err}")
-    if ok and not before:
-        # new grants: Trino's mapping follows (iam-sync's round, then the
-        # kubelet's refresh of the mounted ConfigMap)
-        time.sleep(120)
-    return ok
+    check(f"0e the grants on the files are in force (Ceph)", ok, f"s3: {err}")
+    if not ok:
+        return False
+    # ... and in Trino: the Agent has the grants (it loads them within half
+    # a minute of iam-sync's round), and every Trino pod the mapping. The
+    # authorize writes the record entry by entry, iam-sync may publish it in
+    # two rounds, and each pod reads the mounted ConfigMap at its own
+    # kubelet's refresh: so each user's own rules are waited for (the
+    # engineer's default role passes on a first half of the record), on the
+    # coordinator, and then the workers get the time a refresh takes (a
+    # minute at most, and Trino's 30 s).
+    probes = ((eng, ENG_T), ("smoke-ana", ENG_T), ("smoke-both", AVRO_T), ("smoke-both", ANA_T))
+    end, missing = time.time() + (420 if not before else 180), []
+    while time.time() < end:
+        missing = []
+        for user, table in probes:
+            ok, out = trino(user, f"SELECT count(*) FROM {table}")
+            if not ok:
+                missing.append(f"{user} {table}: {str(out)[:150]}")
+        if not missing:
+            break
+        time.sleep(10)
+    check(f"0e the grants on the tables are in force (Trino), for each user", not missing, "; ".join(missing)[:400])
+    if missing:
+        return False
+    time.sleep(90)
+    return True
 
 
 def gate(eng: str, lid: str) -> None:
@@ -408,27 +444,85 @@ def gate(eng: str, lid: str) -> None:
           "; ".join(let_through))
 
 
+def empty_folder(user: str, group: str, folder: str) -> None:
+    """Deletes the files of a folder with the group's role, not the folder
+    itself (the object <folder>/ the table was made on)."""
+    s3 = sts(user, group)
+    if isinstance(s3, str):
+        return
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=f"{folder}/"):
+        for o in page.get("Contents", []):
+            if o["Key"] != f"{folder}/":
+                s3.delete_object(Bucket=BUCKET, Key=o["Key"])
+
+
 def empty_tables(eng: str, both: str) -> None:
-    """The fixture's tables hold only what this run writes."""
+    """The fixture's tables hold only what this run writes. An Iceberg table
+    is emptied with DELETE; a table of plain files (avro, parquet) takes no
+    DELETE in Trino: its files are deleted."""
     for t in (ENG_T, SPARK_T):
         trino(eng, f"DELETE FROM {t}")
-    trino(both, f"DELETE FROM {ANA_T}")
+    try:
+        empty_folder(eng, USERS[eng]["group"], f"{BRONZE}/avro_t")
+        empty_folder(eng, USERS[eng]["group"], ENG_DIR)
+        empty_folder("smoke-ana", USERS["smoke-ana"]["group"], ANA_DIR)
+    except Exception as e:  # noqa: BLE001 - best effort, the checks report what is left
+        print(f"emptying the smoke test's folders: {e}")
+
+
+def remove_domain(eng: str, adm: str) -> None:
+    """The domain smoke goes out of Meta Catalog and the record of grants:
+    its tables are rejected (the administrator), unprovisioned (their entries
+    in the metastore and their files go) and deleted, then its subdomain and
+    the domain itself. The first step that fails stops it, and the check says
+    what is left. Nothing to do when Meta Catalog lacks the model."""
+    code, rows = entities(eng, "TableType", f'@.domain == "{DOMAIN}"')
+    if code in (400, 404):
+        return
+    steps = []
+    if code != 200:
+        check(f"Z1 the domain {DOMAIN} goes out of Meta Catalog", False, f"listing its tables: HTTP {code} {str(rows)[:200]}")
+        return
+    if rows:
+        for who, step in ((adm, "reject"), (eng, "unprovision"), (eng, "delete")):
+            ok, out = tables_tool(who, step, DOMAIN)
+            if not ok:
+                check(f"Z1 the domain {DOMAIN} goes out of Meta Catalog", False,
+                      f"{step} failed, done: {', '.join(steps) or 'nothing'}: {out[-400:]}")
+                return
+            steps.append(step)
+    code, found = entities(eng, "DomainType", f'@.name == "{DOMAIN}"')
+    for d in found if code == 200 else []:
+        code, parts = metacatalog(eng, "GET", f"/entity/link/{d['id']}/HAS_PART")
+        for s in parts if code == 200 else []:
+            if s.get("entityType") == "SubdomainType":
+                c1, o1 = metacatalog(eng, "DELETE", f"/entity/link/{d['id']}/HAS_PART/{s['id']}")
+                c2, o2 = metacatalog(eng, "DELETE", f"/entity/{s['id']}")
+                if c1 not in (200, 204) or c2 not in (200, 204):
+                    check(f"Z1 the domain {DOMAIN} goes out of Meta Catalog", False,
+                          f"subdomain {s['id']}: HTTP {c1} {o1} / {c2} {o2}")
+                    return
+        c, o = metacatalog(eng, "DELETE", f"/entity/{d['id']}")
+        if c not in (200, 204):
+            check(f"Z1 the domain {DOMAIN} goes out of Meta Catalog", False, f"domain {d['id']}: HTTP {c} {o}")
+            return
+    left = []
+    for entity_type, where in (("TableType", f'@.domain == "{DOMAIN}"'), ("DomainType", f'@.name == "{DOMAIN}"')):
+        code, rows = entities(eng, entity_type, where)
+        if code != 200 or rows:
+            left.append(f"{entity_type} (HTTP {code}, {len(rows) if code == 200 else '?'})")
+    check(f"Z1 the domain {DOMAIN} goes out of Meta Catalog: its tables rejected, unprovisioned and deleted, "
+          "then its subdomain and itself", not left, f"still there: {', '.join(left)}")
 
 
 def cleanup(eng: str, both: str) -> None:
-    """Whatever the run left behind: the rows, the smoke/ objects."""
+    """Whatever the run left behind: the rows, the S3 checks' objects, then
+    the domain smoke itself (the next run loads it again)."""
     empty_tables(eng, both)
     try:
-        s3e = sts(eng, USERS[eng]["group"])
-        if not isinstance(s3e, str):
-            # smoke/: the S3 checks' objects; by_spark/: the metadata file of
-            # the table the catalog refused Spark
-            for prefix in (f"{BRONZE}/smoke/", f"{BRONZE}/by_spark/"):
-                for page in s3e.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=prefix):
-                    for o in page.get("Contents", []):
-                        s3e.delete_object(Bucket=BUCKET, Key=o["Key"])
-    except Exception as e:  # noqa: BLE001 - best effort, the result is reported anyway
-        print(f"cleanup of s3://{BUCKET}/{BRONZE}/: {e}")
+        remove_domain(eng, "smoke-adm")
+    except Exception as e:  # noqa: BLE001 - reported as a failed check
+        check(f"Z1 the domain {DOMAIN} goes out of Meta Catalog", False, repr(e)[:400])
 
 
 def main() -> None:
@@ -452,10 +546,18 @@ def ceph_refused(out) -> bool:
     return any(x in str(out) for x in ("Access Denied", "AccessDenied", "403"))
 
 
+def denied_or_unread(out) -> bool:
+    """Trino refused the statement, or could not load the Iceberg table at
+    all: its metadata is read with the user's role before Trino's rules are
+    asked, Ceph refuses a role with no grant there, and Trino 481's lakehouse
+    connector then fails on its own stand-in for an unreadable table"""
+    return denied(out) or "Unsupported table handle: io.trino.plugin.iceberg.CorruptedIcebergTableHandle" in str(out)
+
+
 def run() -> None:
-    eng, ana, nog, both = "smoke-eng", "smoke-ana", "smoke-nogroup", "smoke-both"
+    eng, ana, nog, both, adm = "smoke-eng", "smoke-ana", "smoke-nogroup", "smoke-both", "smoke-adm"
     ge, ga = USERS[eng]["group"], USERS[ana]["group"]
-    de, da = BRONZE, GOLD          # the layers the lakehouse's policy grants the two groups
+    de, da = ENG_DIR, ANA_DIR      # a folder the tables' policies grant each of the two groups
 
     # ---------------------------------------------------------------- A ----
     s3e = sts(eng, ge)
@@ -471,6 +573,9 @@ def run() -> None:
         check(f"A6 {PREFIX}{ge} may not write s3://{BUCKET}/{da}/", not ok and err == "AccessDenied", err or "allowed")
         ok, err = s3_ok(lambda: s3e.list_objects_v2(Bucket=BUCKET))
         check(f"A7 {PREFIX}{ge} may not list the whole bucket", not ok and err == "AccessDenied", err or "allowed")
+        ok, err = s3_ok(lambda: s3e.list_objects_v2(Bucket=BUCKET, Prefix=f"{BRONZE}/"))
+        check(f"A7 {PREFIX}{ge} may not list the layer either: a grant is a table's", not ok and err == "AccessDenied",
+              err or "allowed")
         s3_ok(lambda: s3e.delete_object(Bucket=BUCKET, Key=f"{de}/smoke/hello.txt"))
 
     # make dataplatform-s3-login (dp-s3-login.sh) writes working keys, and only
@@ -507,44 +612,76 @@ def run() -> None:
     wait_for_trino(both, ge)
     empty_tables(eng, both)                  # what an earlier, failed run left
     ok, out = trino(eng, f"INSERT INTO {ENG_T} VALUES 1, 2, 3, 4")
-    check(f"B1 {eng} writes {ENG_T} (bronze) through Trino", ok, str(out))
+    check(f"B1 {eng} writes {ENG_T} (bronze, iceberg) through Trino", ok, str(out))
     ok, out = trino(eng, f"SELECT sum(x) FROM {ENG_T}")
     check(f"B2 {eng} reads it back (sum = 10)", ok and out == [[10]], str(out))
+    ok, out = trino(eng, f"INSERT INTO {AVRO_T} VALUES (5, TIMESTAMP '2026-01-01 10:00:00'), (6, NULL)")
+    if ok:
+        ok, out = trino(eng, f"SELECT sum(x) FROM {AVRO_T}")
+    check(f"B2 {eng} writes and reads {AVRO_T} (avro: sum = 11)", ok and out == [[11]], str(out))
+    # READ on a table: Trino lets the analyst select and nothing else, and
+    # their role reads the table's files and writes none
     ok, out = trino(ana, f"SELECT sum(x) FROM {ENG_T}")
-    check(f"B3 {ana} is refused by Ceph", not ok and ceph_refused(out), str(out))
+    check(f"B3 {ana}, granted READ, reads {ENG_T} (sum = 10)", ok and out == [[10]], str(out))
+    ok, out = trino(ana, f"INSERT INTO {ENG_T} VALUES 9")
+    check(f"B3 {ana} may not write it: Trino refuses", not ok and denied(out), str(out))
+    s3a = sts(ana, ga)
+    if not isinstance(s3a, str):
+        ok, err = s3_ok(lambda: s3a.list_objects_v2(Bucket=BUCKET, Prefix=f"{BRONZE}/eng_t/"))
+        check(f"B3 {PREFIX}{ga} lists the table's files", ok, err)
+        ok, err = s3_ok(lambda: s3a.put_object(Bucket=BUCKET, Key=f"{BRONZE}/eng_t/smoke.txt", Body=b"x"))
+        check(f"B3 {PREFIX}{ga} may not write one: Ceph refuses", not ok and err == "AccessDenied", err or "allowed")
+    else:
+        check(f"B3 {ana} assumes {PREFIX}{ga}", False, s3a)
+    # Ceph refuses the analyst's role the table's metadata, which Trino reads
+    # before it asks its rules: the refusal is Ceph's (README, Known limits)
+    ok, out = trino(ana, f"SELECT sum(id) FROM {SPARK_T}")
+    check(f"B4 {ana} is refused {SPARK_T}, not granted: Ceph or Trino refuses", not ok and denied_or_unread(out), str(out))
     ok, out = trino(nog, f"SELECT sum(x) FROM {ENG_T}")
-    check(f"B4 {nog} is refused by Trino (no mapping)", not ok and "No matching S3 security mapping" in out, str(out))
+    check(f"B4 {nog}, in no group, is refused by Trino", not ok and denied(out), str(out))
+    ok, out = trino(ana, f"SHOW TABLES FROM {SCHEMA_B}")
+    check(f"B4 {ana} sees only the table granted to them in {SCHEMA_B}", ok and out == [["eng_t"]], str(out))
+    ok, out = trino(nog, "SHOW SCHEMAS FROM lakehouse")
+    check(f"B4 {nog} sees no schema of the tables", ok and out == [["information_schema"]], str(out))
     # Only Meta Catalog creates, changes or drops a schema or a table: Trino
     # gives DDL to its provisioner alone, even where a user may write the data.
-    for n, (label, sql) in enumerate((("create a schema", f"CREATE SCHEMA lakehouse.smoke_by_hand WITH (location = 's3://{BUCKET}/{de}/by_hand')"),
-                       ("create a table", f"CREATE TABLE lakehouse.{LAKEHOUSE}_bronze.by_hand (x int)"),
-                       ("create a table from a query", f"CREATE TABLE lakehouse.{LAKEHOUSE}_bronze.by_hand AS SELECT 1 AS x"),
+    for n, (label, sql) in enumerate((("create a schema", "CREATE SCHEMA lakehouse.smoke_by_hand"),
+                       ("create a table", f"CREATE TABLE {SCHEMA_B}.by_hand (x int)"),
+                       ("create a table from a query", f"CREATE TABLE {SCHEMA_B}.by_hand AS SELECT 1 AS x"),
                        ("comment a table", f"COMMENT ON TABLE {ENG_T} IS 'smoke'"),
                        ("add a column", f"ALTER TABLE {ENG_T} ADD COLUMN z int"),
                        ("drop a table", f"DROP TABLE {ENG_T}"))):
         ok, out = trino(eng, sql)
-        check(f"B5{'abcdef'[n]} {eng} may not {label}, though the layer is theirs", not ok and denied(out), str(out))
+        check(f"B5{'abcdef'[n]} {eng} may not {label}, though the table is theirs", not ok and denied(out), str(out))
+    ok, out = trino(adm, f"DROP TABLE {ENG_T}")
+    check(f"B5g {adm} ({ADMIN}) may not drop a table either", not ok and denied(out), str(out))
     # A member of both groups: Trino picks, for each file, the role granted
     # its directory (iam-sync's per-directory rules). Their default role is
-    # the analysts' (first alphabetically), which Ceph refuses in bronze, so
-    # reading there proves the per-directory rule. The mapping file is
-    # re-read every 30 s, after the group file: retry.
+    # the analysts' (first alphabetically), which Ceph refuses in the
+    # engineers' folders, so reading there proves the per-directory rule.
+    # The mapping file is re-read every 30 s, after the group file: retry.
     end = time.time() + 90
     while True:
-        ok, out = trino(both, f"SELECT sum(x) FROM {ENG_T}")
+        ok, out = trino(both, f"SELECT sum(x) FROM {AVRO_T}")
         if ok or time.time() > end:
             break
         time.sleep(10)
-    check(f"B6 {both} reads {ENG_T} in {de} with no role chosen", ok and out == [[10]], str(out))
+    check(f"B6 {both} reads {AVRO_T} with no role chosen", ok and out == [[11]], str(out))
     ok, out = trino(both, f"INSERT INTO {ANA_T} VALUES 5")
     if ok:
         ok, out = trino(both, f"SELECT (SELECT sum(x) FROM {ENG_T}) + (SELECT sum(y) FROM {ANA_T})")
-    check(f"B7 {both} writes in {da} and reads both layers in one query (sum = 15)", ok and out == [[15]], str(out))
-    ok, out = trino(both, f"SELECT sum(x) FROM {ENG_T}", role=f"{ROLE_ARN}{PREFIX}{ga}")
-    check(f"B8 with s3_role pinned to {PREFIX}{ga}, {both} is refused {ENG_T} by Ceph",
+    check(f"B7 {both} writes {ANA_T} (gold, parquet) and reads both layers in one query (sum = 15)",
+          ok and out == [[15]], str(out))
+    # Trino's rules let a member of the engineer group read the table; with
+    # the analysts' role pinned, the files are refused all the same
+    ok, out = trino(both, f"SELECT sum(x) FROM {AVRO_T}", role=f"{ROLE_ARN}{PREFIX}{ga}")
+    check(f"B8 with s3_role pinned to {PREFIX}{ga}, {both} is refused {AVRO_T} by Ceph",
           not ok and ceph_refused(out), str(out))
 
     # ---------------------------------------------------------------- C ----
+    # A Spark job reaches the catalog through the catalog gate, which knows
+    # the job's user and asks the Open Policy Agent what Trino asks: the
+    # engineer's job reads and writes the engineers' tables.
     ok, out = spark(eng, ge, f"""
 from pyspark.sql import SparkSession
 spark = SparkSession.builder.getOrCreate()
@@ -552,67 +689,133 @@ print("SMOKE trino-table", spark.sql("SELECT sum(x) FROM {ENG_T}").collect()[0][
 spark.sql("INSERT INTO {SPARK_T} SELECT id FROM range(5)")
 print("SMOKE spark-table", spark.sql("SELECT sum(id) FROM {SPARK_T}").collect()[0][0])
 print("SMOKE path", spark.sql("SELECT file_path FROM {SPARK_T}.files LIMIT 1").collect()[0][0])
-# Only Meta Catalog makes tables: the job's catalog login (spark_writer) may not.
-# In the engineers' own layer, so that Ceph lets the metadata file be written
-# and the catalog is what refuses (outside a grant Ceph would refuse first).
-try:
-    spark.sql("CREATE TABLE lakehouse.{LAKEHOUSE}_bronze.by_spark (id bigint) USING iceberg "
-              "LOCATION 's3://{BUCKET}/{BRONZE}/by_spark'")
-    print("SMOKE create allowed")
-except Exception as e:
-    # PostgreSQL's refusal sits deep in the Java exception's text
-    text = str(e)
-    why = [l.strip() for l in text.splitlines() if "permission denied" in l.lower()]
-    print("SMOKE create refused", (why[0] if why else text.splitlines()[0] if text else type(e).__name__)[:200])
+# Tables are Meta Catalog's to make, change and drop: the gate refuses a job,
+# also on a table its user may write.
+def tried(label, fn):
+    try:
+        fn()
+        print("SMOKE", label, "DONE")
+    except Exception as e:
+        said = [l for l in str(e).splitlines() if "Meta Catalog" in l]
+        print("SMOKE", label, "refused:", (said[0] if said else str(e).splitlines()[0])[:240])
+tried("ddl-create", lambda: spark.sql("CREATE TABLE {SCHEMA_B}.by_job (id bigint) USING iceberg"))
+tried("ddl-alter", lambda: spark.sql("ALTER TABLE {SPARK_T} ADD COLUMN z int"))
+tried("ddl-drop", lambda: spark.sql("DROP TABLE {SPARK_T}"))
 # The fence (spark-fence.yaml, the job ClusterRole): the job's own service
-# account may neither read a Secret of compute nor start a pod that mounts one.
-import json, ssl, urllib.error, urllib.request
+# account may neither read a Secret of compute nor start a pod that mounts
+# one, and changes nothing Trino lives by: its group file, its pods, the
+# labels it is known by, its Services (dry runs).
+import base64, json, socket, ssl, urllib.error, urllib.request
 sa = "/var/run/secrets/kubernetes.io/serviceaccount"
 ctx = ssl.create_default_context(cafile=sa + "/ca.crt")
-hdr = {{"Authorization": "Bearer " + open(sa + "/token").read().strip(), "Content-Type": "application/json"}}
-def k8s(method, path, body=None):
-    req = urllib.request.Request("https://kubernetes.default.svc" + path, body, hdr, method=method)
+bearer = "Bearer " + open(sa + "/token").read().strip()
+def k8s(method, path, body=None, ctype="application/json"):
+    req = urllib.request.Request("https://kubernetes.default.svc" + path, body,
+                                 {{"Authorization": bearer, "Content-Type": ctype}}, method=method)
     try:
         with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
-            return r.status, ""
+            return r.status, r.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode(errors="replace")[:300]
-print("SMOKE secret-read", k8s("GET", "/api/v1/namespaces/compute/secrets/iceberg-catalog")[0])
-import base64
-claims = json.loads(base64.urlsafe_b64decode(hdr["Authorization"].split(".")[1] + "=="))
+        return e.code, e.read().decode(errors="replace")[:400]
+ns = "/api/v1/namespaces/compute"
+print("SMOKE secret-read", k8s("GET", ns + "/secrets/trino-s3")[0])
+claims = json.loads(base64.urlsafe_b64decode(bearer.split(".")[1] + "=="))
 me = claims["sub"].rsplit(":", 1)[1]                  # the job's own service account
+mine = claims["kubernetes.io"]["pod"]["name"]         # and this pod
 pod = {{"apiVersion": "v1", "kind": "Pod", "metadata": {{"generateName": "smoke-fence-", "namespace": "compute"}},
        "spec": {{"serviceAccountName": me, "containers": [{{"name": "c", "image": "busybox"}}],
-                "volumes": [{{"name": "s", "secret": {{"secretName": "iceberg-catalog"}}}}]}}}}
-code, msg = k8s("POST", "/api/v1/namespaces/compute/pods?dryRun=All", json.dumps(pod).encode())
+                "volumes": [{{"name": "s", "secret": {{"secretName": "trino-s3"}}}}]}}}}
+code, msg = k8s("POST", ns + "/pods?dryRun=All", json.dumps(pod).encode())
 print("SMOKE pod-mount", code, "fence" if "dataplatform-spark-pods" in msg else msg[:120].replace(chr(10), " "))
+def fence(label, path, patch, policy):
+    code, msg = k8s("PATCH", path + "?dryRun=All", json.dumps(patch).encode(), "application/merge-patch+json")
+    print("SMOKE fence", label, code, "refused" if policy in msg else msg[:160].replace(chr(10), " "))
+fence("groups", ns + "/configmaps/trino-iam", {{"data": {{"groups.txt": "{ADMIN}:" + me}}}}, "dataplatform-compute-configmaps")
+code, pods = k8s("GET", ns + "/pods?labelSelector=app.kubernetes.io/name%3Dtrino")
+theirs = json.loads(pods)["items"][0]["metadata"]["name"] if code == 200 else "trino-coordinator-default-0"
+fence("trino-pod", ns + "/pods/" + theirs, {{"metadata": {{"labels": {{"smoke": "x"}}}}}}, "dataplatform-compute-pods")
+fence("trino-label", ns + "/pods/" + mine, {{"metadata": {{"labels": {{"app.kubernetes.io/name": "trino"}}}}}},
+      "dataplatform-compute-pod-labels")
+fence("trino-service", ns + "/services/trino-coordinator", {{"spec": {{"selector": {{"spark-role": "driver"}}}}}},
+      "dataplatform-compute-services")
+# The doors of governance that are Trino's alone (network policies): a job's
+# pod reaches neither the metastore nor the Open Policy Agent, only the gate.
+def door(label, host, port):
+    s = socket.socket()
+    s.settimeout(5)
+    try:
+        s.connect((host, port))
+        print("SMOKE door", label, "OPEN")
+    except (ConnectionRefusedError, TimeoutError) as e:
+        print("SMOKE door", label, "closed")
+    except OSError as e:
+        print("SMOKE door", label, "not tried:", e)
+    finally:
+        s.close()
+door("thrift", "hive-metastore.governance.svc.cluster.local", 9083)
+door("rest", "hive-metastore-iceberg.governance.svc.cluster.local", 9001)
+door("agent", "opa-server.governance.svc.cluster.local", 8081)
 spark.stop()
 """)
-    check(f"C1 {eng}'s Spark job reads Trino's table", ok and "SMOKE trino-table 10" in out, out[-600:])
-    check(f"C2 {eng}'s Spark job writes {SPARK_T}", ok and "SMOKE spark-table 10" in out, out[-600:])
-    check(f"C3 the table's files are in s3://{BUCKET}/{de}/spark_t/", f"SMOKE path s3://{BUCKET}/{de}/spark_t/" in out, out[-600:])
-    said = next((l for l in out.splitlines() if "SMOKE create" in l), "no SMOKE create line: " + out[-400:])
-    check(f"C4 {eng}'s Spark job may not create a table (its catalog login has no DDL)",
-          re.search(r"SMOKE create refused.*permission denied", said, re.I) is not None, said[:400])
-    check(f"C5 {eng}'s Spark job may not read a Secret of compute", "SMOKE secret-read 403" in out, out[-600:])
+    tail = out[-900:]
+    check(f"C1 {eng}'s Spark job reads Trino's table", ok and "SMOKE trino-table 10" in out, tail)
+    check(f"C2 {eng}'s Spark job writes {SPARK_T}", ok and "SMOKE spark-table 10" in out, tail)
+    check(f"C3 the table's files are in s3://{BUCKET}/{BRONZE}/spark_t/", f"SMOKE path s3://{BUCKET}/{BRONZE}/spark_t/" in out, tail)
+
+    def said(label: str) -> str:
+        """the line a probe of the job printed"""
+        return next((line for line in out.splitlines() if line.startswith(f"SMOKE {label} ")), f"no line SMOKE {label}")
+    for n, (label, what) in enumerate((("ddl-create", "create a table"), ("ddl-alter", "add a column"),
+                                       ("ddl-drop", "drop a table"))):
+        line = said(label)
+        check(f"C4{'abc'[n]} {eng}'s Spark job may not {what}, though the table is theirs: the catalog gate refuses",
+              " refused: " in line and "Meta Catalog" in line, line)
+    check(f"C5 {eng}'s Spark job may not read a Secret of compute", "SMOKE secret-read 403" in out, tail)
     check(f"C6 {eng}'s Spark job may not start a pod mounting another Secret",
-          re.search(r"SMOKE pod-mount 4(03|22) fence", out) is not None, out[-600:])
+          re.search(r"SMOKE pod-mount 4(03|22) fence", out) is not None, said("pod-mount"))
+    for n, (label, what) in enumerate((("groups", "rewrite Trino's group file"), ("trino-pod", "change a pod of Trino"),
+                                       ("trino-label", "give its own pod Trino's label"),
+                                       ("trino-service", "change Trino's Service"))):
+        line = said(f"fence {label}")
+        check(f"C6{'abcd'[n]} {eng}'s Spark job may not {what}", re.search(r" 4(03|22) refused$", line) is not None, line)
+    for n, (label, what) in enumerate((("thrift", "the Hive Metastore's Thrift port"), ("rest", "its REST catalog"),
+                                       ("agent", "the Open Policy Agent"))):
+        line = said(f"door {label}")
+        check(f"C6{'efg'[n]} {eng}'s Spark job cannot reach {what}", line.endswith(" closed"), line)
     ok2, out2 = trino(eng, f"SELECT sum(id) FROM {SPARK_T}")
     check(f"C7 Trino reads the table Spark wrote (sum = 10)", ok2 and out2 == [[10]], str(out2))
-    # The analyst's job sees the catalog entry (the catalog is no boundary)
-    # but Ceph refuses the files with the analysts' role.
+    # The analyst's job: the gate lets it read the table the analysts were
+    # granted READ on and no other, and commit to neither. A commit that
+    # moves a table back to an older snapshot writes no file, so Ceph would
+    # not see it: the gate is what refuses it.
+    schema = SCHEMA_B.split(".", 1)[1]
     ok, out = spark(ana, ga, f"""
 from pyspark.sql import SparkSession
 spark = SparkSession.builder.getOrCreate()
-print("SMOKE leaked", spark.sql("SELECT sum(x) FROM {ENG_T}").collect()[0][0])
+def tried(label, fn):
+    try:
+        print("SMOKE", label, "DONE", fn())
+    except Exception as e:
+        said = [l for l in str(e).splitlines() if "Meta Catalog" in l]
+        print("SMOKE", label, "refused:", (said[0] if said else str(e).splitlines()[0])[:240])
+print("SMOKE granted-read", spark.sql("SELECT sum(x) FROM {ENG_T}").collect()[0][0])
+tried("not-granted", lambda: spark.sql("SELECT sum(id) FROM {SPARK_T}").collect()[0][0])
+ids = [r[0] for r in spark.sql("SELECT snapshot_id FROM {ENG_T}.snapshots ORDER BY committed_at").collect()]
+if len(ids) > 1:
+    tried("rollback", lambda: spark.sql(f"CALL lakehouse.system.rollback_to_snapshot('{schema}.eng_t', {{ids[0]}})").collect())
+else:
+    print("SMOKE rollback not tried: the table has", len(ids), "snapshot")
+spark.stop()
 """)
-    reasons = [l.strip() for l in out.splitlines() if re.search(r"Exception|Denied|Forbidden|403", l)][:4]
-    # refused = no data came back and Ceph answered 403 (the job's own exit
-    # status is unreliable: a PySpark error can still exit 0; a traceback
-    # echoes the failing source line, so only a printed value is a leak)
-    check(f"C8 {ana}'s Spark job is refused {ENG_T} by Ceph", re.search(r"SMOKE leaked \d", out) is None
-          and re.search(r"Status Code: 403|AccessDenied|Access Denied", out) is not None,
-          " | ".join(reasons)[:900])
+    check(f"C8 {ana}'s Spark job, granted READ, reads {ENG_T} (sum = 10)", "SMOKE granted-read 10" in out, out[-900:])
+    line = said("not-granted")
+    check(f"C8 {ana}'s Spark job is refused {SPARK_T}, not granted: the catalog gate refuses",
+          " refused: " in line and "no READ grant" in line, line)
+    line = said("rollback")
+    check(f"C9 {ana}'s Spark job may not move {ENG_T} back to an older snapshot: the catalog gate refuses",
+          " refused: " in line and "no WRITE grant" in line, line)
+    ok2, out2 = trino(eng, f"SELECT sum(x) FROM {ENG_T}")
+    check(f"C9 {ENG_T} is as it was (sum = 10)", ok2 and out2 == [[10]], str(out2))
 
     # ---------------------------------------------------------------- D ----
     # Kubernetes API with the engineer's Keycloak login (client kubernetes)

@@ -1,0 +1,104 @@
+# The Hive Metastore (Stackable): the platform's one catalog of tables. Every
+# table Meta Catalog provisions is registered here, whatever its format
+# (parquet, avro, iceberg), and Trino and Spark find it here. Two doors
+# (manifests/namespaces/network-policies.yaml says who reaches which):
+#
+#   Trino   the Thrift API, thrift://hive-metastore.governance.svc.cluster.local:9083
+#           (the operator's Service: <cluster>-metastore): Trino's pods only
+#   Spark   the metastore's own Iceberg REST catalog (port 9001,
+#           metastore.catalog.servlet.port; the Service below), and only
+#           through the gate in front of it (manifests/governance/catalog-gate):
+#           no pod of compute reaches it directly
+#
+# - Hive 4.2.0, the operator's long-term version. Spark cannot use its Thrift
+#   API for Iceberg tables: Iceberg's Hive catalog goes through Spark's own
+#   Hive 2.3 client, whose get_table call Hive 4 no longer answers ("Invalid
+#   method name: 'get_table'", https://github.com/apache/iceberg/issues/12878;
+#   measured with this platform's Spark 4.1.2 and Iceberg 1.11.0). Through the
+#   REST catalog it reads and commits (measured). Trino has a client of its
+#   own and uses Thrift. A later Hive version is a one-way upgrade of the
+#   database: take a backup first.
+# - Neither door has a login (the REST catalog's is switched off:
+#   metastore.catalog.servlet.auth; it could take Keycloak tokens, but a job
+#   would have to carry one as a Spark setting, which every submitter reads in
+#   the job's manifest). So who may reach a door is what decides, and each
+#   door has one guest who asks the Open Policy Agent first: Trino, before
+#   every statement; the gate, which finds whose job is calling and asks the
+#   same rules. Only Meta Catalog's provisioner makes, changes or drops a
+#   table (through Trino); a job reads and commits data where its user was
+#   granted it. Nothing else reaches the metastore.
+# - S3, with the key of the RGW user hive (make dataplatform-ceph):
+#   - when a table is made, the metastore looks whether its directory exists
+#     and would create it otherwise. Meta Catalog makes the directory first,
+#     so it never does (measured with a key that may not write);
+#   - when a Spark job commits to an Iceberg table through the REST catalog,
+#     the metastore itself writes the table's new metadata file. So its key
+#     reads and writes the metadata/ directory of the tables, and nothing
+#     else: no data file. That write is the metastore's, whoever asked: Ceph
+#     cannot refuse it by the job's role, which is why the gate must know the
+#     job's user (a caller without a grant once moved a table back to an
+#     older snapshot through an anonymous gate: measured).
+#   Trino writes locations as s3://, which Hadoop knows as s3a (fs.s3.impl).
+apiVersion: hive.stackable.tech/v1alpha1
+kind: HiveCluster
+metadata:
+  name: hive
+spec:
+  image:
+    productVersion: 4.2.0
+  clusterConfig:
+    metadataDatabase:
+      postgresql:
+        host: hive-metastore-db-rw
+        database: hive
+        credentialsSecretName: hive-metastore-db-owner
+    s3:
+      inline:
+        host: <%= site_s3_host %>
+        port: 443
+        accessStyle: Path
+        region:
+          name: <%= dataplatform_s3_region %>
+        credentials:
+          secretClass: s3-hive
+        tls:
+          verification:
+            server:
+              caCert:
+                webPki: {}
+    # product logs: a Vector agent in the pod -> the aggregator -> VictoriaLogs
+    # (tenant Stackable); see helm-values/vector-aggregator-values.yaml
+    vectorAggregatorConfigMapName: vector-aggregator-discovery
+  metastore:
+    roleConfig:
+      listenerClass: cluster-internal
+    config:
+      resources:
+        cpu: {min: 100m, max: "1"}
+        memory: {limit: 1Gi}
+      logging:
+        enableVectorAgent: true
+    configOverrides:
+      hive-site.xml:
+        fs.s3.impl: org.apache.hadoop.fs.s3a.S3AFileSystem
+        # the Iceberg REST catalog, for Spark
+        metastore.catalog.servlet.port: "9001"
+        metastore.catalog.servlet.auth: none
+    roleGroups:
+      default:
+        replicas: 1
+---
+# The metastore's Iceberg REST catalog, for the gate
+# (manifests/governance/catalog-gate), which the Spark jobs go through: the
+# operator's own Service carries the Thrift port only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hive-metastore-iceberg
+spec:
+  selector:
+    app.kubernetes.io/name: hive
+    app.kubernetes.io/instance: hive
+    app.kubernetes.io/component: metastore
+  ports:
+    - {name: iceberg-rest, port: 9001, targetPort: 9001}

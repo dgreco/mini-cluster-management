@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: governance
+resources:
+  - hive-metastore-secrets.yaml
+  - hive-metastore-db.yaml
+  - hive-metastore-db-objectstore.yaml
+  - hive-metastore-db-backup.yaml
+  - vector-discovery.yaml
+  - hive-metastore.yaml

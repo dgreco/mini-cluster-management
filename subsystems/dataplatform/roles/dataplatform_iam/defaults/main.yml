@@ -127,17 +127,8 @@ dataplatform_iam_keycloak_namespace: governance
 dataplatform_iam_keycloak_service: keycloak-service
 # How long to wait for Keycloak to serve the realm (s)
 dataplatform_iam_keycloak_timeout: 1200
-# -e dataplatform_iam_prune=true: delete the RGW role, the empty bucket and
-# the catalog role of a group that no longer exists in Keycloak
+# -e dataplatform_iam_prune=true: delete the RGW role and the empty bucket
+# of a group that no longer exists in Keycloak
 dataplatform_iam_prune: false
 # OpenBao: the Keycloak group whose members get its admin policy
 dataplatform_iam_openbao_admin_group: "{{ dataplatform_iam_admin_groups | first }}"
-# The Iceberg catalog database (CloudNativePG) and its row-level security
-dataplatform_iam_catalog_namespace: governance
-dataplatform_iam_catalog_cluster: iceberg-catalog
-dataplatform_iam_catalog_database: iceberg
-dataplatform_iam_catalog_sql: "{{ dataplatform_gitops_dir }}/manifests/governance/iceberg-catalog/catalog-security.sql"
-# OpenBao path (under secret/dataplatform/) with one key per group: the password of its catalog role
-# OpenBao paths of the catalog logins whose password make dataplatform-iam
-# sets (made by make dataplatform-openbao): the Spark jobs'
-dataplatform_iam_catalog_logins: [governance/iceberg-catalog-spark]

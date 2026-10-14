@@ -9,8 +9,8 @@
 #    for; the browser's session of someone else is refused).
 # 2. Exchanges the token at Ceph's STS (AssumeRoleWithWebIdentity) for keys of
 #    a role: your own usr-<you> (-u) or a group's grp-<group> (-g), the roles
-#    the lakehouses' policies (Meta Catalog) grant directories of the
-#    platform bucket to. Without either: your own role if a lakehouse grants
+#    the tables' policies (Meta Catalog) grant their folders in the
+#    platform bucket to. Without either: your own role if a table grants
 #    you one (as Trino), else your only group's. It prints the directories the keys reach and
 #    your other roles (a session has one role). Ceph refuses a group you
 #    are not in and a role nobody made. The keys expire after -d seconds
@@ -18,7 +18,7 @@
 # 3. Writes them to .secrets/sso-<user>.env (or -o <file>) and checks that they
 #    reach the platform bucket:
 #      source .secrets/sso-alice.env
-#      aws s3 ls s3://dataplatform/lakehouse/acme_retail/bronze/
+#      aws s3 ls s3://dataplatform/lakehouse/retail/orders/bronze/orders_raw/
 #
 # Needs curl, jq and python3.
 set -euo pipefail
@@ -83,7 +83,7 @@ if [ -z "$role" ]; then
     echo "$user has no role of their own and is in the groups: $(tr '\n' ' ' <<<"$groups")- choose one with -g <group>" >&2
     exit 2
   fi
-  echo "no keys for $user as $(tr ' ' '/' <<<"$candidates") (does a lakehouse grant the role anything? is $user in the Keycloak group ${group:-'-'}? groups: $(tr '\n' ' ' <<<"$groups"))" >&2
+  echo "no keys for $user as $(tr ' ' '/' <<<"$candidates") (does a table grant the role anything? is $user in the Keycloak group ${group:-'-'}? groups: $(tr '\n' ' ' <<<"$groups"))" >&2
   exit 1
 fi
 { read -r ak; read -r sk; read -r st; read -r exp; } <<<"$creds"
@@ -143,6 +143,6 @@ other = [f"{r} ({', '.join(reach(r))})" for r in mine if r != role and reach(r)]
 if other:
     print("your other roles: " + "; ".join(other) + "   (-u: your own, -g <group>: a group's)")
 PY
-[ "$code" = 200 ] && echo "checked: the keys reach s3://$S3_BUCKET/ (the role's directories: the lakehouses' grants)" >&2 \
+[ "$code" = 200 ] && echo "checked: the keys reach s3://$S3_BUCKET/ (the role's folders: the tables' grants)" >&2 \
   || echo "warning: s3://$S3_BUCKET/ answered HTTP $code to the keys" >&2
 echo "use them with:  source $out" >&2

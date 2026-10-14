@@ -1,0 +1,17 @@
+# What Trino's policy in the Open Policy Agent decides with
+# (manifests/governance/opa/trino.rego): who may read and who may change
+# which table, the provisioner, the admin groups. Argo CD only creates it,
+# empty; iam-sync writes its one key, grants.rego, from the record of grants
+# (metacatalog-grants.yaml) and access.yaml, and may do nothing else to it
+# (the Application ignores /data). The label makes the Agent load it. Until
+# iam-sync's first round the policy finds no grant and no provisioner, and
+# Trino refuses every statement on a table.
+#
+# Like the record it is here, in governance-iam-access (wave 1), so that it
+# exists before iam-sync (wave 1) patches it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-grants
+  labels:
+    opa.stackable.tech/bundle: "true"

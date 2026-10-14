@@ -1,9 +1,10 @@
-# iam-sync (iam_sync.py): Keycloak groups -> Trino's groups file, S3 security
-# mapping and access rules (ConfigMap compute/trino-iam), the Spark jobs'
-# RoleBinding (compute), from Keycloak, the platform's settings (ConfigMap
-# iam-access: access.yaml) and the record of grants Meta Catalog writes
-# (ConfigMap metacatalog-grants, read through the API). Python standard
-# library only, on the stock Python image.
+# iam-sync (iam_sync.py): Keycloak groups -> Trino's groups file and S3
+# security mapping (ConfigMap compute/trino-iam) and the Spark jobs'
+# RoleBinding (compute); the grants -> what Trino's policy in the Open Policy
+# Agent decides with (ConfigMap trino-grants, here). From Keycloak, the
+# platform's settings (ConfigMap iam-access: access.yaml) and the record of
+# grants Meta Catalog writes (ConfigMap metacatalog-grants, read through the
+# API). Python standard library only, on the stock Python image.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

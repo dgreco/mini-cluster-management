@@ -331,23 +331,24 @@ dataplatform-s3-login: ## Temporary S3 keys of your Keycloak group (single sign-
 ##> make dataplatform-s3-login                                   your own role, else your only group's; prints what the keys reach
 ##> make dataplatform-s3-login ARGS="-g <group> -d 43200"   a chosen group, keys valid 12 h
 ##> make dataplatform-s3-login ARGS="-l <user> -g <group>"   as another Keycloak user (fresh login)
-##> source .secrets/sso-<you>.env && aws s3 ls s3://<bucket>/lakehouse/<lakehouse>/
+##> source .secrets/sso-<you>.env && aws s3 ls s3://<bucket>/lakehouse/<domain>/<subdomain>/<layer>/<table>/
 
 .PHONY: dataplatform-spark-submit
 dataplatform-spark-submit: ## Run a PySpark job as yourself (Keycloak login, the group's STS role); see the script's header
 	@subsystems/dataplatform/files/dp-spark-submit.sh $(ARGS)
 ##> make dataplatform-spark-submit ARGS="-g <group> -w my_job.py"
 
-.PHONY: dataplatform-medallion
-dataplatform-medallion: ## Medallion lakehouses in Meta Catalog: load, provision (Trino), authorize (admin group), status
-	@subsystems/dataplatform/files/dp-medallion.sh $(ARGS)
-##> make dataplatform-medallion ARGS="load subsystems/dataplatform/metacatalog/lakehouses/acme_retail.yaml"   the model and a lakehouse
-##> make dataplatform-medallion ARGS="provision acme_retail"   its Iceberg schemas and tables, through Trino
-##> make dataplatform-medallion ARGS="authorize acme_retail"   its grants -> Ceph and Trino (the admin group only)
-##> make dataplatform-medallion ARGS="status acme_retail"      what is provisioned, and for whom
-##> make dataplatform-medallion ARGS="unprovision acme_retail" DROPS its tables and data (asks first)
+.PHONY: dataplatform-tables
+dataplatform-tables: ## Tables in Meta Catalog: load, provision (folder, Hive Metastore), authorize (admin group), status, delete
+	@subsystems/dataplatform/files/dp-tables.sh $(ARGS)
+##> make dataplatform-tables ARGS="load subsystems/dataplatform/metacatalog/domains/retail.yaml subsystems/dataplatform/metacatalog/tables/retail.yaml"   the model, a domain, its tables
+##> make dataplatform-tables ARGS="provision retail"                each table's folder, then the table in the metastore (through Trino)
+##> make dataplatform-tables ARGS="authorize retail/analytics"      their grants -> Ceph and Trino (the admin group only)
+##> make dataplatform-tables ARGS="status retail/orders/silver/orders"   what is provisioned, and for whom
+##> make dataplatform-tables ARGS=list                              every table
+##> make dataplatform-tables ARGS="unprovision retail/orders/bronze/orders_raw"   DROPS the table and deletes its files (asks first)
 
-##@ Data platform data access   (Meta Catalog's grants -> Ceph RGW roles and Trino's mapping; gitops/iam/access.yaml: the platform's part)
+##@ Data platform data access   (Meta Catalog's grants -> Ceph RGW roles, Trino's mapping and Trino's rules; gitops/iam/access.yaml: the platform's part)
 
 .PHONY: dataplatform-admin-read
 dataplatform-admin-read: ## The admin role may read every bucket on Ceph; refresh the S3 browser's bucket index
@@ -360,14 +361,27 @@ dataplatform-logout: ## Log out: delete the cached logins and S3 keys here, end 
 .PHONY: dataplatform-grants
 dataplatform-grants: ## What is granted (the record Meta Catalog's authorize writes): list, plan, apply, remove, import
 	@subsystems/dataplatform/files/dp-grants.sh $(ARGS)
-##> make dataplatform-grants ARGS=list                 every resource with its directory and grants
+##> make dataplatform-grants ARGS=list                 every folder and table with its grants
 ##> make dataplatform-grants ARGS=plan                 what Ceph's roles lack against the record (changes nothing)
-##> make dataplatform-grants ARGS="remove lakehouse.old_bronze"   grants of a lakehouse deleted without a reject
+##> make dataplatform-grants ARGS="remove table.old_schema.old_table"   grants of a table deleted without a reject
 ##> make dataplatform-grants ARGS="import latest.json"           restore a copy from s3://<backup bucket>/metacatalog-grants/
 
 .PHONY: dataplatform-iam-check
 dataplatform-iam-check: ## Validate gitops/iam/access.yaml (no cluster access)
 	@python3 subsystems/dataplatform/files/check_access.py
+
+# The rules and their tests (gitops/manifests/governance/opa), with opa when
+# it is installed, else with the image the platform runs (Docker).
+OPA_POLICY := subsystems/dataplatform/gitops/manifests/governance/opa
+OPA_IMAGE := oci.stackable.tech/sdp/opa:1.16.2-stackable26.7.0
+.PHONY: dataplatform-policy-test
+dataplatform-policy-test: ## Unit tests of Trino's access rules for the Open Policy Agent (no cluster access)
+	@if command -v opa >/dev/null 2>&1; then \
+	   opa test $(OPA_POLICY)/trino.rego $(OPA_POLICY)/trino_test.rego; \
+	 else \
+	   docker run --rm -v "$(CURDIR)/$(OPA_POLICY):/policy:ro" --entrypoint opa $(OPA_IMAGE) \
+	     test /policy/trino.rego /policy/trino_test.rego; \
+	 fi
 
 ##@ Data platform install steps (advanced: dataplatform-install runs them all, in this order)
 

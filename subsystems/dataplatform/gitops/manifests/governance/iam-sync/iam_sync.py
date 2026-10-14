@@ -2,17 +2,27 @@
 """iam-sync: Keycloak groups and Meta Catalog's grants -> what the platform
 derives from them.
 
-Every SYNC_INTERVAL seconds it reads the groups of the realm and their members
+Every SYNC_INTERVAL seconds it reads ACCESS_FILE (the ConfigMap iam-access:
+gitops/iam/access.yaml, the platform's own settings), the record of grants
+(the ConfigMap GRANTS_CONFIGMAP of its namespace, which Meta Catalog's
+authorize and reject write: a table's folder, with who may read or write its
+files, and the table itself, with who may read or write it in Trino; only
+folders under access.yaml's metacatalog.prefix and tables of TRINO_CATALOG
+count, the rest is ignored) and the groups of the realm with their members
 (service account of the Keycloak client iam-sync: view-users, query-groups,
 query-users; both come from the directory, Samba AD, through the realm's user
-federation, and a member the realm holds itself does not count), ACCESS_FILE (the ConfigMap iam-access: gitops/iam/access.yaml,
-the platform's own settings) and the record of grants (the ConfigMap
-GRANTS_CONFIGMAP of its namespace, which Meta Catalog's authorize and reject
-write, and which they apply to Ceph's STS roles; only grants under
-access.yaml's metacatalog.prefix count, the rest is ignored), and
-reconciles, in TRINO_NAMESPACE (compute):
+federation, and a member the realm holds itself does not count), and
+reconciles:
 
-1. ConfigMap trino-iam:
+1. ConfigMap OPA_CONFIGMAP in its own namespace, where the Open Policy Agent
+   runs: grants.rego, the data Trino's policy decides with (gitops/manifests/
+   governance/opa/trino.rego): the catalog, Meta Catalog's provisioner (the
+   only user with DDL), the admin groups, and for every table of the record
+   who may read it (ro) and who may also change its rows (rw). It needs
+   nothing of Keycloak (the Agent gets a user's groups from Trino), so it is
+   written first, also while Keycloak or the directory is down: a reject
+   reaches Trino whatever else happens.
+2. ConfigMap trino-iam in TRINO_NAMESPACE (compute):
    - groups.txt: Trino's file group provider (group:user1,user2), from Keycloak
    - s3-security-mapping.json: for every Keycloak user who has a role (their
      own usr-<user>, or a group's grp-<group>), a rule per directory granted
@@ -29,12 +39,7 @@ reconciles, in TRINO_NAMESPACE (compute):
      role, for users iam-sync has not seen yet. Session name = the Trino
      user. No catch-all rule: a user nothing grants gets no S3 credentials
      from Trino.
-   - rules.json: Trino's file-based access control. Meta Catalog creates
-     every schema and table: only its provisioner (access.yaml
-     metacatalog.provisioner) may create, alter, comment or drop schemas and
-     tables, nobody else, admins included. Every user may SELECT, INSERT,
-     DELETE and UPDATE: the files decide, at Ceph, with the user's roles.
-2. RoleBinding spark-submitter: every Keycloak group (Kubernetes group
+3. RoleBinding spark-submitter: every Keycloak group (Kubernetes group
    oidc:<group>) may use the ClusterRole SPARK_SUBMITTER_ROLE in that
    namespace, where every Spark job runs. The data itself is Ceph's to
    refuse: a job holds only the submitter's Keycloak token, exchanged at STS
@@ -79,6 +84,9 @@ GROUP_ROLE_PREFIX = os.environ.get("GROUP_ROLE_PREFIX", "grp-")
 GROUP_PATTERN = re.compile(os.environ.get("GROUP_PATTERN", r"^[a-z0-9][a-z0-9-]{0,40}[a-z0-9]$"))
 USER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,50}[a-z0-9]$")
 TRINO_NAMESPACE = os.environ.get("TRINO_NAMESPACE", "compute")
+TRINO_CATALOG = os.environ.get("TRINO_CATALOG", "lakehouse")
+OPA_CONFIGMAP = os.environ.get("OPA_CONFIGMAP", "trino-grants")      # in iam-sync's own namespace
+NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,62}$")                 # a schema or a table of the record
 SPARK_SUBMITTER_ROLE = os.environ.get("SPARK_SUBMITTER_ROLE", "dataplatform-spark-submitter")
 OIDC_PREFIX = os.environ.get("OIDC_PREFIX", "oidc:")      # the API server's prefix of Keycloak groups
 INTERVAL = int(os.environ.get("SYNC_INTERVAL", "30"))
@@ -179,12 +187,13 @@ def parse_access(text: str):
 
 
 def read_access() -> dict:
-    """{bucket, grants: [{path, users, groups, access}], admins: [groups],
-    provisioner: the one user with DDL in Trino}. The grants: the
-    provisioner's rw on metacatalog.prefix (it creates every schema and table
-    there), then those of the record under the prefix. A `grants` list in
-    access.yaml is ignored: Meta Catalog is the only source of grants
-    (check_access.py refuses one)."""
+    """{bucket, grants: [{path, users, groups, access}], tables: [{schema,
+    table, users, groups, access}], admins: [groups], provisioner: the one
+    user with DDL in Trino}. The grants: the provisioner's rw on
+    metacatalog.prefix (it makes every table's folder there), then the
+    folders of the record under the prefix; the tables: those of the record.
+    A `grants` list in access.yaml is ignored: Meta Catalog is the only
+    source of grants (check_access.py refuses one)."""
     with open(ACCESS_FILE) as f:
         doc = parse_access(f.read()) or {}
     admins = [a for a in ((doc.get("admins") or {}).get("groups") or []) if GROUP_PATTERN.match(str(a))]
@@ -192,12 +201,14 @@ def read_access() -> dict:
     prefix = str(mc.get("prefix") or "").strip("/")
     provisioner = str(mc.get("provisioner") or "")
     provisioner = provisioner if USER_PATTERN.match(provisioner) else ""
-    grants = []
+    grants, tables = [], []
     if prefix and provisioner:
         grants.append({"path": prefix, "access": "rw", "users": [provisioner], "groups": []})
     if prefix:
-        grants += metacatalog_grants(prefix)
-    return {"bucket": doc.get("bucket", ""), "grants": grants, "admins": admins, "provisioner": provisioner}
+        folders, tables = metacatalog_grants(prefix)
+        grants += folders
+    return {"bucket": doc.get("bucket", ""), "grants": grants, "tables": tables, "admins": admins,
+            "provisioner": provisioner}
 
 
 _record = None
@@ -229,24 +240,38 @@ def read_record() -> dict:
     return _record
 
 
-def metacatalog_grants(prefix: str) -> list:
-    """The grants of the record ({resource: {"path", "grants": [{access,
-    users, groups}]}}), those under the prefix only: the scripts write no
+def _principals(g: dict) -> dict:
+    return {"users": [u for u in (g.get("users") or []) if USER_PATTERN.match(str(u))],
+            "groups": [x for x in (g.get("groups") or []) if GROUP_PATTERN.match(str(x))]}
+
+
+def metacatalog_grants(prefix: str) -> tuple:
+    """(folder grants, table grants) of the record. A resource is a table's
+    folder, {"path", "grants": [{access, users, groups}]}, or the table,
+    {"catalog", "schema", "table", "grants": [...]}. Only folders under the
+    prefix and tables of this platform's catalog count: the scripts write no
     others, and anything else (edited by hand) is dropped here (no grant is
     the safe side)."""
-    out = []
+    folders, tables = [], []
     for name, r in sorted(read_record().items()):
-        path = str((r or {}).get("path") or "").strip("/") if isinstance(r, dict) else ""
-        if not path.startswith(prefix + "/") or ".." in path.split("/"):
-            log(f"record of grants: {name}: {path!r} is not under {prefix}/, ignored")
+        if not isinstance(r, dict):
+            log(f"record of grants: {name}: not an object, ignored")
             continue
-        for g in r.get("grants") or []:
-            if not isinstance(g, dict) or g.get("access") not in ("rw", "ro"):
+        entries = [g for g in (r.get("grants") or []) if isinstance(g, dict) and g.get("access") in ("rw", "ro")]
+        if isinstance(r.get("path"), str):
+            path = r["path"].strip("/")
+            if not path.startswith(prefix + "/") or ".." in path.split("/"):
+                log(f"record of grants: {name}: {path!r} is not under {prefix}/, ignored")
                 continue
-            out.append({"path": path, "access": g["access"],
-                        "users": [u for u in (g.get("users") or []) if USER_PATTERN.match(str(u))],
-                        "groups": [x for x in (g.get("groups") or []) if GROUP_PATTERN.match(str(x))]})
-    return out
+            folders += [{"path": path, "access": g["access"], **_principals(g)} for g in entries]
+        elif isinstance(r.get("schema"), str) and isinstance(r.get("table"), str):
+            if r.get("catalog") != TRINO_CATALOG or not NAME_PATTERN.match(r["schema"]) or not NAME_PATTERN.match(r["table"]):
+                log(f"record of grants: {name}: not a table of the catalog {TRINO_CATALOG}, ignored")
+                continue
+            tables += [{"schema": r["schema"], "table": r["table"], "access": g["access"], **_principals(g)} for g in entries]
+        else:
+            log(f"record of grants: {name}: neither a folder nor a table, ignored")
+    return folders, tables
 
 
 # ---------------------------------------------------------------- Keycloak ----
@@ -388,19 +413,37 @@ def principals(access: dict) -> tuple:
     return users, groups
 
 
-def trino_rules(access: dict) -> dict:
-    """Schema and table DDL for Meta Catalog's provisioner only; data
-    statements for everyone (Ceph refuses the files of a role that lacks
-    them)."""
-    data = ["SELECT", "INSERT", "DELETE", "UPDATE"]
-    schemas, tables = [], []
-    if access.get("provisioner"):
-        who = f"^{re.escape(access['provisioner'])}$"
-        schemas.append({"user": who, "owner": True})
-        tables.append({"user": who, "privileges": data + ["OWNERSHIP"]})
-    schemas.append({"owner": False})
-    tables.append({"privileges": data})
-    return {"catalogs": [{"allow": "all"}], "schemas": schemas, "tables": tables}
+def opa_grants(access: dict) -> str:
+    """The data Trino's policy decides with, as a Rego module (JSON values
+    are Rego values): the package dataplatform. Meta Catalog's provisioner
+    is the only user with DDL, nobody else, admins included; a table is read
+    by those its grants name (ro and rw) and changed by the rw ones; the
+    admin groups read and change every table (as their role does on the
+    files). With no provisioner (an unusable access.yaml) nobody has DDL."""
+    tables: dict = {}
+    for t in access["tables"]:
+        level = tables.setdefault(t["schema"], {}).setdefault(t["table"], {}).setdefault(
+            t["access"], {"users": [], "groups": []})
+        level["users"] = sorted(set(level["users"]) | set(t["users"]))
+        level["groups"] = sorted(set(level["groups"]) | set(t["groups"]))
+    return ("# Written by iam-sync from gitops/iam/access.yaml and the record of grants\n"
+            "# (governance/metacatalog-grants): never by hand, the next round overwrites it.\n"
+            "package dataplatform\n\n"
+            f"catalog := {json.dumps(TRINO_CATALOG)}\n\n"
+            f"provisioner := {json.dumps(access.get('provisioner') or '')}\n\n"
+            f"admin_groups := {json.dumps(sorted(access['admins']))}\n\n"
+            f"tables := {json.dumps(tables, indent=2, sort_keys=True)}\n")
+
+
+def opa_objects(access: dict) -> dict:
+    """The ConfigMap the Open Policy Agent builds its bundle from, with
+    trino.rego's (the label makes it one). It exists already (Argo CD makes
+    it empty, gitops/iam): iam-sync may only patch it."""
+    with open(f"{SA_DIR}/namespace") as f:
+        ns = f.read().strip()
+    return {"apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": OPA_CONFIGMAP, "namespace": ns, "labels": {"opa.stackable.tech/bundle": "true"}},
+            "data": {"grants.rego": opa_grants(access)}}
 
 
 def memberships(groups: dict) -> dict:
@@ -457,6 +500,37 @@ def directory_roles(access: dict, user: str, member_of: set, roles: list) -> lis
     return out
 
 
+def location_prefixes(access: dict, user: str, member_of: set, roles: list) -> list:
+    """[(prefix, role ARN)] in the order Trino tries them, the longest first
+    (Trino takes the first rule whose prefix the location starts with). Each
+    directory of directory_roles twice: with a trailing slash for what is in
+    it, without for the directory itself, which is where Trino lists a
+    parquet or avro table (its location has no slash). Without the slash the
+    prefix also matches siblings that start with the same name (orders,
+    orders_raw): every folder of the record that does gets its two prefixes
+    with the role it gets from the user's directories that hold it, else the
+    default role, as if the sibling's rule were not there. Every rule picks
+    one of the user's own roles: the order decides which, never whether."""
+    dirs = directory_roles(access, user, member_of, roles)     # longest first
+    mine = {d for d, _ in dirs}
+
+    def holder(path: str) -> str:
+        return next((r for d, r in dirs if d == "" or path == d or path.startswith(d + "/")), roles[0])
+
+    out = {}
+    for d, r in dirs:
+        out[d + "/" if d else ""] = r
+        if d:
+            out[d] = r
+    folders = {g["path"] for g in access["grants"]}
+    for d in mine - {""}:
+        for q in folders - mine:
+            if q.startswith(d) and not q.startswith(d + "/"):
+                out.setdefault(q + "/", holder(q))
+                out.setdefault(q, holder(q))
+    return sorted(out.items(), key=lambda pr: (-len(pr[0]), pr[0]))
+
+
 def trino_objects(groups: dict, access: dict) -> dict:
     # only usable usernames: a ',' or ':' in one would break another group's line
     lines = [f"{g}:{','.join(u for u in users if USER_PATTERN.match(u))}"
@@ -465,9 +539,8 @@ def trino_objects(groups: dict, access: dict) -> dict:
     member_of = memberships(groups)
     rules = []
     for u, roles in user_roles(groups, users, role_groups).items():
-        # the trailing slash: projects/data must not match projects/data-x
-        for path, role in directory_roles(access, u, member_of.get(u, set()), roles):
-            rules.append({"user": f"^{re.escape(u)}$", "prefix": f"s3://{access['bucket']}/{path + '/' if path else ''}",
+        for prefix, role in location_prefixes(access, u, member_of.get(u, set()), roles):
+            rules.append({"user": f"^{re.escape(u)}$", "prefix": f"s3://{access['bucket']}/{prefix}",
                           "iamRole": role, "allowedIamRoles": roles, "roleSessionName": "${USER}"})
         rules.append({"user": f"^{re.escape(u)}$", "iamRole": roles[0], "allowedIamRoles": roles,
                       "roleSessionName": "${USER}"})
@@ -481,8 +554,7 @@ def trino_objects(groups: dict, access: dict) -> dict:
             "metadata": {"name": "trino-iam", "namespace": TRINO_NAMESPACE,
                          "labels": {"restarter.stackable.tech/ignore": "true"}},
             "data": {"groups.txt": "\n".join(lines) + "\n",
-                     "s3-security-mapping.json": json.dumps({"mappings": rules}, indent=2) + "\n",
-                     "rules.json": json.dumps(trino_rules(access), indent=2) + "\n"}}
+                     "s3-security-mapping.json": json.dumps({"mappings": rules}, indent=2) + "\n"}}
 
 
 # ---------------------------------------------------------------- Spark ----
@@ -499,10 +571,11 @@ def spark_objects(groups: dict) -> list:
 
 # ---------------------------------------------------------------- loop ----
 def sync_once() -> None:
+    access = read_access()
+    apply(opa_objects(access))          # needs nothing of Keycloak: first
     groups = read_groups()
     if not plausible(groups):
         return
-    access = read_access()
     apply(trino_objects(groups, access))
     for obj in spark_objects(groups):
         apply(obj)
@@ -513,7 +586,7 @@ def main() -> None:
         if not os.environ.get(name):
             sys.exit(f"{name} is not set")
     log(f"iam-sync: realm {REALM} at {KEYCLOAK_URL}, settings from {ACCESS_FILE}, grants from the ConfigMap "
-        f"{GRANTS_CONFIGMAP}, every {INTERVAL} s, into {TRINO_NAMESPACE}")
+        f"{GRANTS_CONFIGMAP}, every {INTERVAL} s, into {TRINO_NAMESPACE} and the ConfigMap {OPA_CONFIGMAP}")
     full_resync = 0
     while True:
         try:

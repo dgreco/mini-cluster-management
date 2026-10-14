@@ -1,0 +1,103 @@
+# catalog-gate (catalog_gate.py): the only way from a Spark job to the Hive
+# Metastore. The metastore's Iceberg REST catalog has no login, and through
+# it the metastore itself writes a table's metadata, with its own key: Ceph
+# never sees who asked. So the gate
+# - finds whose job is calling, from the caller's address: the running pod
+#   of compute with it, its service account (the SparkApplication's name),
+#   that SparkApplication's label <domain>/user (the submitter: the admission
+#   policy dataplatform-spark-submitter-jobs), the user's groups in Trino's
+#   group file (ConfigMap compute/trino-iam, iam-sync's). The Role of
+#   catalog-gate-rbac.yaml reads those three, nothing else;
+# - asks the Open Policy Agent what Trino would ask for the same user
+#   (manifests/governance/opa/trino.rego): a job reads a table's definition
+#   with a READ grant on it and commits data to it with a WRITE grant, and
+#   the lists show it only what its user may read;
+# - lets nothing else through: no table made, changed, renamed or dropped, no
+#   namespace, no view. Those are Meta Catalog's.
+# The jobs' catalog is http://catalog-gate.governance.svc.cluster.local/iceberg
+# (manifests/compute/spark/spark-template.yaml); the network policy lets
+# compute reach these pods and not the metastore's own ports, which only
+# Trino's pods reach (manifests/namespaces/network-policies.yaml).
+# Python standard library only, on the stock Python image. Two replicas: a
+# job's commit fails while the gate is away. It keeps nothing, and answers
+# 503 while the Agent or the Kubernetes API does not answer.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog-gate
+  namespace: governance
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: catalog-gate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: catalog-gate
+    spec:
+      serviceAccountName: catalog-gate
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: catalog-gate
+      containers:
+        - name: catalog-gate
+          # pinned by digest: a moving tag would change the program's runtime under it
+          image: docker.io/library/python:3.13-alpine@sha256:79e7a9b9ff1cbceff819f856fb374477792a5967759d94df266de7b7b4120e6f
+          command: [python3, -u, /app/catalog_gate.py]
+          env:
+            # the metastore's Iceberg REST catalog (the Service of hive-metastore.yaml)
+            - {name: CATALOG_URL, value: "http://hive-metastore-iceberg.governance.svc.cluster.local:9001"}
+            # the Agent, as Trino finds it (manifests/compute/trino/trino-opa.yaml)
+            - {name: OPA_URL, value: "http://opa-server.governance.svc.cluster.local:8081"}
+            - {name: OPA_PACKAGE, value: trino}
+            # the catalog's name in Trino, which the Agent's rules know the tables by
+            - {name: TRINO_CATALOG, value: lakehouse}
+            - {name: JOBS_NAMESPACE, value: compute}
+            # a SparkApplication names its user in the label <domain>/user
+            - {name: LABEL_DOMAIN, value: data.example.org}
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 30
+            failureThreshold: 4
+          resources:
+            requests: {cpu: 10m, memory: 48Mi}
+            limits: {memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: script, mountPath: /app, readOnly: true}
+      volumes:
+        - name: script
+          configMap:
+            name: catalog-gate-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog-gate
+  namespace: governance
+spec:
+  selector:
+    app.kubernetes.io/name: catalog-gate
+  ports:
+    - {name: http, port: 80, targetPort: http}

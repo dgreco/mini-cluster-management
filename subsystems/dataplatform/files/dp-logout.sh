@@ -5,7 +5,7 @@
 #
 # 1. Deletes what the command-line logins left here: the S3 keys of
 #    make dataplatform-s3-login (.secrets/sso-*.env) and the access token of
-#    make dataplatform-medallion (.secrets/sso-*.token). Keys already handed
+#    make dataplatform-tables (.secrets/sso-*.token). Keys already handed
 #    to a running job or shell stay valid until they expire (at most 12 hours).
 # 2. Ends the browser's Keycloak session: opens Keycloak's logout page (confirm
 #    there), so the next login asks for a user and a password again. -k keeps

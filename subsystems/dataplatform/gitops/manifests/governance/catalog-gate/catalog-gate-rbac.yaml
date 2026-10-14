@@ -1,0 +1,40 @@
+# What the catalog gate may read, all of it in compute, to find whose job is
+# calling: the pods (which one has the caller's address, and its service
+# account), the SparkApplications (the job's user, in its label) and Trino's
+# group file (the user's groups). It writes nothing anywhere.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: catalog-gate
+  namespace: governance
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: catalog-gate
+  namespace: compute
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+  - apiGroups: [spark.stackable.tech]
+    resources: [sparkapplications]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [trino-iam]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: catalog-gate
+  namespace: compute
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: catalog-gate
+subjects:
+  - kind: ServiceAccount
+    name: catalog-gate
+    namespace: governance
