@@ -5,11 +5,6 @@
 dataplatform_configure_dirs:
   - "{{ inventory_dir }}/../subsystems/dataplatform/gitops"
   - "{{ inventory_dir }}/../subsystems/dataplatform/files"
-  - "{{ inventory_dir }}/../subsystems/dataplatform/metacatalog"
-# The domains of the business and their subdomains (metacatalog/domains.yaml):
-# the model's enums and the provisioning script's copy are rendered from it
-dataplatform_configure_domains: >-
-  {{ lookup('ansible.builtin.file', inventory_dir ~ '/../subsystems/dataplatform/metacatalog/domains.yaml') | from_yaml }}
 # true: render in check mode and fail on a stale file (preflight); default:
 # the play's own check mode (make configure-check)
 # dataplatform_configure_check: true

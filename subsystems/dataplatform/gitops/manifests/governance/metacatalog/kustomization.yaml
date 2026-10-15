@@ -26,7 +26,6 @@ configMapGenerator:
       - provisioning/lib-grants.sh
       - provisioning/lib-iam.sh
       - provisioning/reconcile.sh
-      - provisioning/domains.json
   # The gate's nginx.conf (metacatalog-proxy.yaml). With the name hash: a
   # change rolls the proxy's pod, which mounts it as a single file.
   - name: metacatalog-gate

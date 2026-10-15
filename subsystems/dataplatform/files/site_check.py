@@ -10,7 +10,9 @@ the LAN and of the pod network). Words that are also generic names (the
 revision `main`, the bucket and account name, the storage classes, the
 directory's NetBIOS name) are not searched. Allowed: site.yml itself, hosts.ini and inventory/known_hosts,
 files rendered from a .in template, Markdown documentation, test fixtures
-(files/tests/) and the example site (publish/example/).
+(files/tests/), the example site (publish/example/), and Meta Catalog's model
+and tables (subsystems/dataplatform/metacatalog/: written out as Meta Catalog
+gets them, so a table's grants name the site's groups as they are).
 
   site_check.py                  check the repository (git ls-files)
   site_check.py --forbid A.yml   check against another site file's values
@@ -34,8 +36,9 @@ HOSTS = "inventory/hosts.ini"
 GENERIC = {"site_git_revision", "site_bucket", "site_rgw_account_name", "site_rbd_storage_class",
            "site_cephfs_storage_class", "site_git_host_keys", "site_k3s_api_vip", "site_ad_netbios_domain"}
 EXEMPT_FILES = {SITE, HOSTS, "inventory/known_hosts"}
-# the test fixtures; the example site (publish/), which the public copy puts in place of this one
-EXEMPT_PREFIXES = ("subsystems/dataplatform/files/tests/", "publish/example/")
+# the test fixtures; the example site (publish/), which the public copy puts in place of this one;
+# Meta Catalog's model and tables, written out (their grants name the site's groups)
+EXEMPT_PREFIXES = ("subsystems/dataplatform/files/tests/", "publish/example/", "subsystems/dataplatform/metacatalog/")
 
 
 def needles(site_file: str, hosts_file: str) -> dict:

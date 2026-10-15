@@ -1,4 +1,4 @@
-# The tables of the example domain retail (metacatalog/domains.yaml): eight tables
+# The tables of the example domain retail (the model's trait DomainMember): eight tables
 # across the medallion and the three formats. Each document is one table: its
 # place (domain, subdomain, layer), its format, its access policy, its
 # schema (the part with the columns) and what it is built from (dependsOn:
@@ -16,6 +16,8 @@
 # it selects one: `resources: { entityTypes: ["S3FolderType"] }` grants the
 # files without the table. Creating, altering and dropping tables is Meta
 # Catalog's alone; platform-admins reads and writes every table without a grant.
+# The groups are the site's (inventory/group_vars/all/site.yml), written out:
+# a grant names a group as it is in the directory.
 #
 #   layer    table                     format    data-engineers   data-analysts
 #   bronze   orders_raw                avro      read, write      -

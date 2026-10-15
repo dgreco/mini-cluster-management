@@ -73,20 +73,6 @@ NAME='^[a-z][a-z0-9]{0,23}$'
 [[ $LAYER =~ ^(bronze|silver|gold)$ ]] || fail "layer '$LAYER': bronze, silver or gold"
 [[ $TABLE =~ ^[a-z][a-z0-9_]{0,62}$ ]] || fail "table name '$TABLE': lower-case letters, digits and _"
 
-# A table is made only under one of its domain's own subdomains (domains.json,
-# rendered from metacatalog/domains.yaml): Meta Catalog checks the domain and
-# the subdomain each against its enum, not the pair. On provision only: the
-# tables of a pair taken out of the definition must still be unprovisioned,
-# rejected and deleted.
-if [ "$OPERATION" = provision ]; then
-  DOMAINS_FILE="$HERE/domains.json"
-  SUBDOMAINS=$(jq -r --arg d "$DOMAIN" 'if has($d) then .[$d] | join(", ") else "" end' "$DOMAINS_FILE") \
-    || fail "the domains' definition $DOMAINS_FILE cannot be read: nothing is made"
-  [ -n "$SUBDOMAINS" ] || fail "domain '$DOMAIN' is not one of metacatalog/domains.yaml: nothing is made"
-  jq -e --arg d "$DOMAIN" --arg s "$SUBDOMAIN" '.[$d] | index($s) != null' "$DOMAINS_FILE" >/dev/null \
-    || fail "subdomain '$SUBDOMAIN' is not one of the domain $DOMAIN's ($SUBDOMAINS; metacatalog/domains.yaml): nothing is made"
-fi
-
 # where the table is, said by its names alone
 LAYER_DIRECTORY="$LAKEHOUSE_PREFIX/$DOMAIN/$SUBDOMAIN/$LAYER"
 WANT_DIRECTORY="$LAYER_DIRECTORY/$TABLE"
@@ -276,9 +262,35 @@ authorize() {
   fi
 }
 
+# A table is made only under one of its domain's own subdomains: x-subdomains
+# of the model's trait DomainMember as Meta Catalog has it now
+# (subsystems/dataplatform/metacatalog/table-model.yaml, sent by make
+# dataplatform-tables ARGS=domains). Meta Catalog checks the domain and the
+# subdomain each against its enum, not the pair. Asked at Meta Catalog's own
+# Service, as the provisioner. On provision only: the tables of a pair taken
+# out of the definition must still be unprovisioned, rejected and deleted.
+# Without an answer nothing is made.
+known_pair() {
+  local out code pairs own
+  : "${METACATALOG_API:?}"
+  out=$(mktemp)
+  code=$(curl -sS --max-time 30 -o "$out" -w '%{http_code}' \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$TRINO_TOKEN") "$METACATALOG_API/trait/DomainMember") || code=000
+  pairs=$(jq -c '.schema | if type == "string" then fromjson else . end | .properties.domain["x-subdomains"] | objects' \
+    "$out" 2>/dev/null) || pairs=""
+  rm -f "$out"
+  [ "$code" = 200 ] || fail "Meta Catalog ($METACATALOG_API) did not give the trait DomainMember (HTTP $code): nothing is made"
+  [ -n "$pairs" ] || fail "the trait DomainMember in Meta Catalog has no x-subdomains (make dataplatform-tables ARGS=domains sends the model's): nothing is made"
+  own=$(jq -r --arg d "$DOMAIN" 'if has($d) then .[$d] | join(", ") else "" end' <<<"$pairs")
+  [ -n "$own" ] || fail "domain '$DOMAIN' is not one of the model's ($(jq -r 'keys | join(", ")' <<<"$pairs")): nothing is made"
+  jq -e --arg d "$DOMAIN" --arg s "$SUBDOMAIN" '.[$d] | index($s) != null' <<<"$pairs" >/dev/null \
+    || fail "subdomain '$SUBDOMAIN' is not one of the domain $DOMAIN's ($own): nothing is made"
+}
+
 # one token for every statement of the run (trino runs in subshells, which
 # would each log in again)
 case $OPERATION in provision|unprovision) trino_login ;; esac
+[ "$OPERATION" != provision ] || known_pair
 
 case $OPERATION:$KIND in
   provision:folder) provision_folder ;;

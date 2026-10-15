@@ -1,15 +1,16 @@
 # The data model of the platform, in Meta Catalog's bulk format (traits,
-# relationships, entity types, mappings). Loaded once into the running Meta
-# Catalog by `make dataplatform-tables ARGS="load ..."`, which skips what is
-# already there.
+# relationships, entity types, mappings). This file is the whole model, as
+# Meta Catalog gets it: nothing is rendered into it. Loaded once into the
+# running Meta Catalog by `make dataplatform-tables ARGS="load ..."`, which
+# skips what is already there; after a change of the domains (the trait
+# DomainMember, below), `make dataplatform-tables ARGS=domains` sends it.
 #
 # The artifact is a table. A table is an aggregate of its own: the unit that
 # is provisioned and the subject of authorization (its root carries the access
 # policy: principals, permissions, grants). What a table says about itself:
 #
-#   domain, subdomain   where it belongs: one of the domains of
-#                       metacatalog/domains.yaml and one of that domain's
-#                       subdomains (enums, rendered from it)
+#   domain, subdomain   where it belongs: one of the domains of the trait
+#                       DomainMember and one of that domain's subdomains
 #   layer               its place in the medallion: bronze, silver or gold
 #   format              how its files are written: parquet, avro or iceberg
 #   name, description, owner
@@ -23,13 +24,19 @@
 #   schema  -> HiveTableType: the table in the Hive Metastore (Trino:
 #              lakehouse.<domain>_<subdomain>_<layer>.<name>), at that folder
 #
+# dataplatform is the platform's bucket (site_bucket in
+# inventory/group_vars/all/site.yml), written out in the mappings: on a site
+# with another bucket, change it there before the first load. The
+# provisioning script builds every place again from the names and its own
+# bucket, and refuses a resource whose values say otherwise.
+#
 # Both are handled by Meta Catalog's `script` task
 # (gitops/manifests/governance/metacatalog/provisioning). Provision makes the
 # folder, then registers the table (the schema's mapping reaches the folder
 # through its table, which is what puts the folder first; unprovision goes
 # the other way round). Authorize turns the table's grants into rights where
 # each resource is enforced: on the folder, Ceph's STS roles; on the table,
-# Trino's rules in the Open Policy Agent (platform-admins only). Reject
+# Trino's rules in the Open Policy Agent (the admin group only). Reject
 # withdraws them.
 #
 # The folder and the names are built from domain, subdomain, layer and name:
@@ -42,13 +49,31 @@
 Traits:
   # Whatever belongs to a subdomain of a domain says which, by name: the
   # mappings build the folder and the schema name from these two values.
-  # Both are enums of metacatalog/domains.yaml, rendered by make configure
-  # (Meta Catalog's form shows them as drop-downs); after a change there,
-  # make dataplatform-tables ARGS=domains brings Meta Catalog to it. Meta
-  # Catalog merges only the properties of a type's traits into its schema,
-  # so no rule can tie the subdomain to its domain here: make
-  # dataplatform-tables checks it at load, the provisioning script before it
-  # makes anything.
+  # This trait is the one definition of the domains and their subdomains.
+  #
+  #   domain.enum            the domains
+  #   domain.x-subdomains    each domain's own subdomains: the only pairs a
+  #                          table may name
+  #   subdomain.enum         every subdomain of x-subdomains, once
+  #
+  # Meta Catalog's form shows the two enums as drop-downs and refuses a value
+  # outside them. It keeps no rule that ties two properties together (it
+  # merges only the properties of a type's traits into its schema, and
+  # refuses if/then, allOf and the like), so the pair is checked by make
+  # dataplatform-tables at load and by the provisioning script before it
+  # makes anything, both against x-subdomains of the trait in Meta Catalog.
+  # Meta Catalog keeps that keyword as it is and validates nothing with it.
+  #
+  # Names: lower-case letters and digits, a letter first, at most 24, no '_'
+  # (they become part of every table's folder and schema name). A subdomain
+  # name may repeat in another domain. The domain smoke, with its subdomain
+  # test, is the smoke test's own (make dataplatform-smoke-test).
+  #
+  # After a change here: make dataplatform-tables ARGS=domains (it checks the
+  # three lists agree, then sends a new version of this trait and of
+  # TableType). A table keeps the version it was made with. A pair taken out
+  # can no longer be provisioned; its tables can still be unprovisioned,
+  # rejected and deleted.
   - name: DomainMember
     schema:
       type: object
@@ -57,11 +82,20 @@ Traits:
         domain:
           type: string
           description: "One of: retail, smoke"
-          enum: ["retail", "smoke"]
+          enum: [retail, smoke]
+          x-subdomains:
+            # The shop: what it sells, to whom, and what it is paid.
+            # orders: as the web shop takes them; customers: the CRM's;
+            # payments: from the payments database; analytics: what the
+            # business reads (revenue, customer value)
+            retail: [orders, customers, payments, analytics]
+            # The tables of make dataplatform-smoke-test: made, used and
+            # taken out again at every run
+            smoke: [test]
         subdomain:
           type: string
           description: "One of its domain's: retail (orders, customers, payments, analytics); smoke (test)"
-          enum: ["orders", "customers", "payments", "analytics", "test"]
+          enum: [orders, customers, payments, analytics, test]
 
   # A named set of data; the lineage relationship below is between datasets.
   - name: Dataset

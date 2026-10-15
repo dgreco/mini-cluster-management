@@ -53,30 +53,6 @@
   become: false
   run_once: true
 
-- name: The domains have the shapes the model relies on (metacatalog/domains.yaml)
-  ansible.builtin.assert:
-    that:
-      - dataplatform_configure_domains is mapping
-      - dataplatform_configure_domains | length > 0
-      - _domains | map(attribute='key') | reject('match', _name) | list | length == 0
-      - _domains | map(attribute='value') | reject('mapping') | list | length == 0
-      - _subdomains | reject('mapping') | list | length == 0
-      - _subdomains | select('equalto', {}) | list | length == 0
-      - _subdomains | map('list') | flatten | reject('match', _name) | list | length == 0
-      - "'test' in (dataplatform_configure_domains['smoke']['subdomains'] | default({}))"
-    fail_msg: >-
-      metacatalog/domains.yaml: every domain needs subdomains (a map of name: description), every
-      name lower-case letters and digits, a letter first, at most 24 (they become parts of folders
-      and schema names), and the smoke test's domain smoke with its subdomain test must be there.
-    quiet: true
-  vars:
-    _name: '^[a-z][a-z0-9]{0,23}$'
-    _domains: "{{ dataplatform_configure_domains | dict2items }}"
-    _subdomains: "{{ _domains | map(attribute='value') | map(attribute='subdomains', default='missing') | list }}"
-  delegate_to: localhost
-  become: false
-  run_once: true
-
 - name: Templates
   ansible.builtin.find:
     paths: "{{ dataplatform_configure_dirs }}"

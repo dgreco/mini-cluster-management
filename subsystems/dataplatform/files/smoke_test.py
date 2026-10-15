@@ -8,11 +8,13 @@ group), smoke-both (both), smoke-nogroup (none), smoke-adm (analyst,
 engineer and the admin group, last: the gate must find it among
 several groups; it authorizes the tables).
 
-Everything happens in the smoke test's own tables, the domain smoke
-(metacatalog/domains.yaml, metacatalog/tables/smoke.yaml), which only
+Everything happens in the smoke test's own tables, the domain smoke (of
+the model's trait DomainMember; metacatalog/tables/smoke.yaml), which only
 Meta Catalog creates and whose policies grant the engineer group the bronze
 tables (the analyst group may read one of them) and the analyst group the
-gold one (the site's groups: ADMIN_GROUP, ENGINEER_GROUP, ANALYST_GROUP). 0
+gold one (the site's groups: ADMIN_GROUP, ENGINEER_GROUP, ANALYST_GROUP; the
+file names them as written, and the test stops before anything when it
+names others). 0
 loads the model (metacatalog/table-model.yaml) when Meta Catalog lacks it,
 and the tables as make dataplatform-tables does (with its script,
 DP_TABLES), and provisions them: a platform built from scratch needs no step
@@ -21,7 +23,7 @@ failed, so no grant of the test stays in the record.
 
 0  Meta Catalog lets the engineer in and refuses the analyst (only
    the admin and engineer groups); the tables: in Meta Catalog, provisioned
-   in their three formats; a domain outside metacatalog/domains.yaml is
+   in their three formats; a domain outside the model's is
    refused by Meta Catalog, a subdomain of another domain (which passes its
    two enums) by make dataplatform-tables at load and by the provisioning
    script, which makes nothing; the engineer may not
@@ -109,8 +111,7 @@ ADMIN, ENGINEER, ANALYST = os.environ["ADMIN_GROUP"], os.environ["ENGINEER_GROUP
 LABEL_DOMAIN = os.environ["LABEL_DOMAIN"]               # the platform's label keys: <it>/user
 METACATALOG = os.environ["METACATALOG_URL"].rstrip("/") + "/metacatalog/v1"
 TABLES = os.environ["DP_TABLES"]                       # files/dp-tables.sh
-DOMAIN, SUBDOMAIN = "smoke", "test"                    # metacatalog/domains.yaml
-DOMAINS_FILE = os.environ["SMOKE_DOMAINS_FILE"]        # its pairs, as make configure renders them (domains.json)
+DOMAIN, SUBDOMAIN = "smoke", "test"                    # the model's trait DomainMember
 TABLES_FILE = os.environ["SMOKE_TABLES_FILE"]          # metacatalog/tables/smoke.yaml
 MODEL_FILE = os.environ["SMOKE_MODEL_FILE"]            # metacatalog/table-model.yaml
 ROOT = f"lakehouse/{DOMAIN}/{SUBDOMAIN}"               # where its tables' folders are, under the bucket
@@ -441,7 +442,8 @@ def table_doc(domain: str, subdomain: str, name: str) -> bytes:
 
 
 def domain_rules(eng: str, adm: str) -> None:
-    """A table's domain and subdomain are a pair of metacatalog/domains.yaml.
+    """A table's domain and subdomain are a pair of the model's (x-subdomains
+    of the trait DomainMember in Meta Catalog).
     Meta Catalog refuses a domain outside its enum; a subdomain of another
     domain passes its two enums (it keeps no rule across two properties), so
     make dataplatform-tables refuses it at load, and the provisioning script
@@ -449,12 +451,19 @@ def domain_rules(eng: str, adm: str) -> None:
     code, out = metacatalog(eng, "POST", "/aggregate/yaml", table_doc("nosuchdomain", SUBDOMAIN, "bad_domain"),
                             ctype="application/octet-stream")
     found, rows = entities(eng, "TableType", '@.name == "bad_domain"')
-    check("0g Meta Catalog refuses a table whose domain is not one of metacatalog/domains.yaml, and keeps nothing",
+    check("0g Meta Catalog refuses a table whose domain is not one of the model's, and keeps nothing",
           400 <= code < 500 and found == 200 and not rows, f"HTTP {code} {str(out)[:200]}; kept: {rows if found == 200 else found}")
-    pairs = json.load(open(DOMAINS_FILE))
+    code, trait = metacatalog(eng, "GET", "/trait/DomainMember")
+    schema = trait.get("schema") if code == 200 and isinstance(trait, dict) else None
+    schema = json.loads(schema) if isinstance(schema, str) else schema
+    pairs = ((schema or {}).get("properties") or {}).get("domain", {}).get("x-subdomains")
+    if not isinstance(pairs, dict):
+        check("0h Meta Catalog's trait DomainMember lists each domain's subdomains (x-subdomains)", False,
+              f"HTTP {code} {str(trait)[:200]}")
+        return
     other = next((sub for d, subs in pairs.items() if d != DOMAIN for sub in subs if sub not in pairs.get(DOMAIN, [])), None)
     if other is None:
-        print(f"0h, 0i not run: metacatalog/domains.yaml has no subdomain outside the domain {DOMAIN}'s")
+        print(f"0h, 0i not run: the model has no subdomain outside the domain {DOMAIN}'s")
         return
     with tempfile.NamedTemporaryFile("wb", suffix=".yaml", delete=False) as f:
         f.write(table_doc(DOMAIN, other, WRONG_PAIR))
@@ -609,8 +618,22 @@ def cleanup(eng: str, both: str) -> None:
         check(f"Z1 the tables of the domain {DOMAIN} go out of Meta Catalog", False, repr(e)[:400])
 
 
+def tables_groups() -> None:
+    """The groups metacatalog/tables/smoke.yaml grants to, written out, must
+    be the site's engineer and analyst groups: the test's users are in
+    those, and another name would fail half the checks for a reason they do
+    not say. Stops before anything is made."""
+    import yaml
+    named = {p.get("id") for entry in yaml.safe_load_all(open(TABLES_FILE)) if entry
+             for p in (entry.get("values") or {}).get("principals") or [] if p.get("type") == "GROUP"}
+    if named != {ENGINEER, ANALYST}:
+        sys.exit(f"{TABLES_FILE} grants to the groups {', '.join(sorted(map(str, named)))}; the site's engineer and "
+                 f"analyst groups are {ENGINEER} and {ANALYST} (inventory/group_vars/all/site.yml): write those there")
+
+
 def main() -> None:
     eng, both = "smoke-eng", "smoke-both"
+    tables_groups()
     try:
         if fixture(eng):
             run()

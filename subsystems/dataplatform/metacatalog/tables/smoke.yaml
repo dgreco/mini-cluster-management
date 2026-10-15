@@ -1,5 +1,5 @@
-# The smoke test's tables (make dataplatform-smoke-test; their domain smoke:
-# metacatalog/domains.yaml): Meta Catalog makes every table and grants every one, so
+# The smoke test's tables (make dataplatform-smoke-test; their domain smoke,
+# of the model's trait DomainMember): Meta Catalog makes every table and grants every one, so
 # the test writes and reads tables of its own instead of making any. Their
 # policies are shaped for the checks, not for a real medallion:
 #
@@ -13,7 +13,9 @@
 #
 # The smoke test loads and provisions them on every run, authorizes them as
 # its temporary member of platform-admins, and takes them out of Meta Catalog
-# again at the end.
+# again at the end. The groups are the site's engineer and analyst groups
+# (site_engineer_group, site_analyst_group), written out: the test puts its
+# users in those and stops at once when this file names others.
 ref: "eng_t"
 entityType: "TableType"
 values:

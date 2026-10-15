@@ -19,15 +19,16 @@
 #              (TableType, one document each, `dependsOn` for their lineage:
 #              all of a file's tables are loaded together, or none when they
 #              are all there). A table's domain and subdomain must be a pair
-#              of metacatalog/domains.yaml (Meta Catalog checks each against
-#              its enum, not the pair). Once loaded, a table lives in Meta
-#              Catalog: change it there (UI or API), not in its file.
-# domains      brings the model's domains in Meta Catalog to
-#              metacatalog/domains.yaml (its copy domains.json, made by make
-#              configure): a new version of the trait DomainMember with its
-#              enums, then of TableType, whose schema is made from its traits
-#              when it is versioned. Tables keep the version they were made
-#              with. Nothing when they agree already.
+#              of the trait DomainMember in Meta Catalog (its x-subdomains;
+#              Meta Catalog checks each against its enum, not the pair). Once
+#              loaded, a table lives in Meta Catalog: change it there (UI or
+#              API), not in its file.
+# domains      sends the model file's trait DomainMember (the domains and
+#              their subdomains) to Meta Catalog, once its three lists agree:
+#              a new version of the trait, then of TableType, whose schema is
+#              made from its traits when it is versioned. Tables keep the
+#              version they were made with. Nothing when Meta Catalog has it
+#              already.
 # list         the tables, with what is provisioned and authorized
 # status       each table's folder and metastore table: provisioned?
 #              authorized for whom?
@@ -69,11 +70,9 @@ ROOT=$(cd "$HERE/../../.." && pwd)
 CLIENT=${CLIENT:-data-cli}
 API="$METACATALOG_URL/metacatalog/v1"
 MODEL=${TABLES_MODEL:-$ROOT/subsystems/dataplatform/metacatalog/table-model.yaml}
-# the pairs of metacatalog/domains.yaml, as make configure renders them for
-# the provisioning script
-DOMAINS=${TABLES_DOMAINS:-$ROOT/subsystems/dataplatform/gitops/manifests/governance/metacatalog/provisioning/domains.json}
 yes=false
-usage() { sed -n '2,61p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+# the header, from its second line to the first that is not a comment
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 while getopts l:yh opt; do
   case $opt in l) export KEYCLOAK_USER=$OPTARG ;; y) yes=true ;; *) usage ;; esac
 done
@@ -180,21 +179,102 @@ for entry in yaml.safe_load_all(open(sys.argv[1])):
     v = entry.get("values") or {}
     if entry.get("entityType") != "TableType":
         sys.exit(f"{sys.argv[1]}: a document of type {entry.get('entityType')!r}: only TableType "
-                 "(domains and subdomains are defined in metacatalog/domains.yaml)")
+                 "(domains and subdomains are the model's: its trait DomainMember)")
     print(json.dumps({"ref": "/".join(str(v.get(k)) for k in ("domain", "subdomain", "layer", "name")),
                       "domain": v.get("domain"), "subdomain": v.get("subdomain"),
                       "schema": any(p.get("entityType") == "TableSchemaType" for p in entry.get("parts") or [])}))
 PY
 }
 
-# Fails unless <domain>/<subdomain> is a pair of metacatalog/domains.yaml
+# The pairs a table may name: x-subdomains of the trait DomainMember as Meta
+# Catalog has it ({domain: [subdomains]}; the provisioning script asks the
+# same), in PAIRS; once per run
+PAIRS=""
+live_pairs() {
+  [ -z "$PAIRS" ] || return 0
+  api GET /trait/DomainMember
+  [ "$CODE" = 200 ] || fail "Meta Catalog has no trait DomainMember (HTTP $CODE): load the model first (dp-tables.sh load)"
+  PAIRS=$(jq -c '.schema | if type == "string" then fromjson else . end | .properties.domain["x-subdomains"] | objects' <<<"$BODY")
+  [ -n "$PAIRS" ] || fail "the trait DomainMember in Meta Catalog has no x-subdomains: dp-tables.sh domains sends the model's"
+}
+
+# Fails unless <domain>/<subdomain> is one of them
 known_pair() { # <what> <domain> <subdomain>
   local own
-  [ -r "$DOMAINS" ] || fail "no $DOMAINS: run make configure"
-  own=$(jq -r --arg d "$2" 'if has($d) then .[$d] | join(", ") else "" end' "$DOMAINS")
-  [ -n "$own" ] || fail "$1: domain '$2' is not one of metacatalog/domains.yaml ($(jq -r 'keys_unsorted | join(", ")' "$DOMAINS"))"
-  jq -e --arg d "$2" --arg s "$3" '.[$d] | index($s) != null' "$DOMAINS" >/dev/null \
-    || fail "$1: subdomain '$3' is not one of the domain $2's ($own; metacatalog/domains.yaml)"
+  live_pairs
+  own=$(jq -r --arg d "$2" 'if has($d) then .[$d] | join(", ") else "" end' <<<"$PAIRS")
+  [ -n "$own" ] || fail "$1: domain '$2' is not one of the model's in Meta Catalog ($(jq -r 'keys | join(", ")' <<<"$PAIRS"))"
+  jq -e --arg d "$2" --arg s "$3" '.[$d] | index($s) != null' <<<"$PAIRS" >/dev/null \
+    || fail "$1: subdomain '$3' is not one of the domain $2's ($own)"
+}
+
+# The model file's trait or entity type as Meta Catalog takes a new version
+# of it: its own schema (JSON text), its father and, for a type, its traits.
+# A new version must carry these, not the schema Meta Catalog answers with
+# (merged from the traits).
+model_part() { # <Traits|EntityTypes> <name>
+  "${PYTHON:-python3}" - "$MODEL" "$1" "$2" <<'PY'
+import json, sys
+try:
+    import yaml
+except ImportError:
+    sys.exit("PyYAML is needed to read the model: pip3 install pyyaml (requirements.txt)")
+model, section, name = sys.argv[1:4]
+found = {}
+for part in yaml.safe_load_all(open(model)):
+    for t in (part or {}).get(section) or []:
+        found[t["name"]] = t
+t = found.get(name) or sys.exit(f"{model}: no {section} entry {name}")
+out = {"name": t["name"], "schema": json.dumps(t.get("schema") or {"type": "object", "properties": {}}),
+       "inheritsFrom": t.get("inheritsFrom")}
+if section == "EntityTypes":
+    out["traits"] = t.get("traits") or []
+print(json.dumps(out))
+PY
+}
+
+# What is wrong with a DomainMember schema, a line each (nothing: it is
+# right). domain.enum lists the domains, domain.x-subdomains each domain's
+# own subdomains, subdomain.enum every one of those once; every name fits a
+# folder and a schema name; the smoke test's domain smoke has its test.
+domain_faults() { # <schema JSON>
+  jq -r '
+    def name: type == "string" and test("^[a-z][a-z0-9]{0,23}$");
+    (.properties.domain.enum // null) as $d
+    | (.properties.domain["x-subdomains"] // null) as $x
+    | (.properties.subdomain.enum // null) as $s
+    | if ($d | type) != "array" or ($x | type) != "object" or ($s | type) != "array" then
+        "it needs domain.enum (a list), domain.x-subdomains ({domain: [subdomains]}) and subdomain.enum (a list)"
+      else
+        ([$x[][]?] | unique) as $all
+        | (($d + $s + $all) | map(select(name | not)) | unique | .[]
+            | "\(tojson): names are lower-case letters and digits, a letter first, at most 24"),
+          ($x | to_entries[] | select((.value | type) != "array" or (.value | length) == 0)
+            | "domain \(.key): x-subdomains needs a list of its subdomains"),
+          (if ($d | sort) != ($x | keys) then
+             "domain.enum (\($d | join(", "))) is not the domains of x-subdomains (\($x | keys_unsorted | join(", ")))"
+           else empty end),
+          (if ($s | sort) != $all then
+             "subdomain.enum (\($s | join(", "))) is not every subdomain of x-subdomains once (\($all | join(", ")))"
+           else empty end),
+          ($d | map(select(IN("if", "then", "else", "not"))) | .[]
+            | "domain \(.): Meta Catalog refuses a schema with this keyword in it, as a key of x-subdomains too"),
+          (if ($x.smoke // [] | index("test")) == null then
+             "the domain smoke with its subdomain test is the smoke test'"'"'s: keep it" else empty end)
+      end' <<<"$1"
+}
+
+# Fails unless the model file's trait DomainMember is right (domain_faults)
+model_domains() {
+  local faults
+  faults=$(domain_faults "$(model_part Traits DomainMember | jq -r .schema)")
+  [ -z "$faults" ] || fail "$MODEL, trait DomainMember:"$'\n'"$faults"
+}
+
+# Whether two schemas say the same of domain and subdomain (Meta Catalog
+# answers with the keys of an object in another order)
+same_domains() { # <schema JSON> <schema JSON>
+  jq -en --argjson a "$1" --argjson b "$2" '[$a, $b] | map(.properties | {domain, subdomain}) | .[0] == .[1]' >/dev/null
 }
 
 load_model() {
@@ -206,7 +286,13 @@ load_model() {
   done
   if [ "$missing" -eq 0 ]; then
     echo "model: already in Meta Catalog ($present entity types)"
+    api GET /trait/DomainMember
+    if [ "$CODE" = 200 ] && ! same_domains "$(jq -c '.schema | if type == "string" then fromjson else . end' <<<"$BODY")" \
+         "$(model_part Traits DomainMember | jq -r .schema)"; then
+      echo "model: its domains (the trait DomainMember) are not those of $MODEL: tables are checked against Meta Catalog's (dp-tables.sh domains sends the file's)"
+    fi
   elif [ "$present" -eq 0 ]; then
+    model_domains
     api POST /bulk-creation -H 'Content-Type: application/octet-stream' --data-binary @"$MODEL"
     [ "$CODE" = 204 ] || fail "loading the model: HTTP $CODE: $BODY"
     echo "model: loaded ($missing entity types, their traits, relationships and mappings)"
@@ -259,74 +345,33 @@ load() {
 }
 
 # ---------------------------------------------------------------- domains ----
-# The trait DomainMember as metacatalog/domains.yaml wants it (its copy
-# domains.json), from the live trait: the enums and their descriptions, in
-# the order of the file, as make configure renders them into the model
-domain_member_schema() { # <live trait schema JSON>
-  jq -c --argjson d "$(cat "$DOMAINS")" '
-    ([$d[]] | add | reduce .[] as $s ([]; if index([$s]) then . else . + [$s] end)) as $subs
-    | .properties.domain.enum = ($d | keys_unsorted)
-    | .properties.domain.description = "One of: " + ($d | keys_unsorted | join(", "))
-    | .properties.subdomain.enum = $subs
-    | .properties.subdomain.description = "One of its domain'"'"'s: "
-        + ([$d | to_entries[] | "\(.key) (\(.value | join(", ")))"] | join("; "))' <<<"$1"
-}
-
-# TableType as the model file defines it: its own schema (JSON text), its
-# traits and its father. A new version must carry these, not the schema
-# Meta Catalog answers with (merged from its traits).
-model_type() { # <name>
-  "${PYTHON:-python3}" - "$MODEL" "$1" <<'PY'
-import json, sys
-try:
-    import yaml
-except ImportError:
-    sys.exit("PyYAML is needed to read the model: pip3 install pyyaml (requirements.txt)")
-types = {}
-for part in yaml.safe_load_all(open(sys.argv[1])):
-    for t in (part or {}).get("EntityTypes") or []:
-        types[t["name"]] = t
-t = types.get(sys.argv[2]) or sys.exit(f"{sys.argv[1]}: no entity type {sys.argv[2]}")
-print(json.dumps({"name": t["name"], "schema": json.dumps(t.get("schema") or {"type": "object", "properties": {}}),
-                  "traits": t.get("traits") or [], "inheritsFrom": t.get("inheritsFrom")}))
-PY
-}
-
-# Whether a schema's enums are those of domains.json (as sets)
-same_domains() { # <schema JSON>
-  jq -en --argjson a "$1" --argjson d "$(cat "$DOMAINS")" \
-    '(($a.properties.domain.enum // []) | sort) == ($d | keys | sort)
-     and (($a.properties.subdomain.enum // []) | sort) == ([$d[]] | add | unique)' >/dev/null
-}
-
 domains() {
-  local trait live body type merged versioned=false
-  [ -r "$DOMAINS" ] || fail "no $DOMAINS: run make configure"
+  local want live body merged type versioned=false
+  model_domains
+  want=$(model_part Traits DomainMember)
   api GET /trait/DomainMember
   [ "$CODE" = 200 ] || fail "Meta Catalog has no trait DomainMember (HTTP $CODE): load the model first (dp-tables.sh load)"
-  trait=$BODY
-  live=$(jq -c '.schema | if type == "string" then fromjson else . end' <<<"$trait")
-  if ! same_domains "$live"; then
-    body=$(jq -cn --argjson t "$trait" --argjson w "$(domain_member_schema "$live")" \
-      '{name: "DomainMember", schema: ($w | tojson)} + (if $t.inheritsFrom then {inheritsFrom: $t.inheritsFrom} else {} end)')
+  live=$(jq -c '.schema | if type == "string" then fromjson else . end' <<<"$BODY")
+  if ! same_domains "$live" "$(jq -r .schema <<<"$want")"; then
+    body=$(jq -c 'if .inheritsFrom == null then del(.inheritsFrom) else . end' <<<"$want")
     api POST /trait/DomainMember/versions -H 'Content-Type: application/json' -d "$body"
     [[ $CODE == 20[01] ]] || fail "a new version of the trait DomainMember: HTTP $CODE: $BODY"
-    echo "trait DomainMember: version $(jq -r '.version // "?"' <<<"$BODY"), domains $(jq -r 'keys_unsorted | join(", ")' "$DOMAINS")"
+    echo "trait DomainMember: version $(jq -r '.version // "?"' <<<"$BODY"), domains $(jq -r '.schema | fromjson | .properties.domain.enum | join(", ")' <<<"$want")"
     versioned=true
   fi
   # a type's schema is merged from its traits' when it is made or versioned:
-  # TableType takes the new enums with a version of its own
+  # TableType takes the new trait with a version of its own
   api GET /entity-type/TableType
   [ "$CODE" = 200 ] || fail "Meta Catalog has no entity type TableType (HTTP $CODE): load the model first (dp-tables.sh load)"
   merged=$(jq -c '.schema | if type == "string" then fromjson else . end' <<<"$BODY")
-  if $versioned || ! same_domains "$merged"; then
-    type=$(model_type TableType)
+  if $versioned || ! same_domains "$merged" "$(jq -r .schema <<<"$want")"; then
+    type=$(model_part EntityTypes TableType)
     body=$(jq -c 'if .inheritsFrom == null then del(.inheritsFrom) else . end' <<<"$type")
     api POST /entity-type/TableType/versions -H 'Content-Type: application/json' -d "$body"
     [[ $CODE == 20[01] ]] || fail "a new version of TableType: HTTP $CODE: $BODY (the trait is up to date: dp-tables.sh domains again)"
     echo "entity type TableType: version $(jq -r '.version // "?"' <<<"$BODY"): new tables take these domains; tables made before keep theirs"
   else
-    echo "domains: Meta Catalog has those of metacatalog/domains.yaml already ($(jq -r 'keys_unsorted | join(", ")' "$DOMAINS"))"
+    echo "domains: Meta Catalog has the model's already ($(jq -r '.schema | fromjson | .properties.domain.enum | join(", ")' <<<"$want"))"
   fi
 }
 
