@@ -7,9 +7,9 @@
 # is provisioned and the subject of authorization (its root carries the access
 # policy: principals, permissions, grants). What a table says about itself:
 #
-#   domain, subdomain   where it belongs (the entities DomainType and
-#                       SubdomainType hold it: Domain HAS_PART Subdomain
-#                       HAS_PART Table)
+#   domain, subdomain   where it belongs: one of the domains of
+#                       metacatalog/domains.yaml and one of that domain's
+#                       subdomains (enums, rendered from it)
 #   layer               its place in the medallion: bronze, silver or gold
 #   format              how its files are written: parquet, avro or iceberg
 #   name, description, owner
@@ -40,34 +40,15 @@
 # column names) '_'; the provisioning script checks them again.
 
 Traits:
-  # A domain of the business, and one of its subdomains. The relationships
-  # below let a domain hold subdomains and a subdomain hold tables.
-  - name: DataDomain
-    schema:
-      type: object
-      required: [name]
-      properties:
-        name:
-          type: string
-          pattern: "^[a-z][a-z0-9]{0,23}$"
-        description:
-          type: string
-        owner:
-          type: string
-
-  - name: DataSubdomain
-    schema:
-      type: object
-      required: [name]
-      properties:
-        name:
-          type: string
-          pattern: "^[a-z][a-z0-9]{0,23}$"
-        description:
-          type: string
-
   # Whatever belongs to a subdomain of a domain says which, by name: the
   # mappings build the folder and the schema name from these two values.
+  # Both are enums of metacatalog/domains.yaml, rendered by make configure
+  # (Meta Catalog's form shows them as drop-downs); after a change there,
+  # make dataplatform-tables ARGS=domains brings Meta Catalog to it. Meta
+  # Catalog merges only the properties of a type's traits into its schema,
+  # so no rule can tie the subdomain to its domain here: make
+  # dataplatform-tables checks it at load, the provisioning script before it
+  # makes anything.
   - name: DomainMember
     schema:
       type: object
@@ -75,10 +56,12 @@ Traits:
       properties:
         domain:
           type: string
-          pattern: "^[a-z][a-z0-9]{0,23}$"
+          description: "One of: <%= dataplatform_configure_domains | list | join(', ') %>"
+          enum: <%= dataplatform_configure_domains | list | to_json %>
         subdomain:
           type: string
-          pattern: "^[a-z][a-z0-9]{0,23}$"
+          description: "One of its domain's: <% for name, domain in dataplatform_configure_domains.items() %><%= name %> (<%= domain.subdomains | list | join(', ') %>)<%= '; ' if not loop.last else '' %><% endfor %>"
+          enum: <%= dataplatform_configure_domains.values() | map(attribute='subdomains') | map('list') | flatten | unique | to_json %>
 
   # A named set of data; the lineage relationship below is between datasets.
   - name: Dataset
@@ -143,14 +126,6 @@ Traits:
 ---
 Relationships:
 
-  - sourceTrait: DataDomain
-    relationshipType: HAS_PART
-    targetTrait: DataSubdomain
-
-  - sourceTrait: DataSubdomain
-    relationshipType: HAS_PART
-    targetTrait: DomainMember
-
   # Lineage: a silver table depends on the bronze one it is built from.
   - sourceTrait: Dataset
     relationshipType: DEPENDS_ON
@@ -158,22 +133,6 @@ Relationships:
 
 ---
 EntityTypes:
-
-  # Neither is part of an aggregate: they only hold what belongs to them, so
-  # a table stays an aggregate of its own under its subdomain.
-  - name: DomainType
-    schema:
-      type: object
-      properties: {}
-    traits:
-      - DataDomain
-
-  - name: SubdomainType
-    schema:
-      type: object
-      properties: {}
-    traits:
-      - DataSubdomain
 
   # The table: the aggregate root. Provisionable, and Authorizable: its
   # principals, permissions and grants are the one access policy of its folder

@@ -341,7 +341,8 @@ dataplatform-spark-submit: ## Run a PySpark job as yourself (Keycloak login, the
 .PHONY: dataplatform-tables
 dataplatform-tables: ## Tables in Meta Catalog: load, provision (folder, Hive Metastore), authorize (admin group), status, delete
 	@subsystems/dataplatform/files/dp-tables.sh $(ARGS)
-##> make dataplatform-tables ARGS="load subsystems/dataplatform/metacatalog/domains/retail.yaml subsystems/dataplatform/metacatalog/tables/retail.yaml"   the model, a domain, its tables
+##> make dataplatform-tables ARGS="load subsystems/dataplatform/metacatalog/tables/retail.yaml"   the model, then the tables of a file
+##> make dataplatform-tables ARGS=domains                           Meta Catalog's domains brought to metacatalog/domains.yaml
 ##> make dataplatform-tables ARGS="provision retail"                each table's folder, then the table in the metastore (through Trino)
 ##> make dataplatform-tables ARGS="authorize retail/analytics"      their grants -> Ceph and Trino (the admin group only)
 ##> make dataplatform-tables ARGS="status retail/orders/silver/orders"   what is provisioned, and for whom

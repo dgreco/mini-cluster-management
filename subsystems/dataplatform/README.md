@@ -118,7 +118,7 @@ Until October 2026 the platform kept Iceberg tables only, in a JDBC catalog (Pos
    ```bash
    git show <the commit before this change>:subsystems/dataplatform/metacatalog/medallion-model.yaml > /tmp/medallion-model.yaml
    make dataplatform-tables ARGS="unload-model /tmp/medallion-model.yaml"     # its mappings, entity types, relationship and traits
-   make dataplatform-tables ARGS="load subsystems/dataplatform/metacatalog/domains/retail.yaml subsystems/dataplatform/metacatalog/tables/retail.yaml"
+   make dataplatform-tables ARGS="load subsystems/dataplatform/metacatalog/tables/retail.yaml"
    ```
 5. `make dataplatform-smoke-test`.
 6. Remove the old catalog. Argo CD removes its Application and leaves what it made (it holds a database); the Secrets it had in `compute` go by themselves:
@@ -272,18 +272,19 @@ where `token` is `os.environ["KEYCLOAK_TOKEN"]` (or a token of the client `data-
 **Tables in Meta Catalog.** A table is modelled in Meta Catalog, and Meta Catalog builds it and decides who may use it:
 
 ```
-domain (DomainType)  >  subdomain (SubdomainType)  >  table (TableType: name, layer, format, principals / permissions / grants)
+table (TableType: domain, subdomain, name, layer, format, principals / permissions / grants)
   the table      ->  its folder          s3://dataplatform/lakehouse/<domain>/<subdomain>/<layer>/<table>
   its schema     ->  the metastore table lakehouse.<domain>_<subdomain>_<layer>.<table>   (the columns; in the table's format)
 ```
 
 - **A table is an aggregate of its own**: the unit you provision and authorize. It says where it belongs (domain, subdomain), its layer (`bronze`, `silver`, `gold`), its format (`parquet`, `avro`, `iceberg`) and its policy. Its columns are its one part, the schema. `dependsOn` records what it is built from (lineage).
-- **The model** (`metacatalog/table-model.yaml`: traits, relationships, entity types, mappings) and the examples (`metacatalog/domains/*.yaml`, `metacatalog/tables/*.yaml`) are Meta Catalog documents. The mappings derive the two physical resources of a table (`S3FolderType`, `HiveTableType`); Meta Catalog's `script` provisioning task runs `gitops/manifests/governance/metacatalog/provisioning/table.sh` for each of them.
+- **Domains and subdomains are fixed lists**, defined once in `metacatalog/domains.yaml`: each domain with its own subdomains. A table names one domain and one of that domain's subdomains, which Meta Catalog's form offers as two drop-downs. Meta Catalog itself checks each value against its list but not the pair, so a subdomain of another domain gets past its form. `make dataplatform-tables ARGS="load …"` refuses such a table, and so does provisioning, before anything is made.
+- **The model** (`metacatalog/table-model.yaml`: traits, relationships, entity types, mappings) and the example tables (`metacatalog/tables/*.yaml`) are Meta Catalog documents. `make configure` writes the two lists into the model from `metacatalog/domains.yaml`. The mappings derive the two physical resources of a table (`S3FolderType`, `HiveTableType`); Meta Catalog's `script` provisioning task runs `gitops/manifests/governance/metacatalog/provisioning/table.sh` for each of them.
 
 From the repository root (a device login of yours, like `dataplatform-s3-login`):
 
 ```bash
-make dataplatform-tables ARGS="load subsystems/dataplatform/metacatalog/domains/retail.yaml subsystems/dataplatform/metacatalog/tables/retail.yaml"
+make dataplatform-tables ARGS="load subsystems/dataplatform/metacatalog/tables/retail.yaml"
 make dataplatform-tables ARGS="provision retail"                      # every table of the domain: its folder, then the table in the metastore
 make dataplatform-tables ARGS="authorize retail/analytics"            # the grants of a subdomain's tables -> Ceph and Trino (platform-admins only)
 make dataplatform-tables ARGS="status retail/orders/silver/orders"    # one table: provisioned, authorized, for whom
@@ -292,7 +293,12 @@ make dataplatform-tables ARGS=list                                    # every ta
 
 A command takes one table, `<domain>/<subdomain>/<layer>/<table>`, or every table under a domain, a subdomain or a layer.
 
-- **Load** sends the model (once), then the files: domains with their subdomains, or tables. A table's subdomain must be there first; the table is then put under it. From then on a table lives in Meta Catalog: change it in the UI or the API, then provision or authorize again. The file is not read again.
+- **Load** sends the model (once), then the files of tables. A table whose domain and subdomain are not a pair of `metacatalog/domains.yaml` is refused. From then on a table lives in Meta Catalog: change it in the UI or the API, then provision or authorize again. The file is not read again.
+- **A new domain or subdomain**: add it to `metacatalog/domains.yaml`, then
+  1. `make configure`, and commit and push: provisioning reads its copy of the list from Git;
+  2. after `make dataplatform-sync`, `make dataplatform-tables ARGS=domains`. It gives Meta Catalog's lists a new version, and new tables can use the addition.
+
+  Tables made before keep the lists they were made with. Taking a domain or subdomain out stops provisioning there; its tables can still be unprovisioned, rejected and deleted.
 - **Provision** makes the table's folder (as the provisioner's own STS role, with temporary keys), then registers the table in the Hive Metastore through Trino, as the Keycloak service account of the client `metacatalog-provisioner`: the only user Trino lets create, alter or drop. The schema `<domain>_<subdomain>_<layer>` is made with its first table.
   - `iceberg` makes an Iceberg table; `parquet` and `avro` make a table over plain files in the folder.
   - Running it again adds the columns the schema gained. A changed column type, another format, or a table found at another place fails the resource: no data is rewritten.
@@ -307,7 +313,7 @@ A command takes one table, `<domain>/<subdomain>/<layer>/<table>`, or every tabl
   **Only members of `platform-admins` may authorize** (in the UI and through the API; a gate in front of Meta Catalog answers everyone else 403). Every member of `platform-admins` and `data-engineers` may edit a table's policy, so an edit is a proposal until an administrator authorizes it; check the policy before you do, it is applied as it is at that moment. Authorize writes the grants into the record of grants (ConfigMap `governance/metacatalog-grants`, two keys per table) and gives the Ceph roles the folder at once; iam-sync updates Trino's mapping and the Open Policy Agent's rules within a minute. Provisioning and unprovisioning have no such gate beyond those two groups: see *Known limits*.
 - **Reject** withdraws all of the table's grants the same way (`platform-admins` only).
 - **Unprovision** drops the table and deletes the files in its folder (it asks first). It removes only what exists outside Meta Catalog. The table stays in Meta Catalog with its two mapped resources, its folder and its table in the metastore, now marked `UNPROVISIONED`, and the next *Provision* makes them again. A table that was never provisioned has nothing to remove: its unprovision succeeds and changes nothing.
-- **Delete** takes a table out of Meta Catalog, with its schema, its two mapped resources and its place under its subdomain. It takes only a table that is unprovisioned and rejected, so that nothing of it is left behind. Its domain and subdomain stay.
+- **Delete** takes a table out of Meta Catalog, with its schema, its two mapped resources and its lineage. It takes only a table that is unprovisioned and rejected, so that nothing of it is left behind.
 - **A table's names are for good.** Domain, subdomain, layer and name make its folder and its name in Trino. Changing them in Meta Catalog does not move anything: make another table instead.
 - In Meta Catalog, AUTHORIZED means *in force*: the record and the roles changed in the same run.
 
@@ -633,7 +639,8 @@ snapshot. After a restore, `make dataplatform-sync` refreshes the Secrets and
 - **A job's account has every verb on the pods, ConfigMaps and Services of `compute`** (the Spark operator's role cannot be narrower: a driver makes its executors). Admission policies keep it off what decides who may do what: `dataplatform-compute-configmaps` (Trino's group file and S3 mapping `trino-iam`, its configuration, the discovery ConfigMaps, the cleanup job's program), `dataplatform-compute-pods` (it changes and deletes only its own pods), `dataplatform-compute-pod-labels` and `dataplatform-compute-services` (no pod of a job passes for Trino's or takes its users' requests). A job can still list the pods and read the ConfigMaps of `compute`, the other users' job code among them.
 - **A `parquet` or `avro` table takes `SELECT` and `INSERT` in Trino, nothing else.** No `UPDATE`, `DELETE` or `MERGE`: replace its files, or make it `iceberg`.
 - **Meta Catalog itself has no roles.** oauth2-proxy in front of it lets only `platform-admins` and `data-engineers` in (UI and API), and every one of them may edit, provision and unprovision any table. Only `platform-admins` may authorize and reject (the gate in the proxy's pod), but unprovisioning drops a table and deletes its files at once. Meta Catalog does not refuse a second table with the same domain, subdomain, layer and name: both derive the same folder and the same table in Trino, so unprovisioning one takes the other's data.
-- **A table deleted in the UI must be let go first.** Meta Catalog refuses to delete a table that is under a subdomain or has lineage, until those links are removed; `make dataplatform-tables ARGS="delete <table>"` does both, and refuses a table that is still provisioned or authorized. Deleting never unprovisions.
+- **A table deleted in the UI must be let go first.** Meta Catalog refuses to delete a table that has lineage (`dependsOn`, either way) until those links are removed; `make dataplatform-tables ARGS="delete <table>"` removes them first, and refuses a table that is still provisioned or authorized. Deleting never unprovisions.
+- **A subdomain of another domain gets past Meta Catalog.** Meta Catalog keeps no rule that ties two values together, so its form and its API take a table whose subdomain belongs to another domain (both are in their lists). Loading it with `make dataplatform-tables` is refused, and so is provisioning it, before anything is made: delete such a table, or change its subdomain before it is provisioned.
 - **A table that did not get its resources.** Meta Catalog derives a table's folder and metastore table a second after it is loaded. If that fails (its log says why), nothing shows it but the missing resources: `make dataplatform-tables` reports it at the load, and the remedy is to delete the table and load it again.
 - **A role's policy grows with every table granted.** Grants are per table, so a group granted many tables gets a long policy; Ceph limits its size. At tens of tables per group this is far away; at hundreds it is not.
 - **Roles:** a user's own role does not include their groups' folders, and a group role not the user's own.

@@ -1,5 +1,5 @@
-# The smoke test's tables (make dataplatform-smoke-test; their domain:
-# domains/smoke.yaml): Meta Catalog makes every table and grants every one, so
+# The smoke test's tables (make dataplatform-smoke-test; their domain smoke:
+# metacatalog/domains.yaml): Meta Catalog makes every table and grants every one, so
 # the test writes and reads tables of its own instead of making any. Their
 # policies are shaped for the checks, not for a real medallion:
 #
@@ -11,9 +11,9 @@
 #                               and nothing in the metastore (the S3 checks' objects)
 #   gold    ana_t      parquet  <%= site_analyst_group %> read and write
 #
-# The smoke test loads and provisions them when they are missing, and
-# authorizes them on every run as its temporary member of <%= site_admin_group %>. The tables
-# are emptied at every run.
+# The smoke test loads and provisions them on every run, authorizes them as
+# its temporary member of <%= site_admin_group %>, and takes them out of Meta Catalog
+# again at the end.
 ref: "eng_t"
 entityType: "TableType"
 values:

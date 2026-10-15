@@ -73,6 +73,20 @@ NAME='^[a-z][a-z0-9]{0,23}$'
 [[ $LAYER =~ ^(bronze|silver|gold)$ ]] || fail "layer '$LAYER': bronze, silver or gold"
 [[ $TABLE =~ ^[a-z][a-z0-9_]{0,62}$ ]] || fail "table name '$TABLE': lower-case letters, digits and _"
 
+# A table is made only under one of its domain's own subdomains (domains.json,
+# rendered from metacatalog/domains.yaml): Meta Catalog checks the domain and
+# the subdomain each against its enum, not the pair. On provision only: the
+# tables of a pair taken out of the definition must still be unprovisioned,
+# rejected and deleted.
+if [ "$OPERATION" = provision ]; then
+  DOMAINS_FILE="$HERE/domains.json"
+  SUBDOMAINS=$(jq -r --arg d "$DOMAIN" 'if has($d) then .[$d] | join(", ") else "" end' "$DOMAINS_FILE") \
+    || fail "the domains' definition $DOMAINS_FILE cannot be read: nothing is made"
+  [ -n "$SUBDOMAINS" ] || fail "domain '$DOMAIN' is not one of metacatalog/domains.yaml: nothing is made"
+  jq -e --arg d "$DOMAIN" --arg s "$SUBDOMAIN" '.[$d] | index($s) != null' "$DOMAINS_FILE" >/dev/null \
+    || fail "subdomain '$SUBDOMAIN' is not one of the domain $DOMAIN's ($SUBDOMAINS; metacatalog/domains.yaml): nothing is made"
+fi
+
 # where the table is, said by its names alone
 LAYER_DIRECTORY="$LAKEHOUSE_PREFIX/$DOMAIN/$SUBDOMAIN/$LAYER"
 WANT_DIRECTORY="$LAYER_DIRECTORY/$TABLE"

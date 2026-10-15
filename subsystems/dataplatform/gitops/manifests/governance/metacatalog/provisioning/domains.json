@@ -1,0 +1,4 @@
+{
+  "retail": ["orders", "customers", "payments", "analytics"],
+  "smoke": ["test"]
+}

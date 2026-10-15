@@ -1,0 +1,38 @@
+# The domains of the business and, for each, its subdomains: the only ones a
+# table may name. This file is their one definition. make configure renders
+# from it the enums of the model's trait DomainMember (table-model.yaml: the
+# drop-downs of Meta Catalog's form) and the provisioning script's copy
+# (gitops/manifests/governance/metacatalog/provisioning/domains.json).
+#
+# Meta Catalog checks each enum on its own: it keeps no rule that ties two
+# properties together. That a table's subdomain is one of its domain's is
+# checked by make dataplatform-tables at load, and by the provisioning
+# script before it makes anything.
+#
+# After a change: make configure, commit and push (Argo CD gives the
+# provisioning script its new copy), then
+#
+#   make dataplatform-tables ARGS=domains
+#
+# brings the model in Meta Catalog to it: a new version of the trait and of
+# TableType. A table keeps the version it was made with. A pair taken out
+# here can no longer be provisioned; its tables can still be unprovisioned,
+# rejected and deleted.
+#
+# Names: lower-case letters and digits, a letter first, at most 24, no '_'.
+# They become part of every table's folder and schema name
+# (lakehouse/<domain>/<subdomain>/..., <domain>_<subdomain>_<layer>). A
+# subdomain name may repeat in another domain. The domain smoke, with its
+# subdomain test, is the smoke test's own (make dataplatform-smoke-test):
+# make configure refuses this file without it.
+retail:
+  description: "The shop: what it sells, to whom, and what it is paid"
+  subdomains:
+    orders: "Orders as the web shop takes them"
+    customers: "Who buys: the CRM's customers"
+    payments: "What was paid, from the payments database"
+    analytics: "What the business reads: revenue, customer value"
+smoke:
+  description: "The tables of make dataplatform-smoke-test"
+  subdomains:
+    test: "Made, used and taken out again at every run"

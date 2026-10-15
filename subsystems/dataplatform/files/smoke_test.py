@@ -9,19 +9,22 @@ engineer and the admin group, last: the gate must find it among
 several groups; it authorizes the tables).
 
 Everything happens in the smoke test's own tables, the domain smoke
-(metacatalog/domains/smoke.yaml, metacatalog/tables/smoke.yaml), which only
+(metacatalog/domains.yaml, metacatalog/tables/smoke.yaml), which only
 Meta Catalog creates and whose policies grant the engineer group the bronze
 tables (the analyst group may read one of them) and the analyst group the
 gold one (the site's groups: ADMIN_GROUP, ENGINEER_GROUP, ANALYST_GROUP). 0
 loads the model (metacatalog/table-model.yaml) when Meta Catalog lacks it,
-the domain and the tables as make dataplatform-tables does (with its script,
+and the tables as make dataplatform-tables does (with its script,
 DP_TABLES), and provisions them: a platform built from scratch needs no step
 before this test. Z takes them out again at the end of every run, passed or
 failed, so no grant of the test stays in the record.
 
 0  Meta Catalog lets the engineer in and refuses the analyst (only
-   the admin and engineer groups); the tables: in Meta Catalog, each under
-   its subdomain, provisioned in their three formats; the engineer may not
+   the admin and engineer groups); the tables: in Meta Catalog, provisioned
+   in their three formats; a domain outside metacatalog/domains.yaml is
+   refused by Meta Catalog, a subdomain of another domain (which passes its
+   two enums) by make dataplatform-tables at load and by the provisioning
+   script, which makes nothing; the engineer may not
    authorize one (only the admin group: the gate, also against tricks with
    the path and a forged groups header), the administrator may, and their
    grants are in force within minutes.
@@ -65,10 +68,10 @@ F  the directory is the only source of people, and only its administrators
    interface (DIRECTORY_UI_URL, LDAP Account Manager) is reached through a
    Keycloak login by the administrator alone, who then logs in to it with
    the same directory account.
-Z  the domain smoke goes out of Meta Catalog: the administrator rejects its
-   tables (their keys leave the record of grants), the engineer unprovisions
-   them (the metastore's tables and the files go) and deletes them, then its
-   subdomain and the domain.
+Z  the tables of the domain smoke go out of Meta Catalog: the administrator
+   rejects them (their keys leave the record of grants), the engineer
+   unprovisions them (the metastore's tables and the files go) and deletes
+   them.
 Reads use sum(), not count(*) (answered from Iceberg statistics, no data read).
 Prints one line per check and exits 1 when any check fails.
 """
@@ -104,8 +107,8 @@ ADMIN, ENGINEER, ANALYST = os.environ["ADMIN_GROUP"], os.environ["ENGINEER_GROUP
 LABEL_DOMAIN = os.environ["LABEL_DOMAIN"]               # the platform's label keys: <it>/user
 METACATALOG = os.environ["METACATALOG_URL"].rstrip("/") + "/metacatalog/v1"
 TABLES = os.environ["DP_TABLES"]                       # files/dp-tables.sh
-DOMAIN, SUBDOMAIN = "smoke", "test"                    # metacatalog/domains/smoke.yaml
-DOMAIN_FILE = os.environ["SMOKE_DOMAIN_FILE"]
+DOMAIN, SUBDOMAIN = "smoke", "test"                    # metacatalog/domains.yaml
+DOMAINS_FILE = os.environ["SMOKE_DOMAINS_FILE"]        # its pairs, as make configure renders them (domains.json)
 TABLES_FILE = os.environ["SMOKE_TABLES_FILE"]          # metacatalog/tables/smoke.yaml
 MODEL_FILE = os.environ["SMOKE_MODEL_FILE"]            # metacatalog/table-model.yaml
 ROOT = f"lakehouse/{DOMAIN}/{SUBDOMAIN}"               # where its tables' folders are, under the bucket
@@ -358,18 +361,13 @@ def fixture(eng: str) -> bool:
             check(f"0c the tables of the domain {DOMAIN} are in Meta Catalog", False,
                   f"{have} of {EXPECTED} only: finish or undo that by hand (make dataplatform-tables)")
             return False
-        ok, out = tables_tool(eng, "load", DOMAIN_FILE, TABLES_FILE)
-        check(f"0c Meta Catalog loads the model ({len(names)} entity types), the domain {DOMAIN} and its "
-              f"{len(EXPECTED)} tables", ok, out[-400:])
+        ok, out = tables_tool(eng, "load", TABLES_FILE)
+        check(f"0c Meta Catalog loads the model ({len(names)} entity types) and the {len(EXPECTED)} tables "
+              f"of the domain {DOMAIN}", ok, out[-400:])
         if not ok:
             return False
         code, rows = entities(eng, "TableType", f'@.domain == "{DOMAIN}"')
     by_name = {r["values"]["name"]: r["id"] for r in rows}
-    # every table is under its subdomain
-    code, held = metacatalog(eng, "GET", f"/entity/link/{by_name['eng_t']}/IS_PART_OF")
-    under = [(h.get("values") if isinstance(h.get("values"), dict) else json.loads(h.get("values") or "{}")).get("name")
-             for h in held if h.get("entityType") == "SubdomainType"] if code == 200 else []
-    check(f"0c the table eng_t belongs to the subdomain {DOMAIN}/{SUBDOMAIN}", under == [SUBDOMAIN], f"HTTP {code} {under}")
     ok, out = tables_tool(eng, "provision", DOMAIN)
     check(f"0c Meta Catalog provisions them ({len(EXPECTED)} folders, {len(EXPECTED) - 1} tables in the metastore: "
           "iceberg, avro, parquet)", ok, out[-600:])
@@ -420,8 +418,73 @@ def fixture(eng: str) -> bool:
     check(f"0e the grants on the tables are in force (Trino), for each user", not missing, "; ".join(missing)[:400])
     if missing:
         return False
-    time.sleep(90)
+    started = time.time()
+    domain_rules(eng, adm)
+    time.sleep(max(0, 90 - (time.time() - started)))
     return True
+
+
+WRONG_PAIR = "wrong_pair"       # 0i's table: in Meta Catalog, never provisioned (Z1 deletes it)
+
+
+def table_doc(domain: str, subdomain: str, name: str) -> bytes:
+    """A table of the smoke test's shape without a schema (a folder only), as
+    an aggregate document"""
+    return (f'ref: "{name}"\nentityType: "TableType"\nvalues:\n  name: "{name}"\n'
+            f'  description: "A check of the domains"\n  domain: "{domain}"\n  subdomain: "{subdomain}"\n'
+            f'  layer: "bronze"\n  format: "parquet"\n'
+            f'  principals:\n    - {{ id: "{ENGINEER}", type: "GROUP" }}\n'
+            f'  permissions:\n    - {{ name: "READ", description: "Read its files" }}\n'
+            f'  grants:\n    - {{ principals: ["{ENGINEER}"], permissions: ["READ"] }}\n').encode()
+
+
+def domain_rules(eng: str, adm: str) -> None:
+    """A table's domain and subdomain are a pair of metacatalog/domains.yaml.
+    Meta Catalog refuses a domain outside its enum; a subdomain of another
+    domain passes its two enums (it keeps no rule across two properties), so
+    make dataplatform-tables refuses it at load, and the provisioning script
+    before it makes anything."""
+    code, out = metacatalog(eng, "POST", "/aggregate/yaml", table_doc("nosuchdomain", SUBDOMAIN, "bad_domain"),
+                            ctype="application/octet-stream")
+    found, rows = entities(eng, "TableType", '@.name == "bad_domain"')
+    check("0g Meta Catalog refuses a table whose domain is not one of metacatalog/domains.yaml, and keeps nothing",
+          400 <= code < 500 and found == 200 and not rows, f"HTTP {code} {str(out)[:200]}; kept: {rows if found == 200 else found}")
+    pairs = json.load(open(DOMAINS_FILE))
+    other = next((sub for d, subs in pairs.items() if d != DOMAIN for sub in subs if sub not in pairs.get(DOMAIN, [])), None)
+    if other is None:
+        print(f"0h, 0i not run: metacatalog/domains.yaml has no subdomain outside the domain {DOMAIN}'s")
+        return
+    with tempfile.NamedTemporaryFile("wb", suffix=".yaml", delete=False) as f:
+        f.write(table_doc(DOMAIN, other, WRONG_PAIR))
+    try:
+        ok, out = tables_tool(eng, "load", f.name)
+    finally:
+        os.unlink(f.name)
+    found, rows = entities(eng, "TableType", f'@.name == "{WRONG_PAIR}"')
+    check(f"0h make dataplatform-tables refuses to load {DOMAIN}/{other} (a subdomain of another domain)",
+          not ok and "is not one of the domain" in out and found == 200 and not rows, out[-300:])
+    # straight through the API, where Meta Catalog's two enums let it in
+    code, out = metacatalog(eng, "POST", "/aggregate/yaml", table_doc(DOMAIN, other, WRONG_PAIR),
+                            ctype="application/octet-stream")
+    if code != 204:
+        check(f"0i Meta Catalog takes {DOMAIN}/{other} through its API (each enum on its own)", False,
+              f"HTTP {code} {str(out)[:200]}")
+        return
+    end, folders = time.time() + 60, []            # derivation is asynchronous
+    while time.time() < end:
+        found, folders = entities(eng, "S3FolderType", f'@.domain == "{DOMAIN}" && @.subdomain == "{other}"'
+                                                         f' && @.table == "{WRONG_PAIR}"')
+        if found == 200 and folders:
+            break
+        time.sleep(2)
+    if not folders:
+        check(f"0i Meta Catalog derives the folder of {DOMAIN}/{other}/bronze/{WRONG_PAIR}", False, f"HTTP {found}")
+        return
+    ok, out = tables_tool(eng, "provision", f"{DOMAIN}/{other}/bronze/{WRONG_PAIR}")
+    s3 = sts(adm, ADMIN)
+    made = s3 if isinstance(s3, str) else s3.list_objects_v2(Bucket=BUCKET, Prefix=f"lakehouse/{DOMAIN}/{other}/").get("KeyCount", 0)
+    check(f"0i the provisioning refuses {DOMAIN}/{other}, and makes nothing",
+          not ok and "is not one of the domain" in out and made == 0, f"{out[-300:]}; objects there: {made}")
 
 
 def gate(eng: str, lid: str) -> None:
@@ -471,48 +534,30 @@ def empty_tables(eng: str, both: str) -> None:
 
 
 def remove_domain(eng: str, adm: str) -> None:
-    """The domain smoke goes out of Meta Catalog and the record of grants:
-    its tables are rejected (the administrator), unprovisioned (their entries
-    in the metastore and their files go) and deleted, then its subdomain and
-    the domain itself. The first step that fails stops it, and the check says
-    what is left. Nothing to do when Meta Catalog lacks the model."""
+    """The tables of the domain smoke go out of Meta Catalog and the record of
+    grants: rejected (the administrator), unprovisioned (their entries in the
+    metastore and their files go) and deleted, 0i's among them. The first
+    step that fails stops it, and the check says what is left. Nothing to do
+    when Meta Catalog lacks the model."""
     code, rows = entities(eng, "TableType", f'@.domain == "{DOMAIN}"')
     if code in (400, 404):
         return
     steps = []
     if code != 200:
-        check(f"Z1 the domain {DOMAIN} goes out of Meta Catalog", False, f"listing its tables: HTTP {code} {str(rows)[:200]}")
+        check(f"Z1 the tables of the domain {DOMAIN} go out of Meta Catalog", False,
+              f"listing them: HTTP {code} {str(rows)[:200]}")
         return
     if rows:
         for who, step in ((adm, "reject"), (eng, "unprovision"), (eng, "delete")):
             ok, out = tables_tool(who, step, DOMAIN)
             if not ok:
-                check(f"Z1 the domain {DOMAIN} goes out of Meta Catalog", False,
+                check(f"Z1 the tables of the domain {DOMAIN} go out of Meta Catalog", False,
                       f"{step} failed, done: {', '.join(steps) or 'nothing'}: {out[-400:]}")
                 return
             steps.append(step)
-    code, found = entities(eng, "DomainType", f'@.name == "{DOMAIN}"')
-    for d in found if code == 200 else []:
-        code, parts = metacatalog(eng, "GET", f"/entity/link/{d['id']}/HAS_PART")
-        for s in parts if code == 200 else []:
-            if s.get("entityType") == "SubdomainType":
-                c1, o1 = metacatalog(eng, "DELETE", f"/entity/link/{d['id']}/HAS_PART/{s['id']}")
-                c2, o2 = metacatalog(eng, "DELETE", f"/entity/{s['id']}")
-                if c1 not in (200, 204) or c2 not in (200, 204):
-                    check(f"Z1 the domain {DOMAIN} goes out of Meta Catalog", False,
-                          f"subdomain {s['id']}: HTTP {c1} {o1} / {c2} {o2}")
-                    return
-        c, o = metacatalog(eng, "DELETE", f"/entity/{d['id']}")
-        if c not in (200, 204):
-            check(f"Z1 the domain {DOMAIN} goes out of Meta Catalog", False, f"domain {d['id']}: HTTP {c} {o}")
-            return
-    left = []
-    for entity_type, where in (("TableType", f'@.domain == "{DOMAIN}"'), ("DomainType", f'@.name == "{DOMAIN}"')):
-        code, rows = entities(eng, entity_type, where)
-        if code != 200 or rows:
-            left.append(f"{entity_type} (HTTP {code}, {len(rows) if code == 200 else '?'})")
-    check(f"Z1 the domain {DOMAIN} goes out of Meta Catalog: its tables rejected, unprovisioned and deleted, "
-          "then its subdomain and itself", not left, f"still there: {', '.join(left)}")
+    code, rows = entities(eng, "TableType", f'@.domain == "{DOMAIN}"')
+    check(f"Z1 the tables of the domain {DOMAIN} go out of Meta Catalog: rejected, unprovisioned and deleted",
+          code == 200 and not rows, f"still there: HTTP {code} {len(rows) if code == 200 else '?'}")
 
 
 def cleanup(eng: str, both: str) -> None:
@@ -522,7 +567,7 @@ def cleanup(eng: str, both: str) -> None:
     try:
         remove_domain(eng, "smoke-adm")
     except Exception as e:  # noqa: BLE001 - reported as a failed check
-        check(f"Z1 the domain {DOMAIN} goes out of Meta Catalog", False, repr(e)[:400])
+        check(f"Z1 the tables of the domain {DOMAIN} go out of Meta Catalog", False, repr(e)[:400])
 
 
 def main() -> None:

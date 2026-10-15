@@ -2,6 +2,7 @@
 # dp-tables.sh: the platform's tables in Meta Catalog, from the command line.
 #
 #   dp-tables.sh [-l <user>] load [<file.yaml> ...]
+#   dp-tables.sh [-l <user>] domains
 #   dp-tables.sh [-l <user>] list [<tables>]
 #   dp-tables.sh [-l <user>] status <tables>
 #   dp-tables.sh [-l <user>] provision|authorize|reject <tables>
@@ -14,15 +15,19 @@
 # <domain>/<subdomain>/<layer>.
 #
 # load         the model (subsystems/dataplatform/metacatalog/table-model.yaml)
-#              unless Meta Catalog has it, then each file. A file holds
-#              domains with their subdomains (DomainType: a domain that is
-#              there gets the subdomains it lacks) or tables (TableType, one
-#              document each, `dependsOn` for their lineage: all of a file's
-#              tables are loaded together, or none when they are all there).
-#              A table's subdomain must be there: load its domain first. Each
-#              table is then put under its subdomain. Once loaded, a table
-#              lives in Meta Catalog: change it there (UI or API), not in
-#              its file.
+#              unless Meta Catalog has it, then each file of tables
+#              (TableType, one document each, `dependsOn` for their lineage:
+#              all of a file's tables are loaded together, or none when they
+#              are all there). A table's domain and subdomain must be a pair
+#              of metacatalog/domains.yaml (Meta Catalog checks each against
+#              its enum, not the pair). Once loaded, a table lives in Meta
+#              Catalog: change it there (UI or API), not in its file.
+# domains      brings the model's domains in Meta Catalog to
+#              metacatalog/domains.yaml (its copy domains.json, made by make
+#              configure): a new version of the trait DomainMember with its
+#              enums, then of TableType, whose schema is made from its traits
+#              when it is versioned. Tables keep the version they were made
+#              with. Nothing when they agree already.
 # list         the tables, with what is provisioned and authorized
 # status       each table's folder and metastore table: provisioned?
 #              authorized for whom?
@@ -39,7 +44,7 @@
 # unprovision  DROPS the table and DELETES the files in its folder (asks
 #              first; -y does not)
 # delete       takes an unprovisioned, rejected table out of Meta Catalog,
-#              with its place under its subdomain and its lineage (asks
+#              with its schema, its two resources and its lineage (asks
 #              first; -y does not)
 # unload-model takes a model out of Meta Catalog: the mappings, entity types,
 #              relationships and traits a model file defines (asks first; -y
@@ -64,8 +69,11 @@ ROOT=$(cd "$HERE/../../.." && pwd)
 CLIENT=${CLIENT:-data-cli}
 API="$METACATALOG_URL/metacatalog/v1"
 MODEL=${TABLES_MODEL:-$ROOT/subsystems/dataplatform/metacatalog/table-model.yaml}
+# the pairs of metacatalog/domains.yaml, as make configure renders them for
+# the provisioning script
+DOMAINS=${TABLES_DOMAINS:-$ROOT/subsystems/dataplatform/gitops/manifests/governance/metacatalog/provisioning/domains.json}
 yes=false
-usage() { sed -n '2,53p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,61p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 while getopts l:yh opt; do
   case $opt in l) export KEYCLOAK_USER=$OPTARG ;; y) yes=true ;; *) usage ;; esac
 done
@@ -74,6 +82,7 @@ shift $((OPTIND - 1))
 cmd=$1; shift
 case $cmd in
   load) ;;
+  domains) [ $# -eq 0 ] || usage ;;
   list) [ $# -le 1 ] || usage ;;
   provision|unprovision|authorize|reject|status|delete|unload-model) [ $# -eq 1 ] || usage ;;
   *) usage ;;
@@ -127,12 +136,6 @@ linked() { # <id> <relation>
   jq -c '.[] | {id, type: .entityType, values: (.values | if type == "string" then fromjson else . end)}' <<<"$BODY"
 }
 
-link() { # <source id> <relation> <target id>
-  api POST /entity/link -H 'Content-Type: application/json' \
-    -d "$(jq -cn --arg s "$1" --arg r "$2" --arg t "$3" '{sourceEntityId: $s, relationshipTypeName: $r, targetEntityId: $t}')"
-  [ "$CODE" = 204 ] || fail "linking $1 $2 $3: HTTP $CODE: $BODY"
-}
-
 # The jsonpath that selects the tables of a reference: domain[/subdomain[/layer[/name]]]
 selector() { # <reference>
   local d s l n extra
@@ -163,7 +166,7 @@ resources() { # <domain> <subdomain> <layer> <name>
 }
 
 # ---------------------------------------------------------------- load ----
-# The documents of a file as JSON lines: {kind: domain|table, ...}
+# The tables of a file as JSON lines: {ref, domain, subdomain, schema}
 documents() { # <file>
   "${PYTHON:-python3}" - "$1" <<'PY'
 import json, sys
@@ -175,24 +178,23 @@ for entry in yaml.safe_load_all(open(sys.argv[1])):
     if not entry:
         continue
     v = entry.get("values") or {}
-    if entry.get("entityType") == "DomainType":
-        print(json.dumps({"kind": "domain", "name": v.get("name"), "values": v,
-                          "subdomains": [p.get("values") or {} for p in entry.get("parts") or []]}))
-    elif entry.get("entityType") == "TableType":
-        print(json.dumps({"kind": "table", "ref": "/".join(str(v.get(k)) for k in ("domain", "subdomain", "layer", "name")),
-                          "domain": v.get("domain"), "subdomain": v.get("subdomain"),
-                          "schema": any(p.get("entityType") == "TableSchemaType" for p in entry.get("parts") or [])}))
-    else:
-        sys.exit(f"{sys.argv[1]}: a document of type {entry.get('entityType')!r}: DomainType or TableType")
+    if entry.get("entityType") != "TableType":
+        sys.exit(f"{sys.argv[1]}: a document of type {entry.get('entityType')!r}: only TableType "
+                 "(domains and subdomains are defined in metacatalog/domains.yaml)")
+    print(json.dumps({"ref": "/".join(str(v.get(k)) for k in ("domain", "subdomain", "layer", "name")),
+                      "domain": v.get("domain"), "subdomain": v.get("subdomain"),
+                      "schema": any(p.get("entityType") == "TableSchemaType" for p in entry.get("parts") or [])}))
 PY
 }
 
-# The id of a subdomain of a domain, or nothing
-subdomain_id() { # <domain> <subdomain>
-  local d
-  d=$(entities DomainType "$(printf '$ ? (@.name == "%s")' "$1")" | jq -r .id | head -1)
-  [ -n "$d" ] || return 0
-  linked "$d" HAS_PART | jq -r --arg n "$2" 'select(.type == "SubdomainType" and .values.name == $n) | .id' | head -1
+# Fails unless <domain>/<subdomain> is a pair of metacatalog/domains.yaml
+known_pair() { # <what> <domain> <subdomain>
+  local own
+  [ -r "$DOMAINS" ] || fail "no $DOMAINS: run make configure"
+  own=$(jq -r --arg d "$2" 'if has($d) then .[$d] | join(", ") else "" end' "$DOMAINS")
+  [ -n "$own" ] || fail "$1: domain '$2' is not one of metacatalog/domains.yaml ($(jq -r 'keys_unsorted | join(", ")' "$DOMAINS"))"
+  jq -e --arg d "$2" --arg s "$3" '.[$d] | index($s) != null' "$DOMAINS" >/dev/null \
+    || fail "$1: subdomain '$3' is not one of the domain $2's ($own; metacatalog/domains.yaml)"
 }
 
 load_model() {
@@ -213,42 +215,15 @@ load_model() {
   fi
 }
 
-load_domains() { # <file> <documents>
-  local entry name id sub sid
-  while IFS= read -r entry; do
-    name=$(jq -r .name <<<"$entry")
-    id=$(entities DomainType "$(printf '$ ? (@.name == "%s")' "$name")" | jq -r .id | head -1)
-    if [ -z "$id" ]; then
-      api POST /entity -H 'Content-Type: application/json' \
-        -d "$(jq -c '{entityType: "DomainType", values: (.values | tojson)}' <<<"$entry")"
-      [ "$CODE" = 200 ] || fail "$1: domain $name: HTTP $CODE: $BODY"
-      id=$BODY
-      echo "domain $name: loaded"
-    fi
-    while IFS= read -r sub; do
-      [ -n "$sub" ] || continue
-      if [ -n "$(linked "$id" HAS_PART | jq -r --arg n "$(jq -r .name <<<"$sub")" 'select(.type == "SubdomainType" and .values.name == $n) | .id')" ]; then
-        continue
-      fi
-      api POST /entity -H 'Content-Type: application/json' -d "$(jq -c '{entityType: "SubdomainType", values: tojson}' <<<"$sub")"
-      [ "$CODE" = 200 ] || fail "$1: subdomain $name/$(jq -r .name <<<"$sub"): HTTP $CODE: $BODY"
-      sid=$BODY
-      link "$id" HAS_PART "$sid"
-      echo "subdomain $name/$(jq -r .name <<<"$sub"): loaded"
-    done < <(jq -c '.subdomains[]' <<<"$entry")
-  done <<<"$2"
-}
-
 load_tables() { # <file> <documents>
-  local entry ref filter found there=0 total=0 d s sid id n have want
+  local entry ref filter found there=0 total=0 n have want
   while IFS= read -r entry; do
     total=$((total + 1))
     ref=$(jq -r .ref <<<"$entry")
     filter=$(selector "$ref")
     found=$(entities TableType "$filter")
     [ -z "$found" ] || there=$((there + 1))
-    d=$(jq -r .domain <<<"$entry"); s=$(jq -r .subdomain <<<"$entry")
-    [ -n "$(subdomain_id "$d" "$s")" ] || fail "$1: table $ref: Meta Catalog has no subdomain $d/$s (load its domain first)"
+    known_pair "$1: table $ref" "$(jq -r .domain <<<"$entry")" "$(jq -r .subdomain <<<"$entry")"
   done <<<"$2"
   if [ "$there" -eq "$total" ]; then
     echo "$1: its $total tables are in Meta Catalog already (change them there; this file is not read again)"
@@ -259,9 +234,6 @@ load_tables() { # <file> <documents>
   [ "$CODE" = 204 ] || fail "loading $1: HTTP $CODE: $BODY"
   while IFS= read -r entry; do
     ref=$(jq -r .ref <<<"$entry")
-    id=$(tables "$ref" | jq -r .id)
-    sid=$(subdomain_id "$(jq -r .domain <<<"$entry")" "$(jq -r .subdomain <<<"$entry")")
-    link "$sid" HAS_PART "$id"
     # the mappings derive the folder, and the metastore table of a schema
     want=$(jq -r 'if .schema then 2 else 1 end' <<<"$entry")
     for n in $(seq 1 30); do
@@ -282,14 +254,80 @@ load() {
     [ -f "$f" ] || fail "no file $f"
     entries=$(documents "$f")
     [ -n "$entries" ] || fail "$f: no document"
-    if jq -se 'all(.kind == "domain")' <<<"$entries" >/dev/null; then
-      load_domains "$f" "$entries"
-    elif jq -se 'all(.kind == "table")' <<<"$entries" >/dev/null; then
-      load_tables "$f" "$entries"
-    else
-      fail "$f: domains and tables in one file: one kind per file"
-    fi
+    load_tables "$f" "$entries"
   done
+}
+
+# ---------------------------------------------------------------- domains ----
+# The trait DomainMember as metacatalog/domains.yaml wants it (its copy
+# domains.json), from the live trait: the enums and their descriptions, in
+# the order of the file, as make configure renders them into the model
+domain_member_schema() { # <live trait schema JSON>
+  jq -c --argjson d "$(cat "$DOMAINS")" '
+    ([$d[]] | add | reduce .[] as $s ([]; if index([$s]) then . else . + [$s] end)) as $subs
+    | .properties.domain.enum = ($d | keys_unsorted)
+    | .properties.domain.description = "One of: " + ($d | keys_unsorted | join(", "))
+    | .properties.subdomain.enum = $subs
+    | .properties.subdomain.description = "One of its domain'"'"'s: "
+        + ([$d | to_entries[] | "\(.key) (\(.value | join(", ")))"] | join("; "))' <<<"$1"
+}
+
+# TableType as the model file defines it: its own schema (JSON text), its
+# traits and its father. A new version must carry these, not the schema
+# Meta Catalog answers with (merged from its traits).
+model_type() { # <name>
+  "${PYTHON:-python3}" - "$MODEL" "$1" <<'PY'
+import json, sys
+try:
+    import yaml
+except ImportError:
+    sys.exit("PyYAML is needed to read the model: pip3 install pyyaml (requirements.txt)")
+types = {}
+for part in yaml.safe_load_all(open(sys.argv[1])):
+    for t in (part or {}).get("EntityTypes") or []:
+        types[t["name"]] = t
+t = types.get(sys.argv[2]) or sys.exit(f"{sys.argv[1]}: no entity type {sys.argv[2]}")
+print(json.dumps({"name": t["name"], "schema": json.dumps(t.get("schema") or {"type": "object", "properties": {}}),
+                  "traits": t.get("traits") or [], "inheritsFrom": t.get("inheritsFrom")}))
+PY
+}
+
+# Whether a schema's enums are those of domains.json (as sets)
+same_domains() { # <schema JSON>
+  jq -en --argjson a "$1" --argjson d "$(cat "$DOMAINS")" \
+    '(($a.properties.domain.enum // []) | sort) == ($d | keys | sort)
+     and (($a.properties.subdomain.enum // []) | sort) == ([$d[]] | add | unique)' >/dev/null
+}
+
+domains() {
+  local trait live body type merged versioned=false
+  [ -r "$DOMAINS" ] || fail "no $DOMAINS: run make configure"
+  api GET /trait/DomainMember
+  [ "$CODE" = 200 ] || fail "Meta Catalog has no trait DomainMember (HTTP $CODE): load the model first (dp-tables.sh load)"
+  trait=$BODY
+  live=$(jq -c '.schema | if type == "string" then fromjson else . end' <<<"$trait")
+  if ! same_domains "$live"; then
+    body=$(jq -cn --argjson t "$trait" --argjson w "$(domain_member_schema "$live")" \
+      '{name: "DomainMember", schema: ($w | tojson)} + (if $t.inheritsFrom then {inheritsFrom: $t.inheritsFrom} else {} end)')
+    api POST /trait/DomainMember/versions -H 'Content-Type: application/json' -d "$body"
+    [[ $CODE == 20[01] ]] || fail "a new version of the trait DomainMember: HTTP $CODE: $BODY"
+    echo "trait DomainMember: version $(jq -r '.version // "?"' <<<"$BODY"), domains $(jq -r 'keys_unsorted | join(", ")' "$DOMAINS")"
+    versioned=true
+  fi
+  # a type's schema is merged from its traits' when it is made or versioned:
+  # TableType takes the new enums with a version of its own
+  api GET /entity-type/TableType
+  [ "$CODE" = 200 ] || fail "Meta Catalog has no entity type TableType (HTTP $CODE): load the model first (dp-tables.sh load)"
+  merged=$(jq -c '.schema | if type == "string" then fromjson else . end' <<<"$BODY")
+  if $versioned || ! same_domains "$merged"; then
+    type=$(model_type TableType)
+    body=$(jq -c 'if .inheritsFrom == null then del(.inheritsFrom) else . end' <<<"$type")
+    api POST /entity-type/TableType/versions -H 'Content-Type: application/json' -d "$body"
+    [[ $CODE == 20[01] ]] || fail "a new version of TableType: HTTP $CODE: $BODY (the trait is up to date: dp-tables.sh domains again)"
+    echo "entity type TableType: version $(jq -r '.version // "?"' <<<"$BODY"): new tables take these domains; tables made before keep theirs"
+  else
+    echo "domains: Meta Catalog has those of metacatalog/domains.yaml already ($(jq -r 'keys_unsorted | join(", ")' "$DOMAINS"))"
+  fi
 }
 
 # ---------------------------------------------------------------- a model, out ----
@@ -412,9 +450,6 @@ delete() { # <table {id, ref, values}>
   r=$(resources $(tr / ' ' <<<"$ref") | jq -sc .)
   jq -e 'all(.provisioningStatus != "PROVISIONED")' <<<"$r" >/dev/null || fail "table $ref is provisioned: unprovision it first (its files and its entry in the metastore would stay behind)"
   jq -e 'all(.authorizationStatus != "AUTHORIZED")' <<<"$r" >/dev/null || fail "table $ref is authorized: reject it first (its grants would stay in force)"
-  for other in $(linked "$id" IS_PART_OF | jq -r 'select(.type == "SubdomainType") | .id'); do
-    api DELETE "/entity/link/$other/HAS_PART/$id"; [ "$CODE" = 204 ] || fail "taking $ref out of its subdomain: HTTP $CODE: $BODY"
-  done
   for other in $(linked "$id" DEPENDS_ON | jq -r .id); do
     api DELETE "/entity/link/$id/DEPENDS_ON/$other"; [ "$CODE" = 204 ] || fail "removing the lineage of $ref: HTTP $CODE: $BODY"
   done
@@ -434,6 +469,7 @@ confirm() { # <what happens> <reference>
 
 case $cmd in
   load) load "$@" ;;
+  domains) domains ;;
   unload-model) unload_model "$1" ;;
   list)
     found=$(if [ $# -eq 1 ]; then tables "$1"; else

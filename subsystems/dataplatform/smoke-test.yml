@@ -6,7 +6,7 @@
 # smoke-adm (also the admin group: only it may authorize; site.yml names the
 # groups) exercise direct
 # STS, Trino and Spark in the smoke test's own tables (Meta Catalog,
-# metacatalog/domains/smoke.yaml and metacatalog/tables/smoke.yaml): every
+# metacatalog/domains.yaml and metacatalog/tables/smoke.yaml): every
 # statement in Trino must be decided by the Open Policy Agent and every file
 # by Ceph through a group role, both from the grants of the tables' policies,
 # and only Meta Catalog may create a schema or a table in Trino. The model is
@@ -201,7 +201,7 @@
             JUPYTER_URL: https://jupyter.{{ dataplatform_domain }}
             METACATALOG_URL: https://metacatalog.{{ dataplatform_domain }}
             DP_TABLES: "{{ playbook_dir }}/files/dp-tables.sh"
-            SMOKE_DOMAIN_FILE: "{{ playbook_dir }}/metacatalog/domains/smoke.yaml"
+            SMOKE_DOMAINS_FILE: "{{ playbook_dir }}/gitops/manifests/governance/metacatalog/provisioning/domains.json"
             SMOKE_TABLES_FILE: "{{ playbook_dir }}/metacatalog/tables/smoke.yaml"
             SMOKE_MODEL_FILE: "{{ playbook_dir }}/metacatalog/table-model.yaml"
             SPARK_SUBMIT: "{{ playbook_dir }}/files/dp-spark-submit.sh"

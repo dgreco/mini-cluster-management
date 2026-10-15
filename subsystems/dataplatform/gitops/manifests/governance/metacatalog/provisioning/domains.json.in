@@ -1,0 +1,9 @@
+<%# The domains and, for each, its subdomains (metacatalog/domains.yaml, by
+    make configure): table.sh provisions a table only under one of these
+    pairs, dp-tables.sh loads one only then, and its `domains` command
+    builds the model's enums from them. %>
+{
+<% for name, domain in dataplatform_configure_domains.items() %>
+  <%= name | to_json %>: <%= domain.subdomains | list | to_json %><%= ',' if not loop.last else '' %>
+<% endfor %>
+}
