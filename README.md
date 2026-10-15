@@ -460,7 +460,8 @@ The subsystem READMEs list the most important settings of each part.
 ## For developers
 
 Offline checks, also run by `.gitlab-ci.yml` on every push: `make syntax-check`,
-`make lint`, `make test` (unit tests of iam-sync, standard library only),
+`make lint`, `make test` (unit tests of the Python programs: iam-sync, the catalog gate,
+the model planner; standard library only),
 `make configure-check` and `make site-check` (the site's values only in
 `inventory/group_vars/all/site.yml` and the files rendered from it) and
 `make dataplatform-render` (every Argo CD Application built locally, the
@@ -499,8 +500,9 @@ address. `make publish-push` publishes it. Details in
 ```
 
 `make syntax-check` checks every playbook offline, `make lint` runs
-ansible-lint. There are no unit tests; everything runs against the live
-boards. Any playbook without its own `make` target can still be run as
+ansible-lint, `make test` runs the unit tests of the Python programs and
+`make dataplatform-policy-test` those of Trino's access rules; everything else
+runs against the live boards. Any playbook without its own `make` target can still be run as
 `make cluster-<name>`, `make ceph-<name>`, `make k3s-<name>` or
 `make dataplatform-<name>`, or directly
 with `ansible-playbook <path>.yml` from this folder.

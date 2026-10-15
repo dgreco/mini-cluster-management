@@ -70,7 +70,7 @@ site-check: ## Fail if a site value is written anywhere but site.yml and the fil
 	@python3 subsystems/dataplatform/files/site_check.py
 
 .PHONY: test
-test: ## Unit tests of the Python programs (iam-sync); standard library only
+test: ## Unit tests of the Python programs (iam-sync, catalog gate, model planner); standard library only
 	python3 -m unittest discover -s subsystems/dataplatform/files/tests -t subsystems/dataplatform/files -v
 
 ##@ Cluster: power, reboot, operating system   (add ARGS="-e target=<node>" for one node)

@@ -25,7 +25,7 @@ make dataplatform-s3-login ARGS="-g data-engineers"   # files/dp-s3-login.sh: Ke
 make dataplatform-directory ARGS="user list"          # files/dp-directory.sh: users and groups, in the directory (Samba AD); also user add|passwd|disable|remove, group add|join|leave
 make dataplatform-tables ARGS="provision retail"      # files/dp-tables.sh: tables in Meta Catalog; load, model, list, status, provision, authorize, reject, unprovision, delete
 make dataplatform-render                    # builds every Argo CD Application offline (kubectl kustomize, helm template)
-make test                                   # unit tests of the Python programs (iam-sync)
+make test                                   # unit tests of the Python programs (iam-sync, catalog gate, model planner)
 make dataplatform-policy-test               # unit tests of Trino's rules for the Open Policy Agent (opa, or its image through Docker)
 make ceph-s3-user ARGS="-e uid=alice"          # also: ceph-s3-users, ceph-s3-user-remove ARGS="-e uid=alice [-e purge_data=true]"
 make ceph-sts-role ARGS="-e role_name=r -e trusted_uid=alice"
