@@ -306,8 +306,8 @@ A command takes one table, `<domain>/<subdomain>/<layer>/<table>`, or every tabl
 
   **Only members of `platform-admins` may authorize** (in the UI and through the API; a gate in front of Meta Catalog answers everyone else 403). Every member of `platform-admins` and `data-engineers` may edit a table's policy, so an edit is a proposal until an administrator authorizes it; check the policy before you do, it is applied as it is at that moment. Authorize writes the grants into the record of grants (ConfigMap `governance/metacatalog-grants`, two keys per table) and gives the Ceph roles the folder at once; iam-sync updates Trino's mapping and the Open Policy Agent's rules within a minute. Provisioning and unprovisioning have no such gate beyond those two groups: see *Known limits*.
 - **Reject** withdraws all of the table's grants the same way (`platform-admins` only).
-- **Unprovision** drops the table and deletes the files in its folder (it asks first).
-- **Delete** takes a table out of Meta Catalog: only one that is unprovisioned and rejected, so that nothing of it is left behind.
+- **Unprovision** drops the table and deletes the files in its folder (it asks first). It removes only what exists outside Meta Catalog. The table stays in Meta Catalog with its two mapped resources, its folder and its table in the metastore, now marked `UNPROVISIONED`, and the next *Provision* makes them again. A table that was never provisioned has nothing to remove: its unprovision succeeds and changes nothing.
+- **Delete** takes a table out of Meta Catalog, with its schema, its two mapped resources and its place under its subdomain. It takes only a table that is unprovisioned and rejected, so that nothing of it is left behind. Its domain and subdomain stay.
 - **A table's names are for good.** Domain, subdomain, layer and name make its folder and its name in Trino. Changing them in Meta Catalog does not move anything: make another table instead.
 - In Meta Catalog, AUTHORIZED means *in force*: the record and the roles changed in the same run.
 
