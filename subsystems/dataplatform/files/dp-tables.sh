@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # dp-tables.sh: the platform's tables in Meta Catalog, from the command line.
 #
+#   dp-tables.sh [-l <user>] [-n] [-y] sync [<tables.yaml>]
 #   dp-tables.sh [-l <user>] load [<file.yaml> ...]
 #   dp-tables.sh [-l <user>] [-y] model
 #   dp-tables.sh [-l <user>] list [<tables>]
@@ -14,6 +15,25 @@
 # under what comes first: <domain>, <domain>/<subdomain>,
 # <domain>/<subdomain>/<layer>.
 #
+# sync         brings Meta Catalog's tables to the file of tables
+#              (subsystems/dataplatform/metacatalog/tables/tables.yaml unless
+#              another is named), its one definition (files/tables_plan.py):
+#              a table that is new there is made, provisioned and authorized;
+#              one whose values, columns, lineage or grants differ gets the
+#              file's, and is provisioned and authorized again (rejected
+#              when the file gives it no grants); one that is not in the file
+#              any more is rejected, unprovisioned (DROPPED, its files
+#              DELETED) and taken out of Meta Catalog. The file owns every
+#              table but those of the domain smoke (the smoke test's own;
+#              TABLES_SYNC_DOMAINS="d1 d2" owns those domains only). Shows the
+#              steps and asks first (-y does not; -n shows them and changes
+#              nothing). Refuses, before any step, a file that holds no table
+#              or cannot do what it says (another format for a table, a
+#              schema added or taken away, a column retyped). Authorizing
+#              needs the admin group (-l admin). A step that fails stops the
+#              run, after those before it: fix it, then sync again (it does
+#              what is still missing). The model is loaded first when Meta
+#              Catalog lacks it.
 # load         the model (subsystems/dataplatform/metacatalog/table-model.yaml)
 #              unless Meta Catalog has it, then each file of tables
 #              (TableType, one document each, `dependsOn` for their lineage:
@@ -82,16 +102,18 @@ CLIENT=${CLIENT:-data-cli}
 API="$METACATALOG_URL/metacatalog/v1"
 MODEL=${TABLES_MODEL:-$ROOT/subsystems/dataplatform/metacatalog/table-model.yaml}
 yes=false
+dry=false
 # the header, from its second line to the first that is not a comment
 usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
-while getopts l:yh opt; do
-  case $opt in l) export KEYCLOAK_USER=$OPTARG ;; y) yes=true ;; *) usage ;; esac
+while getopts l:ynh opt; do
+  case $opt in l) export KEYCLOAK_USER=$OPTARG ;; y) yes=true ;; n) dry=true ;; *) usage ;; esac
 done
 shift $((OPTIND - 1))
 [ $# -ge 1 ] || usage
 cmd=$1; shift
 case $cmd in
   load) ;;
+  sync) [ $# -le 1 ] || usage ;;
   model) [ $# -eq 0 ] || usage ;;
   list) [ $# -le 1 ] || usage ;;
   provision|unprovision|authorize|reject|status|delete|unload-model) [ $# -eq 1 ] || usage ;;
@@ -463,6 +485,133 @@ unload_model() { # <file>
   echo "model of $(basename "$1"): $gone definitions taken out of Meta Catalog"
 }
 
+# ---------------------------------------------------------------- sync ----
+# Which tables the file owns, as tables_plan.py reads it
+sync_scope() {
+  if [ -n "${TABLES_SYNC_DOMAINS:-}" ]; then
+    jq -cn --arg d "$TABLES_SYNC_DOMAINS" '{only: [$d | splits("[ ,]+") | select(. != "")]}'
+  else
+    echo '{"except": ["smoke"]}'
+  fi
+}
+
+# Meta Catalog's tables as tables_plan.py reads them, one JSON object per
+# line: {id, values, part, depends, resources}; the tables outside the scope
+# with their values only
+sync_live() { # <scope JSON>
+  local t id v d s l n part deps res
+  entities TableType all | while IFS= read -r t; do
+    id=$(jq -r .id <<<"$t"); v=$(jq -c .values <<<"$t")
+    if ! jq -en --argjson s "$1" --argjson v "$v" \
+         'if $s.only then ($s.only | index($v.domain)) != null else ($s.except | index($v.domain)) == null end' >/dev/null; then
+      jq -cn --arg id "$id" --argjson v "$v" '{id: $id, values: $v}'
+      continue
+    fi
+    IFS=$'\x1f' read -r d s l n < <(jq -r '[.domain, .subdomain, .layer, .name] | join("\u001f")' <<<"$v")
+    part=$(linked "$id" HAS_PART | jq -sc 'map(select(.type == "TableSchemaType") | {id, values}) | first')
+    deps=$(linked "$id" DEPENDS_ON | jq -sc 'map(select(.type == "TableType") | .values | "\(.domain)/\(.subdomain)/\(.layer)/\(.name)")')
+    res=$(resources "$d" "$s" "$l" "$n" | jq -sc 'map({kind, provisioningStatus, authorizationStatus})')
+    jq -cn --arg id "$id" --argjson v "$v" --argjson p "$part" --argjson dp "$deps" --argjson r "$res" \
+      '{id: $id, values: $v, part: $p, depends: $dp, resources: $r}'
+  done
+}
+
+# A table's folder or metastore table (its values), or nothing
+sync_resource() { # <identity> <folder|table>
+  local d s l n
+  IFS=/ read -r d s l n <<<"$1"
+  resources "$d" "$s" "$l" "$n" | jq -c --arg k "$2" 'select(.kind == $k)'
+}
+
+# Meta Catalog derives a resource again a moment after its source changed,
+# and the resource loses its status then: wait for that before provisioning,
+# or the derivation would wipe the status the run sets
+sync_wait() { # <identity> <folder|table> <its values before the change>
+  local i
+  if [ -z "$3" ] || ! jq -e 'has("provisioningStatus") or has("authorizationStatus")' <<<"$3" >/dev/null; then
+    sleep 5
+    return 0
+  fi
+  for i in $(seq 1 30); do
+    sync_resource "$1" "$2" | jq -e 'has("provisioningStatus") or has("authorizationStatus") | not' >/dev/null && return 0
+    sleep 2
+  done
+  echo "sync: $1: Meta Catalog did not derive its $2 again within a minute; going on (sync again if it ends unprovisioned)" >&2
+}
+
+sync_tables() { # [<tables.yaml>]
+  local file=${1:-$ROOT/subsystems/dataplatform/metacatalog/tables/tables.yaml} scope live plan steps line op ident t other tmp before removals
+  [ -f "$file" ] || fail "no file $file"
+  if $dry; then
+    # -n changes nothing: not even the model is loaded
+    api GET /entity-type/TableType
+    if [ "$CODE" = 404 ]; then
+      echo "sync: Meta Catalog has no model: sync would load $MODEL, then make, provision and authorize every table of $file"
+      return 0
+    fi
+  fi
+  load_model
+  scope=$(sync_scope)
+  live=$(mktemp)
+  sync_live "$scope" | jq -s . >"$live"
+  plan=$("${PYTHON:-python3}" "$HERE/tables_plan.py" "$file" "$live" <(printf '%s' "$scope")) \
+    || { rm -f "$live"; fail "sync: nothing was changed (above)"; }
+  rm -f "$live"
+  jq -r 'select(.note) | "sync: " + .note' <<<"$plan"
+  steps=$(jq -c 'select(.op)' <<<"$plan")
+  if [ -z "$steps" ]; then
+    echo "sync: Meta Catalog's tables are those of $file"
+    return 0
+  fi
+  echo "sync: $(wc -l <<<"$steps" | tr -d ' ') step(s) to make Meta Catalog's tables those of $file:"
+  jq -r '"  " + .say' <<<"$steps"
+  $dry && return 0
+  removals=$(jq -s 'map(select(.op == "remove")) | length' <<<"$steps")
+  if [ "$removals" -gt 0 ]; then
+    confirm "$removals table(s) will be DROPPED and their files DELETED." sync
+  else
+    confirm "Go on?" sync
+  fi
+  while IFS= read -r line; do
+    op=$(jq -r .op <<<"$line"); ident=$(jq -r '.table // empty' <<<"$line")
+    case $op in
+      create)
+        tmp=$(mktemp)
+        jq -c '.documents[]' <<<"$line" | "${PYTHON:-python3}" -c '
+import json, sys, yaml
+yaml.safe_dump_all([json.loads(l) for l in sys.stdin], sys.stdout, sort_keys=False)' >"$tmp"
+        load_tables "$tmp" "$(documents "$tmp")"
+        rm -f "$tmp" ;;
+      update)
+        before=$(sync_resource "$ident" "$(jq -r .wait <<<"$line")")
+        api PUT "/entity/$(jq -r .entity <<<"$line")" -H 'Content-Type: application/json' \
+          --data-binary "$(jq -c '{entityType, values: (.values | tojson)}' <<<"$line")"
+        [[ $CODE == 20[04] ]] || fail "$(jq -r .say <<<"$line"): HTTP $CODE: $BODY (a value its version of the type does not take? then the table must be made again: another name)"
+        sync_wait "$ident" "$(jq -r .wait <<<"$line")" "$before"
+        echo "$(jq -r .say <<<"$line"): done" ;;
+      link|unlink)
+        t=$(tables "$ident" | jq -r .id)
+        other=$(tables "$(jq -r .target <<<"$line")" | jq -r .id)
+        if [ "$op" = link ]; then
+          api POST /entity/link -H 'Content-Type: application/json' \
+            -d "$(jq -cn --arg s "$t" --arg d "$other" '{sourceEntityId: $s, relationshipTypeName: "DEPENDS_ON", targetEntityId: $d}')"
+        else
+          api DELETE "/entity/link/$t/DEPENDS_ON/$other"
+        fi
+        [[ $CODE == 20[04] ]] || fail "$(jq -r .say <<<"$line"): HTTP $CODE: $BODY"
+        echo "$(jq -r .say <<<"$line"): done" ;;
+      provision|authorize|reject)
+        run "$op" "$(tables "$ident")" || fail "sync: $op $ident failed (above); the steps before it are done: fix it, then sync again" ;;
+      remove)
+        t=$(tables "$ident")
+        run reject "$t" || fail "sync: reject $ident failed (above): fix it, then sync again"
+        run unprovision "$t" || fail "sync: unprovision $ident failed (above): fix it, then sync again"
+        delete "$(tables "$ident")" ;;
+    esac
+  done <<<"$steps"
+  echo "sync: done"
+}
+
 # ---------------------------------------------------------------- procedures ----
 # What the script printed last for a resource, or the grants in force
 summary() { # <resource values> <result field | "">
@@ -532,6 +681,7 @@ confirm() { # <what happens> <reference>
 
 case $cmd in
   load) load "$@" ;;
+  sync) sync_tables "$@" ;;
   model) model ;;
   unload-model) unload_model "$1" ;;
   list)

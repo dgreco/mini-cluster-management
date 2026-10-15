@@ -339,9 +339,11 @@ dataplatform-spark-submit: ## Run a PySpark job as yourself (Keycloak login, the
 ##> make dataplatform-spark-submit ARGS="-g <group> -w my_job.py"
 
 .PHONY: dataplatform-tables
-dataplatform-tables: ## Tables in Meta Catalog: load, model (its changes as versions), provision (folder, Hive Metastore), authorize (admin group), status, delete
+dataplatform-tables: ## Tables in Meta Catalog: sync (tables.yaml), model (its changes as versions), load, provision, authorize, status, delete
 	@subsystems/dataplatform/files/dp-tables.sh $(ARGS)
-##> make dataplatform-tables ARGS="load subsystems/dataplatform/metacatalog/tables/retail.yaml"   the model, then the tables of a file
+##> make dataplatform-tables ARGS="-l admin -n sync"              what sync would do to make the tables those of tables.yaml
+##> make dataplatform-tables ARGS="-l admin sync"                 make, change, provision, authorize, remove them (asks first)
+##> make dataplatform-tables ARGS="load <file.yaml>"              the model, then the tables of a file
 ##> make dataplatform-tables ARGS=model                             the model file's changes -> Meta Catalog, as versions (asks first)
 ##> make dataplatform-tables ARGS="provision retail"                each table's folder, then the table in the metastore (through Trino)
 ##> make dataplatform-tables ARGS="authorize retail/analytics"      their grants -> Ceph and Trino (the admin group only)

@@ -119,7 +119,7 @@ Until October 2026 the platform kept Iceberg tables only, in a JDBC catalog (Pos
    ```bash
    git show <the commit before this change>:subsystems/dataplatform/metacatalog/medallion-model.yaml > /tmp/medallion-model.yaml
    make dataplatform-tables ARGS="unload-model /tmp/medallion-model.yaml"     # its mappings, entity types, relationship and traits
-   make dataplatform-tables ARGS="load subsystems/dataplatform/metacatalog/tables/retail.yaml"
+   make dataplatform-tables ARGS="-l admin sync"     # the tables of tables.yaml: made, provisioned, authorized
    ```
 5. `make dataplatform-smoke-test`.
 6. Remove the old catalog. Argo CD removes its Application and leaves what it made (it holds a database); the Secrets it had in `compute` go by themselves:
@@ -282,19 +282,31 @@ table (TableType: domain, subdomain, name, layer, format, principals / permissio
 - **Domains and subdomains are fixed lists**, defined once in the model, in its trait `DomainMember`: `domain.enum` lists the domains, `domain.x-subdomains` each domain's own subdomains, `subdomain.enum` all of them. A table names one domain and one of that domain's subdomains, which Meta Catalog's form offers as two drop-downs. Meta Catalog itself checks each value against its list but not the pair, so a subdomain of another domain gets past its form. `make dataplatform-tables ARGS="load …"` refuses such a table, and so does provisioning, before anything is made: both read `x-subdomains` from Meta Catalog.
 - **The model** (`metacatalog/table-model.yaml`: traits, relationships, entity types, mappings) and the tables (`metacatalog/tables/*.yaml`) are Meta Catalog documents, written out in full: no `make configure` is involved, `make dataplatform-tables` only sends them. The model names the bucket (`dataplatform`) and the tables name the groups of their grants as they are (on a site with another bucket or other group names, change the files before the first load; the smoke test stops when `tables/smoke.yaml` does not name the site's engineer and analyst groups). The mappings derive the two physical resources of a table (`S3FolderType`, `HiveTableType`); Meta Catalog's `script` provisioning task runs `gitops/manifests/governance/metacatalog/provisioning/table.sh` for each of them.
 
-From the repository root (a device login of yours, like `dataplatform-s3-login`):
+**The tables are defined in one file**, `metacatalog/tables/tables.yaml`: every table of every domain but `smoke` (the smoke test's own) is what it says. Edit the file, then, from the repository root (a login as a member of platform-admins: authorizing is theirs):
 
 ```bash
-make dataplatform-tables ARGS="load subsystems/dataplatform/metacatalog/tables/retail.yaml"
-make dataplatform-tables ARGS="provision retail"                      # every table of the domain: its folder, then the table in the metastore
-make dataplatform-tables ARGS="authorize retail/analytics"            # the grants of a subdomain's tables -> Ceph and Trino (platform-admins only)
-make dataplatform-tables ARGS="status retail/orders/silver/orders"    # one table: provisioned, authorized, for whom
-make dataplatform-tables ARGS=list                                    # every table
+make dataplatform-tables ARGS="-l admin -n sync"   # what sync would do, changing nothing
+make dataplatform-tables ARGS="-l admin sync"      # do it: shows the steps and asks (ARGS="-l admin -y sync" does not)
 ```
 
-A command takes one table, `<domain>/<subdomain>/<layer>/<table>`, or every table under a domain, a subdomain or a layer.
+- **A table new in the file** is made in Meta Catalog, provisioned (its folder, then its table in the metastore) and authorized (its grants: Ceph at once, Trino within a minute).
+- **A table changed in the file** (its grants, its description, a column added, its lineage) gets the change in Meta Catalog and is provisioned and authorized again; with no grants left it is rejected. Meta Catalog derives a table's folder (and, for a changed schema, its metastore table) again when it changes, which clears their status; sync waits for that before it provisions.
+- **A table taken out of the file** is rejected, unprovisioned (**its table is dropped and its files are deleted**) and taken out of Meta Catalog. The plan says so in capitals and sync asks before anything.
+- **The file wins**: a table changed in Meta Catalog's UI is put back as the file says at the next sync (the plan shows it first).
+- **Refused before anything is done:** a file with no table (it would remove every table), a table of the domain `smoke`, two documents for one table, a `dependsOn` naming no table of the file, and for a table Meta Catalog has: another format, a schema added or taken away, a column whose type changed. A table's place (domain, subdomain, layer) and name identify it: under another name it is another table, so a rename drops the old one and its data. A column taken out of the file stays in the table (provisioning never drops one).
+- **A step that fails stops the run**, after the steps before it. Fix the cause and sync again: it does only what is still missing.
+- **Tables made before a version of the model** keep their version: a change that uses a value only a newer version takes (a new enum value) is refused by Meta Catalog for them; such a table has to be made again, under another name.
 
-- **Load** sends the model (once), then the files of tables. A table whose domain and subdomain are not a pair of the model in Meta Catalog is refused. From then on a table lives in Meta Catalog: change it in the UI or the API, then provision or authorize again. The file is not read again.
+The single-table commands are still there, for a look or a repair. A command takes one table, `<domain>/<subdomain>/<layer>/<table>`, or every table under a domain, a subdomain or a layer:
+
+```bash
+make dataplatform-tables ARGS="status retail/orders/silver/orders"    # one table: provisioned, authorized, for whom
+make dataplatform-tables ARGS=list                                    # every table
+make dataplatform-tables ARGS="provision retail"                      # again, by hand: every table of the domain
+make dataplatform-tables ARGS="load <file.yaml>"                      # the model, then the tables of a file, without the rest of sync
+```
+
+- **Load** sends the model (once), then the files of tables. A table whose domain and subdomain are not a pair of the model in Meta Catalog is refused. The smoke test loads its own tables (`tables/smoke.yaml`, domain `smoke`) this way.
 - **A change of the model** (a property, an enum value, a trait, an entity type, a mapping, a domain): edit `metacatalog/table-model.yaml`, then
 
   ```bash

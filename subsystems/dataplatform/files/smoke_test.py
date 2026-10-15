@@ -29,7 +29,8 @@ failed, so no grant of the test stays in the record.
    script, which makes nothing; the engineer may not
    authorize one (only the admin group: the gate, also against tricks with
    the path and a forged groups header), the administrator may, and their
-   grants are in force within minutes.
+   grants are in force within minutes; sync, for the domain smoke and
+   the file it was loaded from, has nothing to do.
 A  direct STS: each user gets their group's role only; the role reaches the
    folders of the tables granted to it, not the other group's, nor the
    bucket's root; a role granted READ on a table reads its files and writes
@@ -318,14 +319,14 @@ def entities(user: str, entity_type: str, where: str) -> tuple:
                   for r in rows]
 
 
-def tables_tool(user: str, *args) -> tuple:
+def tables_tool(user: str, *args, env: dict = None) -> tuple:
     """(ok, output) of dp-tables.sh run as the user (make dataplatform-tables)"""
     with tempfile.TemporaryDirectory() as d:
         tok = os.path.join(d, "token")
         with open(tok, "w") as f:
             f.write(token(user))
-        p = subprocess.run([TABLES, "-y", *args], capture_output=True, text=True, timeout=1800,
-                           env=dict(os.environ, TABLES_TOKEN_FILE=tok, PYTHON=sys.executable))
+        p = subprocess.run([TABLES, "-y", *args], capture_output=True, text=True, timeout=1800, stdin=subprocess.DEVNULL,
+                           env=dict(os.environ, TABLES_TOKEN_FILE=tok, PYTHON=sys.executable, **(env or {})))
     return p.returncode == 0, (p.stdout + p.stderr).strip()
 
 
@@ -421,6 +422,12 @@ def fixture(eng: str) -> bool:
     check(f"0e the grants on the tables are in force (Trino), for each user", not missing, "; ".join(missing)[:400])
     if missing:
         return False
+    # sync reads Meta Catalog's tables as they are, provisioned and authorized:
+    # for the file they were loaded from, it has nothing to do (before 0g-0i
+    # add tables of their own to the domain)
+    ok, out = tables_tool(eng, "-n", "sync", TABLES_FILE, env={"TABLES_SYNC_DOMAINS": DOMAIN})
+    check(f"0j make dataplatform-tables ARGS=\"-n sync\" finds the domain {DOMAIN} as {os.path.basename(TABLES_FILE)} says",
+          ok and "are those of" in out, out[-400:])
     started = time.time()
     domain_rules(eng, adm)
     time.sleep(max(0, 90 - (time.time() - started)))

@@ -1,12 +1,24 @@
-# The tables of the example domain retail (the model's trait DomainMember): eight tables
-# across the medallion and the three formats. Each document is one table: its
-# place (domain, subdomain, layer), its format, its access policy, its
-# schema (the part with the columns) and what it is built from (dependsOn:
-# the `ref` of other tables of this file). Load, build and grant:
+# The platform's tables: this file is their one definition. Every table of
+# every domain but smoke (the smoke test's own) is what this file says:
 #
-#   make dataplatform-tables ARGS="load subsystems/dataplatform/metacatalog/tables/retail.yaml"
-#   make dataplatform-tables ARGS="provision retail"     # each table's folder, then the table in the metastore
-#   make dataplatform-tables ARGS="authorize retail"     # each table's grants -> Ceph and Trino (platform-admins only)
+#   make dataplatform-tables ARGS="-n sync"   # what sync would do, changing nothing
+#   make dataplatform-tables ARGS=sync        # do it (shows it and asks; ARGS="-y sync" does not)
+#
+# sync makes a table that is new here, provisions it (its folder, then its
+# table in the metastore) and authorizes it (its grants -> Ceph and Trino);
+# a table whose values, columns or grants changed here gets them in Meta
+# Catalog, and is provisioned and authorized again; a table that is no longer
+# here is rejected, unprovisioned (DROPPED, its files DELETED) and taken out of
+# Meta Catalog. A change made in Meta Catalog's UI to one of these tables is
+# put back as this file says. Authorizing needs the admin group: run it as
+# ARGS="-l admin sync" (the login is kept for an hour).
+#
+# Each document is one table: its place (domain, subdomain, layer) and name,
+# which identify it, its format, its access policy, its schema (the part with
+# the columns) and what it is built from (dependsOn: the `ref` of other
+# tables of this file). A table's place, name and format never change: a
+# table with another one is another table (sync drops the old one). A column
+# is added by provisioning, never dropped, and its type never changes.
 #
 # A table is granted on its own. Principals are Keycloak groups (GROUP) and
 # users (USER); a SERVICE is a Keycloak client's service account
@@ -14,11 +26,13 @@
 # files) and WRITE (also change its rows and its files). A grant reaches the
 # table's folder (Ceph) and its entry in the metastore (Trino) alike, unless
 # it selects one: `resources: { entityTypes: ["S3FolderType"] }` grants the
-# files without the table. Creating, altering and dropping tables is Meta
-# Catalog's alone; platform-admins reads and writes every table without a grant.
-# The groups are the site's (inventory/group_vars/all/site.yml), written out:
-# a grant names a group as it is in the directory.
+# files without the table. A table without grants is rejected (nobody but
+# the admin group reaches it). Creating, altering and dropping tables is
+# Meta Catalog's alone; platform-admins reads and writes every table without
+# a grant. The groups are the site's (inventory/group_vars/all/site.yml),
+# written out: a grant names a group as it is in the directory.
 #
+#   domain retail (the example domain of the model's trait DomainMember)
 #   layer    table                     format    data-engineers   data-analysts
 #   bronze   orders_raw                avro      read, write      -
 #   bronze   customers_raw             parquet   read, write      -
@@ -26,6 +40,7 @@
 #   silver   orders, customers, payments  iceberg  read, write    -
 #   gold     daily_revenue             iceberg   read, write      read
 #   gold     customer_lifetime_value   parquet   read, write      read
+#   gold     monthly_revenue           iceberg   read, write      read
 ref: "orders_raw"
 entityType: "TableType"
 values:
@@ -233,3 +248,32 @@ parts:
         - { name: "customer_id", type: "long" }
         - { name: "country", type: "string" }
         - { name: "lifetime_value", type: "decimal(12,2)" }
+---
+ref: "monthly_revenue"
+entityType: "TableType"
+dependsOn: ["orders", "payments"]
+values:
+  name: "monthly_revenue"
+  description: "Revenue per month: orders paid, their total and average"
+  domain: "retail"
+  subdomain: "analytics"
+  layer: "gold"
+  format: "iceberg"
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+    - { id: "data-analysts", type: "GROUP" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
+    - { principals: ["data-analysts"], permissions: ["READ"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      primaryKey: ["month"]
+      columns:
+        - { name: "month", type: "date", description: "First day of the month" }
+        - { name: "orders", type: "long", description: "Orders paid in the month" }
+        - { name: "revenue", type: "decimal(12,2)", description: "Total paid" }
+        - { name: "average_order", type: "decimal(10,2)", description: "Revenue divided by orders" }
