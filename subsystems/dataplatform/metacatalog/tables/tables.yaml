@@ -277,3 +277,4 @@ parts:
         - { name: "orders", type: "long", description: "Orders paid in the month" }
         - { name: "revenue", type: "decimal(12,2)", description: "Total paid" }
         - { name: "average_order", type: "decimal(10,2)", description: "Revenue divided by orders" }
+        - { name: "customers", type: "long", description: "Customers who paid in the month" }
