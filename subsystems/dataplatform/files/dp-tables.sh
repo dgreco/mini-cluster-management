@@ -2,7 +2,7 @@
 # dp-tables.sh: the platform's tables in Meta Catalog, from the command line.
 #
 #   dp-tables.sh [-l <user>] load [<file.yaml> ...]
-#   dp-tables.sh [-l <user>] domains
+#   dp-tables.sh [-l <user>] [-y] model
 #   dp-tables.sh [-l <user>] list [<tables>]
 #   dp-tables.sh [-l <user>] status <tables>
 #   dp-tables.sh [-l <user>] provision|authorize|reject <tables>
@@ -23,12 +23,23 @@
 #              Meta Catalog checks each against its enum, not the pair). Once
 #              loaded, a table lives in Meta Catalog: change it there (UI or
 #              API), not in its file.
-# domains      sends the model file's trait DomainMember (the domains and
-#              their subdomains) to Meta Catalog, once its three lists agree:
-#              a new version of the trait, then of TableType, whose schema is
-#              made from its traits when it is versioned. Tables keep the
-#              version they were made with. Nothing when Meta Catalog has it
-#              already.
+# model        sends the changes of the model file to the model Meta Catalog
+#              has, as versions (files/model_plan.py): new traits, trait
+#              links, entity types and mappings are made; a changed trait or
+#              entity type gets a new version (so does a type whose merged
+#              schema a changed trait alters); a changed mapping, or one whose
+#              target type got a version, is sent again (replaced in place).
+#              Shows them and asks first (-y does not); nothing when Meta
+#              Catalog has the file's model already. The domains are part of
+#              it (the trait DomainMember): its three lists must agree.
+#              Entities keep the version they were made with: a new
+#              property or enum value is for tables made afterwards, and a
+#              changed mapping reaches what it derived before only when its
+#              source is next edited. What Meta Catalog has and the file has
+#              not is shown and left as it is (unload-model takes a whole
+#              model out). A call Meta Catalog refuses stops the run, after
+#              those before it: fix the file and run it again, it sends what
+#              is still missing.
 # list         the tables, with what is provisioned and authorized
 # status       each table's folder and metastore table: provisioned?
 #              authorized for whom?
@@ -81,7 +92,7 @@ shift $((OPTIND - 1))
 cmd=$1; shift
 case $cmd in
   load) ;;
-  domains) [ $# -eq 0 ] || usage ;;
+  model) [ $# -eq 0 ] || usage ;;
   list) [ $# -le 1 ] || usage ;;
   provision|unprovision|authorize|reject|status|delete|unload-model) [ $# -eq 1 ] || usage ;;
   *) usage ;;
@@ -195,7 +206,7 @@ live_pairs() {
   api GET /trait/DomainMember
   [ "$CODE" = 200 ] || fail "Meta Catalog has no trait DomainMember (HTTP $CODE): load the model first (dp-tables.sh load)"
   PAIRS=$(jq -c '.schema | if type == "string" then fromjson else . end | .properties.domain["x-subdomains"] | objects' <<<"$BODY")
-  [ -n "$PAIRS" ] || fail "the trait DomainMember in Meta Catalog has no x-subdomains: dp-tables.sh domains sends the model's"
+  [ -n "$PAIRS" ] || fail "the trait DomainMember in Meta Catalog has no x-subdomains: dp-tables.sh model sends the model's"
 }
 
 # Fails unless <domain>/<subdomain> is one of them
@@ -271,25 +282,38 @@ model_domains() {
   [ -z "$faults" ] || fail "$MODEL, trait DomainMember:"$'\n'"$faults"
 }
 
-# Whether two schemas say the same of domain and subdomain (Meta Catalog
-# answers with the keys of an object in another order)
-same_domains() { # <schema JSON> <schema JSON>
-  jq -en --argjson a "$1" --argjson b "$2" '[$a, $b] | map(.properties | {domain, subdomain}) | .[0] == .[1]' >/dev/null
+# The calls that bring Meta Catalog's model to the file's, as model_plan.py
+# prints them (JSON lines: {say, method, path, body} and {note})
+model_changes() {
+  local live part
+  live=$(mktemp)
+  printf '{' >"$live"
+  for part in traits:/trait types:/entity-type mappings:/mapping links:/trait/relationships; do
+    api GET "${part#*:}"
+    [ "$CODE" = 200 ] || { rm -f "$live"; fail "Meta Catalog answered HTTP $CODE for ${part#*:}: $BODY"; }
+    printf '"%s": %s%s' "${part%%:*}" "$BODY" "$([ "${part%%:*}" = links ] || echo ,)" >>"$live"
+  done
+  printf '}' >>"$live"
+  "${PYTHON:-python3}" "$HERE/model_plan.py" "$MODEL" "$live" || { rm -f "$live"; fail "the model file cannot be compared (above)"; }
+  rm -f "$live"
 }
 
 load_model() {
   local names missing=0 present=0 n
-  names=$(awk '/^EntityTypes:/ { s = 1; next } /^[A-Za-z]/ { s = 0 } s && /^  - name:/ { print $3 }' "$MODEL")
+  names=$("${PYTHON:-python3}" -c 'import sys, yaml
+print("\n".join(t["name"] for d in yaml.safe_load_all(open(sys.argv[1])) if d for t in d.get("EntityTypes") or []))' "$MODEL")
+  [ -n "$names" ] || fail "$MODEL: no entity type"
   for n in $names; do
     api GET "/entity-type/$n"
     case $CODE in 200) present=$((present + 1)) ;; 404) missing=$((missing + 1)) ;; *) fail "Meta Catalog answered HTTP $CODE for entity type $n" ;; esac
   done
   if [ "$missing" -eq 0 ]; then
     echo "model: already in Meta Catalog ($present entity types)"
-    api GET /trait/DomainMember
-    if [ "$CODE" = 200 ] && ! same_domains "$(jq -c '.schema | if type == "string" then fromjson else . end' <<<"$BODY")" \
-         "$(model_part Traits DomainMember | jq -r .schema)"; then
-      echo "model: its domains (the trait DomainMember) are not those of $MODEL: tables are checked against Meta Catalog's (dp-tables.sh domains sends the file's)"
+    # a hint only: the tables are checked against Meta Catalog's model
+    if ! n=$(model_changes | jq -s 'map(select(.method)) | length'); then
+      echo "model: Meta Catalog's could not be compared with $MODEL (dp-tables.sh model says why)"
+    elif [ "$n" -ne 0 ]; then
+      echo "model: Meta Catalog's differs from $MODEL ($n change(s)): tables are checked against Meta Catalog's (dp-tables.sh model shows and sends them)"
     fi
   elif [ "$present" -eq 0 ]; then
     model_domains
@@ -344,35 +368,29 @@ load() {
   done
 }
 
-# ---------------------------------------------------------------- domains ----
-domains() {
-  local want live body merged type versioned=false
+# ---------------------------------------------------------------- model ----
+model() {
+  local plan calls line
   model_domains
-  want=$(model_part Traits DomainMember)
-  api GET /trait/DomainMember
-  [ "$CODE" = 200 ] || fail "Meta Catalog has no trait DomainMember (HTTP $CODE): load the model first (dp-tables.sh load)"
-  live=$(jq -c '.schema | if type == "string" then fromjson else . end' <<<"$BODY")
-  if ! same_domains "$live" "$(jq -r .schema <<<"$want")"; then
-    body=$(jq -c 'if .inheritsFrom == null then del(.inheritsFrom) else . end' <<<"$want")
-    api POST /trait/DomainMember/versions -H 'Content-Type: application/json' -d "$body"
-    [[ $CODE == 20[01] ]] || fail "a new version of the trait DomainMember: HTTP $CODE: $BODY"
-    echo "trait DomainMember: version $(jq -r '.version // "?"' <<<"$BODY"), domains $(jq -r '.schema | fromjson | .properties.domain.enum | join(", ")' <<<"$want")"
-    versioned=true
-  fi
-  # a type's schema is merged from its traits' when it is made or versioned:
-  # TableType takes the new trait with a version of its own
   api GET /entity-type/TableType
   [ "$CODE" = 200 ] || fail "Meta Catalog has no entity type TableType (HTTP $CODE): load the model first (dp-tables.sh load)"
-  merged=$(jq -c '.schema | if type == "string" then fromjson else . end' <<<"$BODY")
-  if $versioned || ! same_domains "$merged" "$(jq -r .schema <<<"$want")"; then
-    type=$(model_part EntityTypes TableType)
-    body=$(jq -c 'if .inheritsFrom == null then del(.inheritsFrom) else . end' <<<"$type")
-    api POST /entity-type/TableType/versions -H 'Content-Type: application/json' -d "$body"
-    [[ $CODE == 20[01] ]] || fail "a new version of TableType: HTTP $CODE: $BODY (the trait is up to date: dp-tables.sh domains again)"
-    echo "entity type TableType: version $(jq -r '.version // "?"' <<<"$BODY"): new tables take these domains; tables made before keep theirs"
-  else
-    echo "domains: Meta Catalog has the model's already ($(jq -r '.schema | fromjson | .properties.domain.enum | join(", ")' <<<"$want"))"
+  plan=$(model_changes)
+  calls=$(jq -c 'select(.method)' <<<"$plan")
+  jq -r 'select(.note) | "model: " + .note' <<<"$plan"
+  if [ -z "$calls" ]; then
+    echo "model: Meta Catalog has the model of $MODEL already"
+    return 0
   fi
+  echo "model: $(wc -l <<<"$calls" | tr -d ' ') change(s) of $MODEL for Meta Catalog:"
+  jq -r '"  " + .say' <<<"$calls"
+  confirm "Send them to Meta Catalog?" model
+  while IFS= read -r line; do
+    api "$(jq -r .method <<<"$line")" "$(jq -r .path <<<"$line")" -H 'Content-Type: application/json' \
+      --data-binary "$(jq -c .body <<<"$line")"
+    [[ $CODE == 20[014] ]] \
+      || fail "$(jq -r .say <<<"$line"): HTTP $CODE: $BODY (what came before is in Meta Catalog: fix the file, then dp-tables.sh model again)"
+    echo "$(jq -r .say <<<"$line"): done"
+  done <<<"$calls"
 }
 
 # ---------------------------------------------------------------- a model, out ----
@@ -514,7 +532,7 @@ confirm() { # <what happens> <reference>
 
 case $cmd in
   load) load "$@" ;;
-  domains) domains ;;
+  model) model ;;
   unload-model) unload_model "$1" ;;
   list)
     found=$(if [ $# -eq 1 ]; then tables "$1"; else

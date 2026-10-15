@@ -2,8 +2,10 @@
 # relationships, entity types, mappings). This file is the whole model, as
 # Meta Catalog gets it: nothing is rendered into it. Loaded once into the
 # running Meta Catalog by `make dataplatform-tables ARGS="load ..."`, which
-# skips what is already there; after a change of the domains (the trait
-# DomainMember, below), `make dataplatform-tables ARGS=domains` sends it.
+# skips what is already there. After a change, `make dataplatform-tables
+# ARGS=model` sends it as versions: it shows what it will make or version
+# and asks first. Entities keep the version they were made with, so a new
+# property or enum value is for tables made afterwards.
 #
 # The artifact is a table. A table is an aggregate of its own: the unit that
 # is provisioned and the subject of authorization (its root carries the access
@@ -69,7 +71,7 @@ Traits:
   # name may repeat in another domain. The domain smoke, with its subdomain
   # test, is the smoke test's own (make dataplatform-smoke-test).
   #
-  # After a change here: make dataplatform-tables ARGS=domains (it checks the
+  # After a change here: make dataplatform-tables ARGS=model (it checks the
   # three lists agree, then sends a new version of this trait and of
   # TableType). A table keeps the version it was made with. A pair taken out
   # can no longer be provisioned; its tables can still be unprovisioned,

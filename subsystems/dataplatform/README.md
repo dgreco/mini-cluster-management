@@ -295,9 +295,18 @@ make dataplatform-tables ARGS=list                                    # every ta
 A command takes one table, `<domain>/<subdomain>/<layer>/<table>`, or every table under a domain, a subdomain or a layer.
 
 - **Load** sends the model (once), then the files of tables. A table whose domain and subdomain are not a pair of the model in Meta Catalog is refused. From then on a table lives in Meta Catalog: change it in the UI or the API, then provision or authorize again. The file is not read again.
-- **A new domain or subdomain**: add it to the trait `DomainMember` in `metacatalog/table-model.yaml`, in all three lists (`domain.enum`, `domain.x-subdomains`, `subdomain.enum`), then `make dataplatform-tables ARGS=domains`. It checks that the lists agree and the names fit, and gives Meta Catalog's trait and `TableType` a new version; new tables can use the addition at once, provisioning included. Nothing to configure, sync or restart. Commit the file so that it stays the definition.
+- **A change of the model** (a property, an enum value, a trait, an entity type, a mapping, a domain): edit `metacatalog/table-model.yaml`, then
 
-  Tables made before keep the lists they were made with. Taking a domain or subdomain out stops provisioning there; its tables can still be unprovisioned, rejected and deleted.
+  ```bash
+  make dataplatform-tables ARGS=model     # shows what it makes or versions in Meta Catalog, then asks (ARGS="-y model" does not)
+  ```
+
+  New traits, trait links, entity types and mappings are made. A changed trait or entity type gets a new version, and so does every type whose schema a changed trait alters. A changed mapping, or one whose target type got a version, is sent again; Meta Catalog replaces it in place. When nothing differs it says so and sends nothing. Commit the file so that it stays the definition. Nothing to configure, sync or restart.
+  - **Tables made before keep their version**: a new property or enum value is for tables made afterwards (Meta Catalog pins every entity to the version it was made with), and a changed mapping reaches the resources it derived before only when their table is next edited. Do not change how a mapping builds a place or a name (folder, location, schema): provisioning refuses a table whose place changed.
+  - **What Meta Catalog has and the file has not** (a type, a trait, a mapping, a trait link) is shown and left as it is: nothing is deleted. A whole model goes out with `unload-model`.
+  - **Refused before anything is sent**: a mapping whose values are not properties of its target, or leave out one it requires, and a mapped property renamed in one go. Make that two changes: add the new property first, take the old one out afterwards.
+  - **Refused by Meta Catalog** (a keyword it does not take, such as `allOf`): the run stops there, after the changes before it. Fix the file and run it again; it sends what is still missing.
+- **A new domain or subdomain** is such a change: add it to the trait `DomainMember`, in all three lists (`domain.enum`, `domain.x-subdomains`, `subdomain.enum`), then `make dataplatform-tables ARGS=model`. It checks that the lists agree and the names fit before it sends anything; new tables can use the addition at once, provisioning included. Taking a domain or subdomain out stops provisioning there; its tables can still be unprovisioned, rejected and deleted.
 - **Provision** makes the table's folder (as the provisioner's own STS role, with temporary keys), then registers the table in the Hive Metastore through Trino, as the Keycloak service account of the client `metacatalog-provisioner`: the only user Trino lets create, alter or drop. The schema `<domain>_<subdomain>_<layer>` is made with its first table.
   - `iceberg` makes an Iceberg table; `parquet` and `avro` make a table over plain files in the folder.
   - Running it again adds the columns the schema gained. A changed column type, another format, or a table found at another place fails the resource: no data is rewritten.

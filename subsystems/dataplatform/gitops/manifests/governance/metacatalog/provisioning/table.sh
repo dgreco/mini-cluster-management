@@ -265,7 +265,7 @@ authorize() {
 # A table is made only under one of its domain's own subdomains: x-subdomains
 # of the model's trait DomainMember as Meta Catalog has it now
 # (subsystems/dataplatform/metacatalog/table-model.yaml, sent by make
-# dataplatform-tables ARGS=domains). Meta Catalog checks the domain and the
+# dataplatform-tables ARGS=model). Meta Catalog checks the domain and the
 # subdomain each against its enum, not the pair. Asked at Meta Catalog's own
 # Service, as the provisioner. On provision only: the tables of a pair taken
 # out of the definition must still be unprovisioned, rejected and deleted.
@@ -280,7 +280,7 @@ known_pair() {
     "$out" 2>/dev/null) || pairs=""
   rm -f "$out"
   [ "$code" = 200 ] || fail "Meta Catalog ($METACATALOG_API) did not give the trait DomainMember (HTTP $code): nothing is made"
-  [ -n "$pairs" ] || fail "the trait DomainMember in Meta Catalog has no x-subdomains (make dataplatform-tables ARGS=domains sends the model's): nothing is made"
+  [ -n "$pairs" ] || fail "the trait DomainMember in Meta Catalog has no x-subdomains (make dataplatform-tables ARGS=model sends the model's): nothing is made"
   own=$(jq -r --arg d "$DOMAIN" 'if has($d) then .[$d] | join(", ") else "" end' <<<"$pairs")
   [ -n "$own" ] || fail "domain '$DOMAIN' is not one of the model's ($(jq -r 'keys | join(", ")' <<<"$pairs")): nothing is made"
   jq -e --arg d "$DOMAIN" --arg s "$SUBDOMAIN" '.[$d] | index($s) != null' <<<"$pairs" >/dev/null \
