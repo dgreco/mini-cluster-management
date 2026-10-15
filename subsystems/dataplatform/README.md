@@ -88,7 +88,8 @@ Prerequisites:
 make dataplatform-install       # 30-60 minutes; safe to run again
 make dataplatform-smoke-test    # checks that the IAM model holds (about 10 minutes; on a new platform it
                                 # first loads Meta Catalog's model; its own tables, the domain smoke,
-                                # are made for the run and taken out again at the end)
+                                # are made for the run and taken out again at the end, as are its
+                                # users and their Spark jobs)
 make dataplatform-passwords     # the bootstrap and break-glass logins
 ```
 

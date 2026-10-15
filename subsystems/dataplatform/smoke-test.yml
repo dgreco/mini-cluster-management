@@ -13,9 +13,9 @@
 # loaded when Meta Catalog lacks it, so a platform built from scratch needs
 # no other step first; the domain and the tables are loaded and provisioned
 # on every run, and smoke-adm authorizes them.
-# At the end, pass or fail, the domain goes out of Meta Catalog again
+# At the end, pass or fail, its tables go out of Meta Catalog again
 # (rejected, unprovisioned, deleted: no grant of the test stays in the
-# record), then the users go.
+# record), then the users go, with their Spark jobs and tokens.
 #   make dataplatform-smoke-test
 - name: Data platform smoke test
   hosts: "{{ groups['k3s_servers'][0] }}"
@@ -305,8 +305,32 @@
           retries: 4
           delay: 5
 
-        - name: Delete their Spark namespaces
-          ansible.builtin.command: >-
-            /usr/local/bin/k3s kubectl delete namespace --ignore-not-found --wait=false
-            {{ smoke_users.keys() | map('regex_replace', '^', 'spark-') | join(' ') }}
+        # Their Spark jobs, in compute under their user label: the operator's
+        # ConfigMaps, service account and role binding belong to a job and go
+        # with it; the token Secrets belong to none.
+        - name: Delete their Spark jobs and tokens
+          ansible.builtin.shell: |
+            set -o pipefail
+            k="/usr/local/bin/k3s kubectl -n compute"
+            $k delete sparkapplications.spark.stackable.tech --ignore-not-found --wait=true --timeout=120s \
+              -l '{{ dataplatform_domain }}/user in ({{ smoke_users.keys() | join(',') }})'
+            $k get secrets -o name \
+              | { grep -E '^secret/spark-token-({{ smoke_users.keys() | map('regex_escape') | join('|') }})-' || true; } \
+              | xargs -r $k delete --ignore-not-found
+          args:
+            executable: /bin/bash
           changed_when: true
+
+        - name: Nothing of their Spark jobs is left
+          ansible.builtin.shell: |
+            set -o pipefail
+            k="/usr/local/bin/k3s kubectl -n compute"
+            {
+              $k get sparkapplications.spark.stackable.tech -o name -l '{{ dataplatform_domain }}/user in ({{ smoke_users.keys() | join(',') }})'
+              $k get secrets -o name | grep -E '^secret/spark-token-({{ smoke_users.keys() | map('regex_escape') | join('|') }})-' || true
+            } | sed '/^$/d'
+          args:
+            executable: /bin/bash
+          register: smoke_jobs_left
+          changed_when: false
+          failed_when: smoke_jobs_left.rc != 0 or smoke_jobs_left.stdout | length > 0
