@@ -88,6 +88,8 @@ spec:
             - {name: KEYCLOAK_TOKEN_URL, value: https://keycloak.<%= dataplatform_domain %>/realms/<%= dataplatform_keycloak_realm %>/protocol/openid-connect/token}
             - {name: PROVISIONER_CLIENT_ID, value: metacatalog-provisioner}
             - {name: PROVISIONER_CLIENT_SECRET_FILE, value: /etc/metacatalog/provisioner/client-secret}
+            # its own Service: reconcile.sh lists its folders and tables there
+            - {name: METACATALOG_API, value: http://metacatalog.governance.svc/metacatalog/v1}
           # ... the record of grants, Ceph and the names of the platform's
           # tables (metacatalog-grants.yaml)
           envFrom:

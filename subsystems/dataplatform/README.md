@@ -30,7 +30,7 @@ The names point to node2 and node3, where k3s servicelb publishes the platform's
 
 ```
 a table's policy in Meta Catalog  --authorize (platform-admins only)-->  record governance/metacatalog-grants
-        the table's folder  =>  Ceph role usr-<user> / grp-<group> (at once; iam-reconcile repairs it hourly)
+        the table's folder  =>  Ceph role usr-<user> / grp-<group> (at once; iam-reconcile repairs it every ten minutes)
                             =>  Trino's S3 mapping (iam-sync, within a minute)
         the table itself    =>  the rules in the Open Policy Agent, for Trino and for the Spark jobs (iam-sync, within a minute)
 gitops/iam/access.yaml:  the bucket, the admin group, Meta Catalog's provisioner (roles kept by make dataplatform-iam)
@@ -89,7 +89,7 @@ make dataplatform-install       # 30-60 minutes; safe to run again
 make dataplatform-smoke-test    # checks that the IAM model holds (about 10 minutes; on a new platform it
                                 # first loads Meta Catalog's model; its own tables, the domain smoke,
                                 # are made for the run and taken out again at the end, as are its
-                                # users and their Spark jobs)
+                                # users, their Spark jobs and any grant of theirs left in the record)
 make dataplatform-passwords     # the bootstrap and break-glass logins
 ```
 
@@ -325,8 +325,10 @@ A command takes one table, `<domain>/<subdomain>/<layer>/<table>`, or every tabl
 ```bash
 make dataplatform-grants ARGS=list      # every table's folder and table entry with its grants
 make dataplatform-grants ARGS=plan      # what the roles in Ceph lack against the record (changes nothing)
-make dataplatform-grants ARGS=apply     # bring them back now (the CronJob iam-reconcile does it every hour)
+make dataplatform-grants ARGS=apply     # bring them back now (the CronJob iam-reconcile does it every ten minutes)
 ```
+
+**A table that is gone takes its grants with it.** Meta Catalog deletes a table, in its UI or its API, without asking our scripts, so a table deleted without a reject first keeps its grants in the record. Every ten minutes `iam-reconcile` asks Meta Catalog for its folders and tables, takes out of the record every entry Meta Catalog no longer has, and so takes away the rights in Ceph and Trino; `make dataplatform-grants ARGS=plan` shows what it would take out, and `ARGS=apply` does it now. It takes out nothing while Meta Catalog does not answer, or holds no table at all while the record holds some (a Meta Catalog set up again empty is likelier than every table deleted): then `make dataplatform-grants ARGS="remove <resource>"`, entry by entry.
 
 A role that no grant names any more loses its policies, so it grants nothing, but it is never deleted. Trino keeps a role's credentials for an hour, and Ceph would refuse them once the role had been deleted, even after a new grant had made it again. The users would then be locked out of Trino until the credentials ran out. A new grant puts the policy back into the same role instead. When the record is empty, only a reject or `make dataplatform-grants ARGS="remove <resource>"` empties roles, because they emptied the record on purpose. The hourly repair keeps them as they are then, since an empty record is more likely a lost one; `plan` lists them as `kept role`.
 
@@ -456,7 +458,7 @@ gitops/helm-values/<chart>-values.yaml
 | 0 | Keycloak (+ PostgreSQL), the directory (Samba AD, one domain controller), the Hive Metastore (+ PostgreSQL) |
 | 1 | the Keycloak realm, iam-sync, the Open Policy Agent, Grafana |
 | 2 | Trino, Spark (history server, job RBAC), the catalog gate (the jobs' way to the Hive Metastore), JupyterHub, VMUI, LDAP Account Manager |
-| 3 | Meta Catalog (with the CronJob iam-reconcile, which applies the record of grants every hour), the OpenBao snapshot CronJob, the directory's backup CronJob and the CronJob that purges finished Spark jobs: last, because Argo CD rates a CronJob whose last run failed (or is still waiting) unhealthy, and the root app waits for each wave to be healthy |
+| 3 | Meta Catalog (with the CronJob iam-reconcile, which applies the record of grants every ten minutes), the OpenBao snapshot CronJob, the directory's backup CronJob and the CronJob that purges finished Spark jobs: last, because Argo CD rates a CronJob whose last run failed (or is still waiting) unhealthy, and the root app waits for each wave to be healthy |
 
 **What Ansible owns on the cluster** (everything else is Argo CD's, from `gitops/`):
 - the k3s HelmChart `argo-cd` (`/var/lib/rancher/k3s/server/manifests/dataplatform-argocd.yaml`, values from `bootstrap/argocd-values.yaml` plus the pinned Git host keys), the Secret `argocd/dataplatform-repo` (the Git key), the AppProject and the root Application from `app-of-apps/` (a change there needs `make dataplatform-argocd`);
@@ -494,7 +496,7 @@ in OpenBao, Secret `backup-s3` in `governance`, Argo CD app `governance-backup`)
 | OpenBao (Raft) | CronJob `openbao-snapshot` at 03:15 (service account login, may only read `sys/storage/raft/snapshot`), 14 kept; a run missed while the cluster was off starts at the power-on and waits up to 2 hours for OpenBao | `openbao/openbao-<date>.snap` |
 | etcd of k3s | `subsystems/k3s/README.md` | `etcd/` |
 | The directory (Samba AD: every user, group and password hash, the domain's keys) | CronJob `samba-ad-backup` at 03:45: it starts `ad-backup` in the domain controller's pod (`samba-tool domain backup offline`, which has to run on the controller), 14 kept. As sensitive as an OpenBao snapshot | `samba-ad/samba-ad-<date>.tar.bz2` |
-| The record of grants (ConfigMap `governance/metacatalog-grants`) | CronJob `iam-reconcile`, every hour after it applied the record: `latest.json` and one file per day | `metacatalog-grants/` |
+| The record of grants (ConfigMap `governance/metacatalog-grants`) | CronJob `iam-reconcile`, every ten minutes after it applied the record: `latest.json` and one file per day | `metacatalog-grants/` |
 | Ceph's own state | `make ceph-backup`, to this computer | `backups/ceph/` |
 
 ```bash

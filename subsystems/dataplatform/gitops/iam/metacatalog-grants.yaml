@@ -7,7 +7,8 @@
 # record made anew starts empty): the provisioning scripts write its data (authorize puts a
 # resource's key, reject removes it; the Application ignores /data), and it is
 # never pruned or deleted with the Application. iam-sync reads it (Trino's S3
-# mapping); iam-reconcile applies it to Ceph's STS roles every hour and copies
+# mapping); iam-reconcile, every ten minutes, takes out the entries of
+# resources Meta Catalog no longer has, applies it to Ceph's STS roles and copies
 # it to s3://platform-backups/metacatalog-grants/.
 # make dataplatform-grants lists it, plans, applies, removes a key and
 # restores a copy.

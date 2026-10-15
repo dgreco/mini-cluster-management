@@ -11,10 +11,12 @@
 #
 #   dp-grants.sh list               every resource with its folder or table and its grants
 #   dp-grants.sh export [<file>]    the record as JSON (standard output without a file)
-#   dp-grants.sh plan               what the roles in Ceph lack against the record (changes nothing)
-#   dp-grants.sh apply              bring the roles to the record now (iam-reconcile does it hourly)
-#   dp-grants.sh remove <resource>  drop one resource's grants, then apply: for a table
-#                                   deleted in Meta Catalog without a reject first
+#   dp-grants.sh plan               what apply would change: entries of resources Meta Catalog no
+#                                   longer has, roles in Ceph that lack the record (changes nothing)
+#   dp-grants.sh apply              those entries out, the roles to the record, now (iam-reconcile
+#                                   does it every ten minutes)
+#   dp-grants.sh remove <resource>  drop one resource's grants, then apply: for an entry
+#                                   iam-reconcile leaves (Meta Catalog still has the resource)
 #   dp-grants.sh import <file>      put the resources of a copy into the record, then apply:
 #                                   a restore from s3://<backup bucket>/metacatalog-grants/
 #                                   (validated first; resources missing from the copy are kept)

@@ -1,7 +1,11 @@
-# Every hour: Ceph's STS roles back to the record of grants
-# (metacatalog-grants.yaml; provisioning/reconcile.sh apply), and the record
-# copied to s3://platform-backups/metacatalog-grants/. It applies what was
-# authorized, never Meta Catalog's current policies, and runs in the cluster:
+# Every ten minutes: the entries of tables Meta Catalog no longer has out of
+# the record of grants (a table deleted without a reject), Ceph's STS roles
+# back to the record (metacatalog-grants.yaml; provisioning/reconcile.sh
+# apply), and the record copied to s3://platform-backups/metacatalog-grants/.
+# It asks Meta Catalog as its provisioner (the client credentials of the
+# Secret metacatalog-provisioner, as Meta Catalog's own pod has them) for
+# its folders and tables. It applies what was authorized, never Meta
+# Catalog's current policies, and runs in the cluster:
 # nothing runs while it is off, and the first run after a power-on repairs
 # what changed meanwhile. Meta Catalog's image: the scripts need bash, curl
 # and jq, and it has them.
@@ -10,7 +14,7 @@ kind: CronJob
 metadata:
   name: iam-reconcile
 spec:
-  schedule: "17 * * * *"
+  schedule: "*/10 * * * *"
   # only the latest missed run starts after a power-on
   startingDeadlineSeconds: 3600
   concurrencyPolicy: Forbid
@@ -39,6 +43,10 @@ spec:
               env:
                 - {name: BACKUP_BUCKET, value: platform-backups}
                 - {name: BACKUP_KEY_DIR, value: /etc/metacatalog/backup}
+                - {name: KEYCLOAK_TOKEN_URL, value: https://keycloak.data.example.org/realms/data-platform/protocol/openid-connect/token}
+                - {name: PROVISIONER_CLIENT_ID, value: metacatalog-provisioner}
+                - {name: PROVISIONER_CLIENT_SECRET_FILE, value: /etc/metacatalog/provisioner/client-secret}
+                - {name: METACATALOG_API, value: http://metacatalog.governance.svc/metacatalog/v1}
               resources:
                 requests: {cpu: 10m, memory: 32Mi}
                 limits: {memory: 128Mi}
@@ -51,6 +59,7 @@ spec:
                 - {name: provisioning, mountPath: /opt/metacatalog/provisioning, readOnly: true}
                 - {name: iam, mountPath: /etc/metacatalog/iam, readOnly: true}
                 - {name: backup, mountPath: /etc/metacatalog/backup, readOnly: true}
+                - {name: provisioner, mountPath: /etc/metacatalog/provisioner, readOnly: true}
           volumes:
             - name: tmp
               emptyDir: {}
@@ -64,3 +73,7 @@ spec:
             - name: backup
               secret:
                 secretName: backup-s3
+            # Meta Catalog's provisioner: the listings of its folders and tables
+            - name: provisioner
+              secret:
+                secretName: metacatalog-provisioner

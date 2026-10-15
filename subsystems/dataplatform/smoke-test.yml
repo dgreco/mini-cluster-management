@@ -15,7 +15,10 @@
 # on every run, and smoke-adm authorizes them.
 # At the end, pass or fail, its tables go out of Meta Catalog again
 # (rejected, unprovisioned, deleted: no grant of the test stays in the
-# record), then the users go, with their Spark jobs and tokens.
+# record), then the users go, with their Spark jobs and tokens; iam-reconcile
+# runs, and nothing of the domain smoke may be left in the record (check Z2
+# deletes one table without a reject, as Meta Catalog's UI lets anyone, and
+# only iam-reconcile takes its grants out).
 #   make dataplatform-smoke-test
 - name: Data platform smoke test
   hosts: "{{ groups['k3s_servers'][0] }}"
@@ -334,3 +337,26 @@
           register: smoke_jobs_left
           changed_when: false
           failed_when: smoke_jobs_left.rc != 0 or smoke_jobs_left.stdout | length > 0
+
+        # A table deleted in Meta Catalog without a reject (its UI's delete
+        # calls no script) leaves its keys in the record, and its grants in
+        # force, until iam-reconcile finds Meta Catalog has it no more (every
+        # ten minutes); check Z2 made one. Here it runs at once, as
+        # make dataplatform-grants ARGS=apply does.
+        - name: Take out of the record what Meta Catalog has no more (iam-reconcile)
+          ansible.builtin.command: >-
+            /usr/local/bin/k3s kubectl -n governance exec deploy/metacatalog -c metacatalog --
+            bash /opt/metacatalog/provisioning/reconcile.sh apply
+          register: smoke_reconcile
+          changed_when: "'removed ' in smoke_reconcile.stdout"
+
+        - name: Nothing of the domain smoke is left in the record
+          ansible.builtin.shell: |
+            set -o pipefail
+            /usr/local/bin/k3s kubectl -n governance get configmap metacatalog-grants -o 'jsonpath={.data}' \
+              | { grep -oE '"(folder\.smoke\.|table\.smoke_)[^"]*"' || true; }
+          args:
+            executable: /bin/bash
+          register: smoke_record_after
+          changed_when: false
+          failed_when: smoke_record_after.rc != 0 or smoke_record_after.stdout | length > 0

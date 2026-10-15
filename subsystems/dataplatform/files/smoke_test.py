@@ -71,7 +71,9 @@ F  the directory is the only source of people, and only its administrators
 Z  the tables of the domain smoke go out of Meta Catalog: the administrator
    rejects them (their keys leave the record of grants), the engineer
    unprovisions them (the metastore's tables and the files go) and deletes
-   them.
+   them. Before that, one more is authorized and deleted without a reject, as
+   Meta Catalog's UI lets anyone: the playbook then runs iam-reconcile, which
+   must take its grants out of the record.
 Reads use sum(), not count(*) (answered from Iceberg statistics, no data read).
 Prints one line per check and exits 1 when any check fails.
 """
@@ -560,10 +562,47 @@ def remove_domain(eng: str, adm: str) -> None:
           code == 200 and not rows, f"still there: HTTP {code} {len(rows) if code == 200 else '?'}")
 
 
+ORPHAN = "orphan_t"             # Z2's table: authorized, then deleted without a reject
+
+
+def orphan(eng: str, adm: str) -> None:
+    """A table deleted in Meta Catalog without a reject (its UI's delete, its
+    API's) leaves its grants in the record of grants: iam-reconcile takes
+    them out. Here one is made, authorized and deleted that way; the
+    playbook then runs iam-reconcile and fails if anything of the domain
+    smoke is left in the record. A folder only, never provisioned: nothing
+    in S3."""
+    label = f"Z2 a table authorized, then deleted in Meta Catalog without a reject (as its UI's delete does)"
+    ref = f"{DOMAIN}/{SUBDOMAIN}/bronze/{ORPHAN}"
+    code, out = metacatalog(eng, "POST", "/aggregate/yaml", table_doc(DOMAIN, SUBDOMAIN, ORPHAN),
+                            ctype="application/octet-stream")
+    if code != 204:
+        check(label, False, f"loading it: HTTP {code} {str(out)[:200]}")
+        return
+    end, folders = time.time() + 60, []            # derivation is asynchronous
+    while time.time() < end:
+        found, folders = entities(eng, "S3FolderType", f'@.domain == "{DOMAIN}" && @.table == "{ORPHAN}"')
+        if found == 200 and folders:
+            break
+        time.sleep(2)
+    ok, out = tables_tool(adm, "authorize", ref) if folders else (False, "its folder was not derived")
+    found, rows = entities(eng, "TableType", f'@.domain == "{DOMAIN}" && @.name == "{ORPHAN}"')
+    code = 0
+    if found == 200 and rows:
+        code, _ = metacatalog(eng, "DELETE", f"/aggregate/{rows[0]['id']}")
+    found, rows = entities(eng, "TableType", f'@.domain == "{DOMAIN}" && @.name == "{ORPHAN}"')
+    check(label, ok and code in (200, 204) and found == 200 and not rows,
+          f"authorize: {out[-200:]}; delete: HTTP {code}; still there: {rows if found == 200 else found}")
+
+
 def cleanup(eng: str, both: str) -> None:
     """Whatever the run left behind: the rows, the S3 checks' objects, then
     the domain smoke itself (the next run loads it again)."""
     empty_tables(eng, both)
+    try:
+        orphan(eng, "smoke-adm")
+    except Exception as e:  # noqa: BLE001 - reported as a failed check
+        check("Z2 a table authorized, then deleted in Meta Catalog without a reject", False, repr(e)[:400])
     try:
         remove_domain(eng, "smoke-adm")
     except Exception as e:  # noqa: BLE001 - reported as a failed check

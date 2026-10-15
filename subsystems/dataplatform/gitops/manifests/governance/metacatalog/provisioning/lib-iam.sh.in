@@ -1,5 +1,5 @@
 # The applied grants -> Ceph RGW's IAM. Sourced by table.sh (authorize,
-# reject, with lib-grants.sh) and reconcile.sh (the hourly CronJob
+# reject, with lib-grants.sh) and reconcile.sh (the CronJob
 # iam-reconcile); needs bash, curl and jq.
 #
 # The record of what is granted is the ConfigMap $GRANTS_CONFIGMAP of this
@@ -28,7 +28,8 @@
 # role no grant names any more loses its policies and is kept (never deleted:
 # iam_empty_role says why); while the record is empty only by a run right
 # after an entry was taken out on purpose (IAM_ENTRY_REMOVED), never by the
-# hourly reconcile. The roles of $IAM_PLATFORM_ROLES
+# reconcile unless it took out, itself, entries of resources Meta Catalog
+# no longer has. The roles of $IAM_PLATFORM_ROLES
 # (the admin groups', Meta Catalog's provisioner's) are Ansible's (make
 # dataplatform-iam) and never touched: grants naming them are kept in the
 # record for iam-sync only. The RGW user of $IAM_KEY_DIR may manage usr-* and
@@ -312,7 +313,8 @@ iam_converge() { # plan|apply
     # An empty record is far likelier a lost one than every grant rejected,
     # unless an entry was just taken out on purpose (IAM_ENTRY_REMOVED=true:
     # a reject, lib-grants.sh; make dataplatform-grants ARGS="remove ..."):
-    # then it is the last grant going. The hourly reconcile never sets it.
+    # then it is the last grant going. The reconcile sets it only after it
+    # took out entries of resources Meta Catalog no longer has (reconcile.sh).
     if [ "$(jq length <<<"$RECORD")" = 0 ] && [ "${IAM_ENTRY_REMOVED:-false}" != true ]; then
       [ -z "$(iam_role_policies "$role")" ] ||
         echo "kept role $role as it is: the record of grants is empty (if nothing is granted anywhere on purpose, remove its policies by hand)"
