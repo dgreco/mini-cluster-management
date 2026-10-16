@@ -442,13 +442,13 @@ gitops/helm-values/<chart>-values.yaml
 |---|---|
 | -10 | namespaces |
 | -5 | Gateway API CRDs, cert-manager (the Barman Cloud plugin's certificates and the directory's LDAPS certificate) |
-| -4 | Stackable operators (commons, secret, listener, trino, hive, opa, spark-k8s), CloudNativePG, External Secrets, NGINX Gateway Fabric, Keycloak operator |
+| -4 | Stackable operators (commons, secret, listener, zookeeper, trino, hive, opa, spark-k8s), CloudNativePG, External Secrets, NGINX Gateway Fabric, Keycloak operator |
 | -3 | OpenBao, CloudNativePG's Barman Cloud plugin |
 | -2 | SecretStores, Gateway (+ wildcard certificate, CoreDNS rewrite), S3 connection, RBAC |
-| -1 | VictoriaMetrics, VictoriaLogs, OpenTelemetry collectors, the Vector aggregator, kube-state-metrics |
+| -1 | VictoriaMetrics, VictoriaLogs, OpenTelemetry collectors, the Vector aggregator, kube-state-metrics, the backup user's Secret (app governance-backup) |
 | 0 | Keycloak (+ PostgreSQL), the directory (Samba AD, one domain controller), the Hive Metastore (+ PostgreSQL) |
 | 1 | the Keycloak realm, iam-sync, the Open Policy Agent, Grafana |
-| 2 | Trino, Spark (history server, job RBAC), the catalog gate (the jobs' way to the Hive Metastore), JupyterHub, VMUI, LDAP Account Manager |
+| 2 | Trino, Spark (history server, job RBAC), the catalog gate (the jobs' way to the Hive Metastore), JupyterHub, VMUI, LDAP Account Manager, the S3 browser |
 | 3 | Meta Catalog (with the CronJob iam-reconcile, which applies the record of grants every ten minutes), the OpenBao snapshot CronJob, the directory's backup CronJob and the CronJob that purges finished Spark jobs: last, because Argo CD rates a CronJob whose last run failed (or is still waiting) unhealthy, and the root app waits for each wave to be healthy |
 
 **What Ansible owns on the cluster** (everything else is Argo CD's, from `gitops/`):
