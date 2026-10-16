@@ -42,7 +42,7 @@ gitops/iam/access.yaml:  the bucket, the admin group, Meta Catalog's provisioner
 
 One bucket, `s3://dataplatform`, holds every table as a folder, `lakehouse/<domain>/<subdomain>/<layer>/<table>`. In Trino the same table is `lakehouse.<domain>_<subdomain>_<layer>.<table>`. A grant of a table reaches both, each enforced where it lives:
 
-- **The folder, at Ceph.** Every user and group a policy names gets an STS role whose policy is exactly the folders granted to it: Meta Catalog's authorize applies them to Ceph at once and keeps them in the record of grants (ConfigMap `governance/metacatalog-grants`), which the CronJob `iam-reconcile` applies again every hour.
+- **The folder, at Ceph.** Every user and group a policy names gets an STS role whose policy is exactly the folders granted to it: Meta Catalog's authorize applies them to Ceph at once and keeps them in the record of grants (ConfigMap `governance/metacatalog-grants`), which the CronJob `iam-reconcile` applies again every ten minutes.
 - **The table, in Trino.** The Open Policy Agent decides every statement, from rules in Git (`gitops/manifests/governance/opa/trino.rego`) and the same record, which iam-sync hands it: READ lets you `SELECT` the table and see it, WRITE also lets you change its rows. Nobody but Meta Catalog's provisioner creates, alters or drops a schema or a table, `platform-admins` included.
 
 The directory's groups (`platform-admins`, `data-engineers`, `data-analysts`, more with `make dataplatform-directory`) are the teams; `platform-admins` reads and writes every table and the whole bucket.
@@ -73,7 +73,7 @@ What the example domain `retail` grants (each table's own policy in Meta Catalog
 | `data-analysts` | refused | read | refused |
 | `platform-admins` | everything | everything | everything |
 
-To grant access: change the table's policy in Meta Catalog; a member of `platform-admins` authorizes it (`make dataplatform-grants ARGS=list` shows what is granted).
+To grant access: change the table's grants in `metacatalog/tables/tables.yaml`, then a member of `platform-admins` runs `make dataplatform-tables ARGS="-l admin sync"`, which authorizes it (*Tables in Meta Catalog* under *Everyday use*; `make dataplatform-grants ARGS=list` shows what is granted).
 
 
 ## Install
@@ -107,34 +107,6 @@ make dataplatform-passwords     # the bootstrap and break-glass logins
 
 On the first install, Argo CD stops at OpenBao (wave -3) until the `openbao` step has initialised it. This is expected.
 
-## Moving from the lakehouse model
-
-Until October 2026 the platform kept Iceberg tables only, in a JDBC catalog (PostgreSQL `iceberg-catalog`), grouped in lakehouses, with Trino's own file rules. A platform installed then moves in this order. The old model goes completely: its lakehouses and their data, its definitions in Meta Catalog, its catalog database. Nothing is carried over, and nothing here is automatic.
-
-1. **With the old version still running**, before the new one is on `main`: reject every lakehouse, then unprovision it (`make dataplatform-medallion`): its tables and their files go. To keep a table's data, copy its folder elsewhere first.
-2. Still on the old version: delete the lakehouses in Meta Catalog (its UI, *Delete aggregate* on the instances page), and empty the record of grants: `make dataplatform-grants ARGS=list`, then `remove` each entry.
-3. Merge and push. Then, in this order: `make dataplatform-openbao` (the metastore's database login), `make dataplatform-ceph` (the RGW user `hive`), `make dataplatform-iam` (Ceph takes the provisioner's token), `make dataplatform-sync`.
-4. Take the old model out of Meta Catalog, then load the new one. The old model's file is in Git's history; the new model has a trait named like one of the old (`Dataset`), so it does not load before the old one is out:
-
-   ```bash
-   git show <the commit before this change>:subsystems/dataplatform/metacatalog/medallion-model.yaml > /tmp/medallion-model.yaml
-   make dataplatform-tables ARGS="unload-model /tmp/medallion-model.yaml"     # its mappings, entity types, relationship and traits
-   make dataplatform-tables ARGS="-l admin sync"     # the tables of tables.yaml: made, provisioned, authorized
-   ```
-5. `make dataplatform-smoke-test`.
-6. Remove the old catalog. Argo CD removes its Application and leaves what it made (it holds a database); the Secrets it had in `compute` go by themselves:
-
-   ```bash
-   kubectl -n governance delete scheduledbackup.postgresql.cnpg.io iceberg-catalog-daily
-   kubectl -n governance delete cluster.postgresql.cnpg.io iceberg-catalog            # the database and its volumes
-   kubectl -n governance delete objectstore.barmancloud.cnpg.io iceberg-catalog
-   kubectl -n governance delete externalsecret iceberg-catalog-owner
-   kubectl -n governance delete configmap iceberg-catalog-init
-   source .secrets/s3-backup.env && aws s3 rm --recursive s3://platform-backups/cnpg/iceberg-catalog/   # its backups
-   ```
-
-   In OpenBao, delete the logins nothing reads any more (UI, or `bao kv metadata delete`): `secret/dataplatform/governance/iceberg-catalog-db`, `governance/iceberg-catalog-spark`, `compute/iceberg-catalog`, `compute/iceberg-catalog-spark`.
-
 ## Everyday use
 
 **Users and groups.** They are kept in one place, the directory (Samba AD, the pod `governance/samba-ad-0`). Keycloak reads them from it and can change nothing there. You manage them in **LDAP Account Manager** (LAM) at https://directory.data.example.org, as a member of `platform-admins`:
@@ -165,8 +137,8 @@ make dataplatform-directory ARGS="group join data-analysts alice"  # also: group
   - a new user: at their first login, nothing else is needed;
   - a membership: within about 30 seconds in Trino (iam-sync), and in the user's next token within 5 minutes (STS, Kubernetes, the web UIs read the groups from the token);
   - a disabled or removed user: refused at the next login; a token already issued lasts until it expires.
-- A **new group** gets data access when a table's policy grants it something: add it to the policy in Meta Catalog and have a member of `platform-admins` authorize it (its role appears at once).
-- Removing a user from every group, or removing the account, takes its access away with its next token; removing it from every table's policy (then authorize) removes its own role. A JupyterHub server it left running stops after an hour idle, and its home volume stays until you delete it.
+- A **new group** gets data access when a table's grants name it: add it to the table's `principals` and `grants` in `tables.yaml` and have a member of `platform-admins` sync (its role appears at once).
+- Removing a user from every group, or removing the account, takes its access away with its next token; taking it out of every table's grants in `tables.yaml` (then sync) empties its own role. A JupyterHub server it left running stops after an hour idle, and its home volume stays until you delete it.
 - Keycloak reads the directory as one account (`keycloak-bind`), which can change nothing in it; LAM uses the same account only to find the entry of whoever logs in. The two service accounts of the realm (`service-account-iam-sync`, `service-account-metacatalog-provisioner`) are Keycloak's own, not the directory's.
 
 **LDAP clients.** An LDAP browser or an application that looks users up over LDAP reaches the directory at `ldaps://ad.data.example.org:636`, from wherever the platform's web addresses are reachable. Only LDAPS is exposed: nothing else of Active Directory (no domain join, no Kerberos, no file shares).
@@ -297,7 +269,7 @@ make dataplatform-tables ARGS="-l admin sync"      # do it: shows the steps and 
 - **A step that fails stops the run**, after the steps before it. Fix the cause and sync again: it does only what is still missing.
 - **Tables made before a version of the model** keep their version: a change that uses a value only a newer version takes (a new enum value) is refused by Meta Catalog for them; such a table has to be made again, under another name.
 
-The single-table commands are still there, for a look or a repair. A command takes one table, `<domain>/<subdomain>/<layer>/<table>`, or every table under a domain, a subdomain or a layer:
+Single-table commands are for a look or a repair. Each takes one table, `<domain>/<subdomain>/<layer>/<table>`, or every table under a domain, a subdomain or a layer:
 
 ```bash
 make dataplatform-tables ARGS="status retail/orders/silver/orders"    # one table: provisioned, authorized, for whom
@@ -349,15 +321,15 @@ make dataplatform-grants ARGS=apply     # bring them back now (the CronJob iam-r
 
 **A table that is gone takes its grants with it.** Meta Catalog deletes a table, in its UI or its API, without asking our scripts, so a table deleted without a reject first keeps its grants in the record. Every ten minutes `iam-reconcile` asks Meta Catalog for its folders and tables, takes out of the record every entry Meta Catalog no longer has, and so takes away the rights in Ceph and Trino; `make dataplatform-grants ARGS=plan` shows what it would take out, and `ARGS=apply` does it now. It takes out nothing while Meta Catalog does not answer, or holds no table at all while the record holds some (a Meta Catalog set up again empty is likelier than every table deleted): then `make dataplatform-grants ARGS="remove <resource>"`, entry by entry.
 
-A role that no grant names any more loses its policies, so it grants nothing, but it is never deleted. Trino keeps a role's credentials for an hour, and Ceph would refuse them once the role had been deleted, even after a new grant had made it again. The users would then be locked out of Trino until the credentials ran out. A new grant puts the policy back into the same role instead. When the record is empty, only a reject or `make dataplatform-grants ARGS="remove <resource>"` empties roles, because they emptied the record on purpose. The hourly repair keeps them as they are then, since an empty record is more likely a lost one; `plan` lists them as `kept role`.
+A role that no grant names any more loses its policies, so it grants nothing, but it is never deleted. Trino keeps a role's credentials for an hour, and Ceph would refuse them once the role had been deleted, even after a new grant had made it again. The users would then be locked out of Trino until the credentials ran out. A new grant puts the policy back into the same role instead. When the record is empty, only a reject or `make dataplatform-grants ARGS="remove <resource>"` empties roles, because they emptied the record on purpose. The repair every ten minutes (`iam-reconcile`) keeps them as they are then, since an empty record is more likely a lost one; `plan` lists them as `kept role`.
 
-In the example domain `retail`, `data-engineers` read and write every table and `data-analysts` read the two gold ones.
+In the example domain `retail`, `data-engineers` read and write every table and `data-analysts` read the gold ones.
 
 **S3 browser (administrators).** https://s3browser.data.example.org shows every bucket on Ceph, its directories and objects, an object's metadata, and downloads (a link valid five minutes); it changes nothing. It has no key of its own: your Keycloak login (members of `platform-admins` only) is exchanged at Ceph's STS for the role `grp-platform-admins`, so Ceph logs every listing and download under your name. That role reads the whole platform bucket, and every other bucket on Ceph because `make dataplatform-ceph` adds a read-only statement for it to their bucket policies and writes the list of buckets the browser shows (`system/admin-browser/buckets.json`); a bucket made later appears after `make dataplatform-admin-read`. **Log out** ends the browser's session and your Keycloak session. The program is `gitops/manifests/tools/s3browser/s3browser.py` (standard library, one replica: a restart logs everyone out).
 
 **Logging out on the command line.** `make dataplatform-logout` deletes the S3 keys and cached tokens the scripts left in `.secrets/` and opens Keycloak's logout page, so the next login asks for a user and a password again (`ARGS="-k"` keeps the Keycloak session). Keys already given to a running job or shell stay valid until they expire.
 
-**Desktop tools.** There is no permanent key any more: every data grant comes from Meta Catalog, so a desktop tool (CloudMounter, Cyberduck) uses the temporary keys of `make dataplatform-s3-login` (up to 12 hours, `-d 43200`), and a tool that cannot take their session token has no access. The earlier key `dataplatform-rw` was removed on 2026-10-04 (`dataplatform_s3_users_removed`: `make dataplatform-ceph` deletes such users and their files in `.secrets/`).
+**Desktop tools.** There is no permanent key that reads or writes data: every data grant comes from Meta Catalog, so a desktop tool (CloudMounter, Cyberduck) uses the temporary keys of `make dataplatform-s3-login` (up to 12 hours, `-d 43200`), and a tool that cannot take their session token has no access.
 
 **Monitoring.** Everything goes through OpenTelemetry. The OTel cluster collector (`observability`) is the platform's telemetry gateway:
 - **Metrics.** It scrapes every annotated pod and service, the kubelets, cAdvisor and the Ceph exporters. It also receives OTLP, from the Vector aggregator's own metrics. It sends all of it to **VictoriaMetrics** by Prometheus remote write, its only writer: VictoriaMetrics scrapes nothing itself (no `-promscrape.config`). To check it, compare `vm_rows_inserted_total{type="promremotewrite"}` with `otelcol_exporter_prometheusremotewrite_translated_time_series_total` (equal rates), while every other `type` stays at 0. `make dataplatform-render` (and the pipeline) fails if VictoriaMetrics' render gets a scrape configuration, a vmagent appears, or any other app names one of its write endpoints.
@@ -389,7 +361,7 @@ Useful fields in the Stackable store: `service.name` (the product: `trino`, `hiv
 
 ```
 service.name:=trino k8s.container.name:=trino severity_text:=ERROR   # Trino's own errors
-_time:1h k8s.namespace.name:=spark-alice                # alice's Spark jobs
+_time:1h k8s.namespace.name:=compute service.name:"alice-"*   # alice's Spark jobs (named <user>-<job>)
 _time:1h | stats by (service.name, severity_text) count()    # volume per product and level
 ```
 
@@ -655,7 +627,7 @@ snapshot. After a restore, `make dataplatform-sync` refreshes the Secrets and
   - Members of `platform-admins` are administrators of the cluster as well: one of them could run a pod that passes for anybody's job. They are also the ones who authorize every grant.
   - A job commits only while the gate, the Open Policy Agent and the Kubernetes API answer: the gate says 503 otherwise, never yes.
   - The REST catalog could ask for a Keycloak token itself (`metastore.catalog.servlet.auth`); a job would have to carry it as a Spark setting, readable in its manifest by every submitter, so it is off.
-- **Hive 4.2.0, and Spark through its REST catalog.** Spark cannot use the metastore's Thrift API for Iceberg tables with Hive 4 (`Invalid method name: 'get_table'`: measured, and in [Stackable's own notes](https://docs.stackable.tech/home/stable/hive/#_hive_4_issues)), so the jobs go through the metastore's Iceberg REST catalog instead (measured: they read and commit, and Trino reads what they wrote). The price: on a job's commit the metastore writes the table's new metadata file itself, so its S3 key (`hive`) reads and writes the `metadata/` folder of every table (it reaches no data file), and Ceph never sees who asked for a commit. The catalog gate is what ties a commit to the table's WRITE grant: without it a job of anybody could move a table back to an older snapshot (measured). Trino writes with the user's own role, as before. A later Hive version is a one-way upgrade of the metastore's database.
+- **Hive 4.2.0, and Spark through its REST catalog.** Spark cannot use the metastore's Thrift API for Iceberg tables with Hive 4 (`Invalid method name: 'get_table'`: measured, and in [Stackable's own notes](https://docs.stackable.tech/home/stable/hive/#_hive_4_issues)), so the jobs go through the metastore's Iceberg REST catalog instead (measured: they read and commit, and Trino reads what they wrote). The price: on a job's commit the metastore writes the table's new metadata file itself, so its S3 key (`hive`) reads and writes the `metadata/` folder of every table (it reaches no data file), and Ceph never sees who asked for a commit. The catalog gate is what ties a commit to the table's WRITE grant: without it a job of anybody could move a table back to an older snapshot (measured). Trino writes with the user's own role. A later Hive version is a one-way upgrade of the metastore's database.
 - **The catalog gate judges the user, Ceph the role.** For a job, the gate asks about the user with all their groups, whatever role the job named; Ceph holds the job's files to that one role. A job run with a role that is not granted a table's folder gets through the gate and is refused by Ceph.
 - **The Open Policy Agent's own API has no login.** Once its rules are loaded it refuses any rule or data sent to it (measured); in the seconds before a new pod's first load it does not. From `compute` only Trino's pods reach it (a pod is Trino's by a label that an admission policy lets no other pod carry); the catalog gate asks it inside `governance`. It runs in `governance` because it loads every ConfigMap of its namespace that carries its label, and in `compute` a Spark job's service account can write ConfigMaps.
 - **A job's account has every verb on the pods, ConfigMaps and Services of `compute`** (the Spark operator's role cannot be narrower: a driver makes its executors). Admission policies keep it off what decides who may do what: `dataplatform-compute-configmaps` (Trino's group file and S3 mapping `trino-iam`, its configuration, the discovery ConfigMaps, the cleanup job's program), `dataplatform-compute-pods` (it changes and deletes only its own pods), `dataplatform-compute-pod-labels` and `dataplatform-compute-services` (no pod of a job passes for Trino's or takes its users' requests). A job can still list the pods and read the ConfigMaps of `compute`, the other users' job code among them.
@@ -670,13 +642,13 @@ snapshot. After a restore, `make dataplatform-sync` refreshes the Secrets and
   - Trino's rules match the start of a location, so the rule for a folder itself also matches folders whose names begin with its name (`orders_raw` next to `orders`). Every such folder in the record of grants gets its own rules, with the role it would have had. A place that is in no table's folder there (a stray file, or a table not yet authorized) is read with the other folder's role.
 - **A table you may not read can give an odd error in Trino.** Trino reads an Iceberg table's metadata with your role before it asks its rules. If Ceph refuses that role, Trino 481's `lakehouse` connector answers `Unsupported table handle: io.trino.plugin.iceberg.CorruptedIcebergTableHandle` instead of *Access Denied*. The table is fine: you have no grant on it. Smoke check B4 accepts either answer.
   - Directly on S3 and in Spark, a session has one role, and you pick it (`-g <group>` or `-u`).
-- **No password logins from scripts:** the public clients (`data-cli`, `spark`, `kubernetes`) accept only the device or browser flows; a password can be tried only through the smoke test's confidential client, whose secret is in OpenBao. `kubectl oidc-login` with `--grant-type=password` no longer works.
+- **No password logins from scripts:** the public clients (`data-cli`, `spark`, `kubernetes`) accept only the device or browser flows; a password can be tried only through the smoke test's confidential client, whose secret is in OpenBao. `kubectl oidc-login` with `--grant-type=password` does not work.
 - **One domain controller.** The directory has a single controller (a second one means AD replication between pods). While its pod moves to another node (a drain, a node failure) nobody logs in with a password: Keycloak answers "unexpected error". Tokens already issued and service accounts go on. A token refresh works while the user is in Keycloak's cache (5 minutes, `dataplatform_directory_cache_lifespan`), then it is refused ("User disabled") until the controller is back; the session itself is kept, so the same refresh works again afterwards. iam-sync keeps what it had applied (Keycloak answers it with empty groups meanwhile, which it does not apply).
 - **Nobody changes their own password.** Keycloak only reads the directory, and LDAP Account Manager lets in administrators only: a password is set by an administrator (LAM, or `user passwd`), who has to hand it over. There is no reset by e-mail (Keycloak sends no mail) and no desktop login: of the directory only LDAPS is reachable from outside the cluster (no domain join, no Kerberos login).
 - **The Keycloak console still shows *Add user*, and it works**: the user it makes is the realm's own, not the directory's. Do not use it. Such a user is ignored by iam-sync, and `make dataplatform-iam` and the smoke test (F4) fail while one exists. A change to a user of the directory is refused there ("read only"), and a group made in the console is dropped at the next sync (within a minute).
 - **LDAP Account Manager checks no names.** A user or group name with capitals, dots or spaces is accepted by the directory and breaks role names and Kubernetes objects built from it: keep to small letters, digits and `-` (`make dataplatform-directory` refuses anything else).
 - **One LDAP Account Manager, no state.** It keeps its sessions in the pod: a restart logs its users out, nothing else is lost.
-- **Removing a group** (in LDAP Account Manager, or `make dataplatform-directory ARGS="group remove <name>"`; Keycloak drops it at its next sync): iam-sync refuses an answer that lost a group it had seen (or has none at all), because a half-imported realm would look the same and would revoke every user. After removing a group on purpose, restart iam-sync (`kubectl -n governance rollout restart deploy/iam-sync`), then `make dataplatform-iam ARGS="-e dataplatform_iam_prune=true"` deletes the group's STS role and its bucket if empty (a bucket with data is kept and named).
+- **Removing a group** (in LDAP Account Manager, or `make dataplatform-directory ARGS="group remove <name>"`; Keycloak drops it at its next sync): first take it out of the grants in `tables.yaml` and sync, so its role `grp-<name>` loses its policies (the role itself is kept: roles are never deleted). iam-sync refuses an answer that lost a group it had seen (or has none at all), because a half-imported realm would look the same and would revoke every user: after removing a group on purpose, restart iam-sync (`kubectl -n governance rollout restart deploy/iam-sync`).
 - **Removing a user** (from every group, or from the directory): the next token has no group, so STS, Trino and Kubernetes refuse it; a job already running keeps its token until it ends.
 - **Spark sees the Iceberg tables.** Its catalog `lakehouse` is Iceberg's; a `parquet` or `avro` table is not in it. A job can read such a table's files by path with its role.
 - **Spark job length:** a job lives about as long as its token. Tokens of the Keycloak client `spark` last 12 hours.
@@ -685,7 +657,7 @@ snapshot. After a restore, `make dataplatform-sync` refreshes the Secrets and
 - **Spark event logs** (`s3://dataplatform/system/spark-events/`, reached only by the RGW user `spark`, whose key every job carries) are readable by every job submitter; no grant may name `system/`.
 - **Spark jobs share the namespace `compute`:** every submitter sees every job, its pods and its driver logs, and may delete them; a token Secret can be created and deleted by name but never read. The files are Ceph's to refuse, with the token's role.
 - **Keycloak signing key:** if you rotate it, run `make dataplatform-iam` so Ceph trusts the new certificate.
-- **A new Keycloak group** has no data until a table's policy grants it something and an administrator authorized it; a group with no grant has no role, and its members get nothing from Trino unless they have a grant of their own.
+- **A new Keycloak group** has no data until a table's grants in `tables.yaml` name it and an administrator synced them; a group with no grant has no role, and its members get nothing from Trino unless they have a grant of their own.
 - **Authorize applies the policy as it is at that moment:** an administrator approves what Meta Catalog shows; an edit made after the authorize waits for the next one. Meta Catalog keeps no history of policies; who authorized what and when is in oauth2-proxy's log (VictoriaLogs, pod `metacatalog-proxy`), what changed in the authorize run's result.
 - **The gate guards the way in from outside:** pods in `governance`, `observability` and `operators`, and the nodes, can reach Meta Catalog's Service without the proxy (the namespace policy keeps `tools` and `compute` out).
 - **Two default StorageClasses:** k3s marks `local-path` as default at every start, next to `ceph-rbd`. Every volume of the platform names `ceph-rbd`; do the same in anything you add, or the volume may land on a node's local disk.
