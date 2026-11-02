@@ -33,8 +33,8 @@ on a file Meta Catalog would refuse in a way that can be seen here.
 
 Meta Catalog answers with merged schemas only, so the merge is done here as
 Meta Catalog does it (JsonUtils.mergeSchemas over TypeLinearization, read in
-its code, commit 29815bb): the type, then its traits from the last declared
-to the first, then its father, each followed by its own linearization, an
+its code, commit 29815bb; unchanged in 2.0.0): the type, then its traits from
+the last declared to the first, then its father, each followed by its own linearization, an
 element already there dropped from the left; the base schemas merged in the
 reverse of that order, the last definition of a property deciding its value
 and whether it is required. A trait the file does not define (Meta Catalog's

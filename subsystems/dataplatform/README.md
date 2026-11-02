@@ -424,7 +424,19 @@ Anyone who can read the seal Secret and an OpenBao volume can decrypt OpenBao. T
 curl -H "Authorization: Bearer $TOKEN" https://metacatalog.data.example.org/metacatalog/v1/entity-type
 ```
 
-A new version: the image is `ghcr.io/dgreco/metacatalog`, built for amd64 and arm64 by that project's GitHub pipeline on every merge to its `main`; put the new commit tag and digest in `gitops/manifests/governance/metacatalog/metacatalog.yaml`. The database migrates itself at the next start.
+A new version: the image is `ghcr.io/dgreco/metacatalog`, built for amd64 and arm64 by that project's GitHub pipeline for every release (tags such as `2.0.0`; every merge to its `main` also gets its commit's 7-character tag). Read its [changelog](https://github.com/dgreco/metacatalog/blob/main/CHANGELOG.md) first: a new major version may break the API, the database schema or the configuration. Put the release tag and its digest (`docker buildx imagetools inspect ghcr.io/dgreco/metacatalog:<tag>`) in `gitops/manifests/governance/metacatalog/metacatalog.yaml.in` and `iam-reconcile.yaml.in` (the reconcile job runs the provisioning scripts from the same image), run `make configure` and commit both. Within a major version the database migrates itself at the next start.
+
+A version that cannot migrate the database starts from an empty one. That happened with the move from the pre-release commit `29815bb` to 2.0.0: Meta Catalog's only migration had been rewritten before 1.0.0, and the new pod stopped at `Migration checksum mismatch for migration version 1`. Nothing of the platform depends on Meta Catalog's own ids, so the model and the tables come back from Git. The grants stay in force meanwhile, because `iam-reconcile` takes nothing out while Meta Catalog holds no table. With the new version deployed (its pod failing, the old one still serving), make the database again as the cluster's bootstrap made it, on its primary, and restart the new pod:
+
+```bash
+kubectl -n governance get cluster.postgresql.cnpg.io metacatalog-db -o jsonpath='{.status.currentPrimary}{"\n"}'
+kubectl -n governance exec <primary> -c postgres -- psql -v ON_ERROR_STOP=1 -d postgres \
+  -c 'DROP DATABASE metacatalog WITH (FORCE)' -c 'CREATE DATABASE metacatalog OWNER metacatalog'
+kubectl -n governance get pods -l app.kubernetes.io/name=metacatalog -L pod-template-hash
+kubectl -n governance delete pod -l app.kubernetes.io/name=metacatalog,pod-template-hash=<the new pod's>
+```
+
+The new pod makes its schema and becomes ready, and the old one goes. Then run `make dataplatform-tables ARGS="-l admin sync"`. It loads the model and the tables of `tables.yaml` again, then provisions them (folders and tables that are already in S3 and Trino are kept as they are) and authorizes them.
 
 ## Layout and configuration
 
@@ -442,7 +454,7 @@ gitops/helm-values/<chart>-values.yaml
 |---|---|
 | -10 | namespaces |
 | -5 | Gateway API CRDs, cert-manager (the Barman Cloud plugin's certificates and the directory's LDAPS certificate) |
-| -4 | Stackable operators (commons, secret, listener, zookeeper, trino, hive, opa, spark-k8s), CloudNativePG, External Secrets, NGINX Gateway Fabric, Keycloak operator |
+| -4 | Stackable operators (commons, secret, listener, zookeeper, hbase, trino, hive, opa, spark-k8s), CloudNativePG, External Secrets, NGINX Gateway Fabric, Keycloak operator |
 | -3 | OpenBao, CloudNativePG's Barman Cloud plugin |
 | -2 | SecretStores, Gateway (+ wildcard certificate, CoreDNS rewrite), S3 connection, RBAC |
 | -1 | VictoriaMetrics, VictoriaLogs, OpenTelemetry collectors, the Vector aggregator, kube-state-metrics, the backup user's Secret (app governance-backup) |
@@ -641,6 +653,13 @@ snapshot. After a restore, `make dataplatform-sync` refreshes the Secrets and
   - Trino chooses for each file: the role granted its folder, and the same for the folder itself, where it lists a `parquet` or `avro` table. A location outside the user's grants gets their default role (their own, else their first group alphabetically, which may be an admin group), and Ceph refuses it unless that role reaches it. The extra credential `s3_role` pins one role for the whole session instead.
   - Trino's rules match the start of a location, so the rule for a folder itself also matches folders whose names begin with its name (`orders_raw` next to `orders`). Every such folder in the record of grants gets its own rules, with the role it would have had. A place that is in no table's folder there (a stray file, or a table not yet authorized) is read with the other folder's role.
 - **A table you may not read can give an odd error in Trino.** Trino reads an Iceberg table's metadata with your role before it asks its rules. If Ceph refuses that role, Trino 481's `lakehouse` connector answers `Unsupported table handle: io.trino.plugin.iceberg.CorruptedIcebergTableHandle` instead of *Access Denied*. The table is fine: you have no grant on it. Smoke check B4 accepts either answer.
+- **Meta Catalog cannot provision or unprovision an Iceberg table: `CorruptedIcebergTableHandle` on `SHOW CREATE TABLE` or `DROP TABLE`.** If the provisioner gets that answer, the table's metastore entry points at a metadata file that is gone. That happened on 2026-11-02, when an Unprovision in the UI raced a provision of the same table and emptied its folder after the table had been registered again. Trino cannot drop such a table, so take the entry out through the metastore's Iceberg REST catalog, without purge, from a pod of `governance`, then provision or unprovision again:
+
+  ```bash
+  kubectl -n governance exec deploy/catalog-gate -- python3 -c 'import urllib.request as u; print(u.urlopen(u.Request("http://hive-metastore-iceberg.governance.svc.cluster.local:9001/iceberg/v1/namespaces/<schema>/tables/<table>?purgeRequested=false", method="DELETE")).status)'
+  ```
+
+  First check that the metadata file is really gone: the entry's `metadata_location` is in `TABLE_PARAMS` of the metastore's database, and `radosgw-admin object stat` on the admin host answers *No such file* for it.
   - Directly on S3 and in Spark, a session has one role, and you pick it (`-g <group>` or `-u`).
 - **No password logins from scripts:** the public clients (`data-cli`, `spark`, `kubernetes`) accept only the device or browser flows; a password can be tried only through the smoke test's confidential client, whose secret is in OpenBao. `kubectl oidc-login` with `--grant-type=password` does not work.
 - **One domain controller.** The directory has a single controller (a second one means AD replication between pods). While its pod moves to another node (a drain, a node failure) nobody logs in with a password: Keycloak answers "unexpected error". Tokens already issued and service accounts go on. A token refresh works while the user is in Keycloak's cache (5 minutes, `dataplatform_directory_cache_lifespan`), then it is refused ("User disabled") until the controller is back; the session itself is kept, so the same refresh works again afterwards. iam-sync keeps what it had applied (Keycloak answers it with empty groups meanwhile, which it does not apply).

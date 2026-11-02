@@ -28,7 +28,8 @@ data:
   IAM_KEY_DIR: /etc/metacatalog/iam
 ---
 # Meta Catalog's pod (its scripts write the record) and iam-reconcile (reads
-# it) talk to the Kubernetes API for that one ConfigMap only.
+# it, and its prune takes entries out) talk to the Kubernetes API for that
+# one ConfigMap only.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -62,7 +63,13 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: metacatalog
+  # reconcile.sh prune writes the entries of deleted tables away (until
+  # 2026-11-02 it had only the reader below, and every such prune got 403)
+  - kind: ServiceAccount
+    name: iam-reconcile
 ---
+# The reader is covered by the writer now; kept because Argo CD does not
+# prune this app, so a removed Role would stay behind as an orphan.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

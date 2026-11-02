@@ -1,7 +1,8 @@
 # The Stackable ZooKeeper operator, same release as the other Stackable
-# operators. Its only user is Accumulo deployed outside Argo CD by
-# ../accumulo-k8s (scripts/startup.sh, namespace accumulo), whose
-# ZookeeperCluster needs this CRD: keep the app while that deployment runs.
+# operators. Its users are deployed outside Argo CD: Accumulo by
+# ../accumulo-k8s (namespace accumulo) and HBase by ../hbase-k8s (namespace
+# hbase), each with a ZookeeperCluster that needs this CRD: keep the app
+# while either deployment runs.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:

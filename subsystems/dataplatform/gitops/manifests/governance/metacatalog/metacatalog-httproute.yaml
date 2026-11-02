@@ -12,8 +12,9 @@ spec:
   hostnames:
     - metacatalog.data.example.org
   rules:
-    # The bare address: the app answers / with 500 (Spring Boot serves the
-    # UI's index template as a welcome page, without the data /ui adds)
+    # The bare address: before 2.0.0 the app answered / with 500 (Spring
+    # Boot served the UI's index template as a welcome page, without the data
+    # /ui adds); 2.0.0 redirects / to /ui itself, this saves the round trip
     - matches:
         - path: {type: Exact, value: /}
       filters:
