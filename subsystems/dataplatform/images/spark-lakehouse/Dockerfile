@@ -5,8 +5,7 @@
 # Central through Ivy, which has no read timeout: on 2026-11-24 one download
 # took 23 minutes (5 to 40 s otherwise) and the smoke test's checks of that
 # job failed waiting for its driver. Built by make dataplatform-spark-image
-# (arm64, the boards', and amd64; the first push was arm64 only,
-# PLATFORMS=linux/arm64, on a slow line), pushed to GHCR, pinned by digest in
+# (arm64, the boards', and amd64), pushed to GHCR, pinned by digest in
 # dataplatform_spark_image_name and _digest (group_vars/dataplatform.yml), which
 # every job names: a job's sparkImage replaces its template's whole.
 # The base is pinned by its index digest, the one the boards already hold
