@@ -10,9 +10,12 @@
 # physical types; `kind` in the values tells them apart:
 #
 #   folder (S3FolderType)   the table's directory in the platform bucket,
-#                           s3://$LAKEHOUSE_BUCKET/$LAKEHOUSE_PREFIX/<domain>/<subdomain>/<layer>/<table>
+#                           s3://$LAKEHOUSE_BUCKET/$LAKEHOUSE_PREFIX/<domain>/<layer>/<name>_v<version>
 #   table  (HiveTableType)  the table in the Hive Metastore, as Trino's
-#                           $LAKEHOUSE_CATALOG.<domain>_<subdomain>_<layer>.<table>
+#                           $LAKEHOUSE_CATALOG.<domain>_<layer>.<name>_v<version>
+#
+# A table's version is part of its name, and its domain is an entity of
+# Meta Catalog (a $DOMAIN_TYPE), which must exist before anything is made.
 #
 # Meta Catalog takes the folder first on provision and authorize, the table
 # first on reject and unprovision. What this prints is recorded in the
@@ -22,7 +25,7 @@
 #   provision    folder: makes the directory (an empty object <path>/), as
 #                the provisioner's own STS role. The metastore then finds it
 #                and never has to write to the bucket.
-#                table: the schema <domain>_<subdomain>_<layer> when it is
+#                table: the schema <domain>_<layer> when it is
 #                not there (at the layer's directory), then the table, in
 #                the table's format: iceberg (an Iceberg table), parquet or
 #                avro (a Hive table over the folder's files). Through Trino,
@@ -69,24 +72,29 @@ IFS=$'\x1f' read -r KIND DOMAIN SUBDOMAIN LAYER TABLE LOCATION DIRECTORY CATALOG
 
 NAME='^[a-z][a-z0-9]{0,23}$'
 [[ $DOMAIN =~ $NAME ]] || fail "domain '$DOMAIN': lower-case letters and digits"
-[[ $SUBDOMAIN =~ $NAME ]] || fail "subdomain '$SUBDOMAIN': lower-case letters and digits"
 [[ $LAYER =~ ^(bronze|silver|gold)$ ]] || fail "layer '$LAYER': bronze, silver or gold"
 [[ $TABLE =~ ^[a-z][a-z0-9_]{0,62}$ ]] || fail "table name '$TABLE': lower-case letters, digits and _"
 
-# where the table is, said by its names alone
-LAYER_DIRECTORY="$LAKEHOUSE_PREFIX/$DOMAIN/$SUBDOMAIN/$LAYER"
+# where the table is, said by its names alone; a subdomain is a value of the
+# platform's earlier model, which no longer exists
+[ -z "$SUBDOMAIN" ] || fail "subdomain '$SUBDOMAIN': the platform's model has no subdomains (an earlier model's resource?)"
+[[ $TABLE =~ _v[1-9][0-9]{0,2}$ ]] || fail "table name '$TABLE': a table is named <name>_v<version>"
+PLACE_NAMES="$DOMAIN/$LAYER/$TABLE"
+LAYER_DIRECTORY="$LAKEHOUSE_PREFIX/$DOMAIN/$LAYER"
+WANT_SCHEMA="${DOMAIN}_${LAYER}"
+FOLDER_RESOURCE="folder.$DOMAIN.$LAYER.$TABLE"
 WANT_DIRECTORY="$LAYER_DIRECTORY/$TABLE"
 WANT_LOCATION="s3://$LAKEHOUSE_BUCKET/$WANT_DIRECTORY"
 [ "$LOCATION" = "$WANT_LOCATION" ] \
-  || fail "the $KIND of $DOMAIN/$SUBDOMAIN/$LAYER/$TABLE is at '$LOCATION', not at $WANT_LOCATION: a table's names do not change (make another table)"
+  || fail "the $KIND of $PLACE_NAMES is at '$LOCATION', not at $WANT_LOCATION: a table's names do not change (make another table)"
 
 case $KIND in
   folder)
     [ "$DIRECTORY" = "$WANT_DIRECTORY" ] || fail "the folder's path is '$DIRECTORY', not $WANT_DIRECTORY"
-    RESOURCE="folder.$DOMAIN.$SUBDOMAIN.$LAYER.$TABLE" ;;
+    RESOURCE=$FOLDER_RESOURCE ;;
   table)
     [ "$CATALOG" = "$LAKEHOUSE_CATALOG" ] || fail "catalog '$CATALOG': this platform's is $LAKEHOUSE_CATALOG"
-    [ "$SCHEMA" = "${DOMAIN}_${SUBDOMAIN}_${LAYER}" ] || fail "schema '$SCHEMA' is not ${DOMAIN}_${SUBDOMAIN}_${LAYER}"
+    [ "$SCHEMA" = "$WANT_SCHEMA" ] || fail "schema '$SCHEMA' is not $WANT_SCHEMA"
     [ "$SCHEMA_LOCATION" = "s3://$LAKEHOUSE_BUCKET/$LAYER_DIRECTORY" ] \
       || fail "the schema's place is '$SCHEMA_LOCATION', not s3://$LAKEHOUSE_BUCKET/$LAYER_DIRECTORY"
     [[ $FORMAT =~ ^(parquet|avro|iceberg)$ ]] || fail "format '$FORMAT': parquet, avro or iceberg"
@@ -161,12 +169,21 @@ created_with() { # SCHEMA|TABLE <qualified name> <property>
   trino "SHOW CREATE $1 $2" | jq -r '.[0]' | sed -n "s/^ *$3 = '\(.*\)'.*$/\1/p"
 }
 
+# Both are asked in conditions (if !, ||), where bash ignores errexit: a
+# Trino that does not answer must end the run (trino has said why), never
+# read as "not there". 2026-11-22: unprovisions run while Trino was stopped
+# answered "its schema is not there, nothing to drop", succeeded, and left
+# every table in the metastore with its files deleted.
 schema_exists() {
-  [ "$(trino "SELECT count(*) FROM \"$CATALOG\".information_schema.schemata WHERE schema_name = $(sql_str "$SCHEMA")")" = "[1]" ]
+  local n
+  n=$(trino "SELECT count(*) FROM \"$CATALOG\".information_schema.schemata WHERE schema_name = $(sql_str "$SCHEMA")") || exit 1
+  [ "$n" = "[1]" ]
 }
 
 table_exists() {
-  [ "$(trino "SELECT count(*) FROM \"$CATALOG\".information_schema.tables WHERE table_schema = $(sql_str "$SCHEMA") AND table_name = $(sql_str "$TABLE")")" = "[1]" ]
+  local n
+  n=$(trino "SELECT count(*) FROM \"$CATALOG\".information_schema.tables WHERE table_schema = $(sql_str "$SCHEMA") AND table_name = $(sql_str "$TABLE")") || exit 1
+  [ "$n" = "[1]" ]
 }
 
 # The schema of the table's layer: made by the first table that needs it.
@@ -216,13 +233,37 @@ provision_table() {
   echo "table $NAMED exists ($FORMAT) at $LOCATION${added:+; added columns:$added}"
 }
 
+# Trino's lakehouse connector cannot drop an Iceberg table whose metadata
+# files are gone ("Unsupported table handle: ...CorruptedIcebergTableHandle",
+# measured on 2026-11-22 after a reset that emptied the folders while the
+# entries stayed): the metastore's Iceberg REST catalog then drops the entry
+# without reading them (no purge; measured on Hive 4.2.0: 200, the table's
+# neighbours stay, 404 once gone).
+drop_table() {
+  local err code
+  if err=$( (trino "DROP TABLE IF EXISTS $Q_TABLE" >/dev/null) 2>&1 ); then
+    return 0
+  fi
+  case $err in
+    *CorruptedIcebergTableHandle*) ;;
+    *) fail "$err" ;;
+  esac
+  : "${METASTORE_REST:?}"
+  code=$(curl -sS --max-time 60 -o /dev/null -w '%{http_code}' -X DELETE \
+    "$METASTORE_REST/v1/namespaces/$SCHEMA/tables/$TABLE") || code=000
+  case $code in
+    200|204|404) echo "table $NAMED: its metadata files were gone; its entry was dropped in the metastore's REST catalog" ;;
+    *) fail "the metastore's REST catalog ($METASTORE_REST) did not drop $SCHEMA.$TABLE (HTTP $code)" ;;
+  esac
+}
+
 unprovision_table() {
   local left files="" schema=""
   if ! schema_exists; then
     echo "table $NAMED: its schema is not there, nothing to drop"
     return 0
   fi
-  trino "DROP TABLE IF EXISTS $Q_TABLE" >/dev/null
+  drop_table
   [ "$TABLE_TYPE" != HIVE ] || files="; its files stay until the folder goes"
   # the schema goes with its last table; another table made meanwhile keeps it
   left=$(trino "SELECT count(*) FROM \"$CATALOG\".information_schema.tables WHERE table_schema = $(sql_str "$SCHEMA")")
@@ -262,35 +303,34 @@ authorize() {
   fi
 }
 
-# A table is made only under one of its domain's own subdomains: x-subdomains
-# of the model's trait DomainMember as Meta Catalog has it now
-# (subsystems/dataplatform/metacatalog/table-model.yaml, sent by make
-# dataplatform-tables ARGS=model). Meta Catalog checks the domain and the
-# subdomain each against its enum, not the pair. Asked at Meta Catalog's own
-# Service, as the provisioner. On provision only: the tables of a pair taken
-# out of the definition must still be unprovisioned, rejected and deleted.
-# Without an answer nothing is made.
-known_pair() {
-  local out code pairs own
+# A table is made only in a domain that is an entity of Meta Catalog: a
+# $DOMAIN_TYPE named so (subsystems/dataplatform/metacatalog/table-model.yaml;
+# make dataplatform-tables makes the domains of tables.yaml). Meta Catalog
+# keeps no rule that ties a table's `domain` to one. Asked at Meta Catalog's
+# own Service, as the provisioner, on provision only: the tables of a domain
+# taken out must still be unprovisioned, rejected and deleted. The script
+# runs on Meta Catalog's task executor, on a thread of its own that may start
+# before the transaction that planned it commits; the call only reads, so it
+# waits on no lock of that transaction. Without an answer nothing is made.
+DOMAIN_TYPE=${DOMAIN_TYPE:-DomainType}
+known_domain() {
+  local out code found
   : "${METACATALOG_API:?}"
   out=$(mktemp)
-  code=$(curl -sS --max-time 30 -o "$out" -w '%{http_code}' \
-    -K <(printf 'header = "Authorization: Bearer %s"\n' "$TRINO_TOKEN") "$METACATALOG_API/trait/DomainMember") || code=000
-  pairs=$(jq -c '.schema | if type == "string" then fromjson else . end | .properties.domain["x-subdomains"] | objects' \
-    "$out" 2>/dev/null) || pairs=""
+  code=$(curl -sS --max-time 30 -o "$out" -w '%{http_code}' -G \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$TRINO_TOKEN") \
+    --data-urlencode "entityTypeName=$DOMAIN_TYPE" --data-urlencode "queryPath=\$ ? (@.name == \"$DOMAIN\")" \
+    "$METACATALOG_API/entity") || code=000
+  found=$(jq 'length' "$out" 2>/dev/null) || found=""
   rm -f "$out"
-  [ "$code" = 200 ] || fail "Meta Catalog ($METACATALOG_API) did not give the trait DomainMember (HTTP $code): nothing is made"
-  [ -n "$pairs" ] || fail "the trait DomainMember in Meta Catalog has no x-subdomains (make dataplatform-tables ARGS=model sends the model's): nothing is made"
-  own=$(jq -r --arg d "$DOMAIN" 'if has($d) then .[$d] | join(", ") else "" end' <<<"$pairs")
-  [ -n "$own" ] || fail "domain '$DOMAIN' is not one of the model's ($(jq -r 'keys | join(", ")' <<<"$pairs")): nothing is made"
-  jq -e --arg d "$DOMAIN" --arg s "$SUBDOMAIN" '.[$d] | index($s) != null' <<<"$pairs" >/dev/null \
-    || fail "subdomain '$SUBDOMAIN' is not one of the domain $DOMAIN's ($own): nothing is made"
+  [ "$code" = 200 ] && [ -n "$found" ] || fail "Meta Catalog ($METACATALOG_API) did not list the domains ($DOMAIN_TYPE, HTTP $code): nothing is made"
+  [ "$found" -ge 1 ] || fail "domain '$DOMAIN' is no $DOMAIN_TYPE of Meta Catalog: nothing is made"
 }
 
 # one token for every statement of the run (trino runs in subshells, which
 # would each log in again)
 case $OPERATION in provision|unprovision) trino_login ;; esac
-[ "$OPERATION" != provision ] || known_pair
+[ "$OPERATION" != provision ] || known_domain
 
 case $OPERATION:$KIND in
   provision:folder) provision_folder ;;

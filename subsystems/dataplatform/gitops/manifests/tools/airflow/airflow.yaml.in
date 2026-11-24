@@ -1,0 +1,166 @@
+# Apache Airflow 3 (Stackable's AirflowCluster), https://airflow.<%= dataplatform_domain %>.
+#
+# Who logs in: everyone of the realm <%= dataplatform_keycloak_realm %>, through Keycloak only (the
+# client airflow; AuthenticationClass airflow-keycloak). What they may do is
+# Airflow's own roles, given from their Keycloak groups at every login
+# (AUTH_ROLES_MAPPING below; the groups come from the directory):
+#
+#   <%= site_admin_group %>  Admin    everything, users and roles included
+#   <%= site_engineer_group %>   Op       run, pause, clear and mark DAGs; connections, variables, pools
+#   <%= site_analyst_group %>    Viewer   see the DAGs, their runs and logs
+#   anyone else      Public   nothing
+#
+# Nobody logs in with a password: the security manager below refuses every
+# check against Airflow's own user table (POST /auth/token included).
+#
+# Stackable's CRD has no field for the mapping: it goes into the generated
+# webserver_config.py (FAB reads the groups from Keycloak's userinfo, as
+# role_keys; read in the image's providers-fab 2.4.1). Airflow's roles decide
+# who runs what; what the runs may touch is the pipeline's grants in Meta
+# Catalog, never the person's who pressed the button.
+#
+# The DAGs are the lakehouse example's (subsystems/dataplatform/examples/
+# lakehouse/dags), read from this repository by git-sync (branch
+# <%= dataplatform_git_revision %>, the one Argo CD follows; the deploy key and pinned host keys of
+# Secret airflow-git): a change there reaches Airflow within a minute. Every
+# task runs in a pod of its own (KubernetesExecutor, in tools) as the
+# Keycloak client lakehouse-pipeline (Secret lakehouse-pipeline, mounted
+# into the task pods only; examples/lakehouse/dags/lakehouse_pipeline/
+# platform.py): Trino with its token, Ceph with its STS role, Spark jobs in
+# compute as oidc:service-account-lakehouse-pipeline.
+#
+# Behind the Gateway: Airflow builds its links and the login's redirect
+# (https://airflow.<%= dataplatform_domain %>/auth/oauth-authorized/keycloak, registered on the
+# client) from [api] base_url and, with the proxy fix, the X-Forwarded-*
+# headers NGINX sets. Stackable sets base_url to the internal Service: the
+# overrides put the public one.
+apiVersion: airflow.stackable.tech/v1alpha2
+kind: AirflowCluster
+metadata:
+  name: airflow
+spec:
+  image:
+    productVersion: 3.0.6          # Stackable's long-term version of Airflow 3 (26.7)
+    # Stackable's default is Always: every task pod (one per task) would ask
+    # the registry first, and a node's lookup of oci.stackable.tech now and
+    # then fails ("lookup ...: Try again", 2026-11-22), failing the task. The
+    # tag is a release, it never moves: a node that has it uses it.
+    pullPolicy: IfNotPresent
+  clusterConfig:
+    loadExamples: false
+    exposeConfig: false
+    credentialsSecretName: airflow-admin
+    metadataDatabase:
+      postgresql:
+        host: airflow-db-rw
+        database: airflow
+        credentialsSecretName: airflow-db-owner
+    authentication:
+      - authenticationClass: airflow-keycloak
+        oidc:
+          clientCredentialsSecret: airflow-oidc
+        userRegistration: true
+        userRegistrationRole: Public
+        syncRolesAt: Login
+    dagsGitSync:
+      - repo: <%= dataplatform_git_repo | regex_replace('^([^@/:]+@[^:/]+):(.*)$', 'ssh://\\1/\\2') %>
+        branch: <%= dataplatform_git_revision %>
+        gitFolder: subsystems/dataplatform/examples/lakehouse/dags
+        depth: 1
+        wait: 60s
+        credentials:
+          sshPrivateKeySecretName: airflow-git
+    vectorAggregatorConfigMapName: vector-aggregator-discovery
+  webservers:
+    roleConfig:
+      listenerClass: cluster-internal
+    envOverrides:
+      AIRFLOW__API__BASE_URL: https://airflow.<%= dataplatform_domain %>/
+      AIRFLOW__FAB__ENABLE_PROXY_FIX: "True"
+    configOverrides:
+      webserver_config.py:
+        FILE_FOOTER: |
+          # Airflow's roles from the Keycloak groups, at every login
+          AUTH_ROLES_MAPPING = {
+              "<%= site_admin_group %>": ["Admin"],
+              "<%= site_engineer_group %>": ["Op"],
+              "<%= site_analyst_group %>": ["Viewer"],
+          }
+
+          # No password login at all: Keycloak is the only one. FAB checks a
+          # user name and password against Airflow's own table on POST
+          # /auth/token (the API's tokens) whatever AUTH_TYPE says, and the
+          # user Stackable makes there (airflow-bootstrap, Admin) has its
+          # password printed in the scheduler's log at every start (its
+          # start script traces its commands), which reaches VictoriaLogs.
+          from airflow.providers.fab.auth_manager.security_manager.override import (
+              FabAirflowSecurityManagerOverride,
+          )
+
+
+          class KeycloakOnlySecurityManager(FabAirflowSecurityManagerOverride):
+              def auth_user_db(self, *args, **kwargs):
+                  return None
+
+
+          SECURITY_MANAGER_CLASS = KeycloakOnlySecurityManager
+    config:
+      resources:
+        cpu: {min: 250m, max: "2"}
+        memory: {limit: 2Gi}
+      logging:
+        enableVectorAgent: true
+    roleGroups:
+      default:
+        replicas: 1
+  # the scheduler runs the DAG processor too (no dagProcessors role)
+  schedulers:
+    envOverrides:
+      AIRFLOW__API__BASE_URL: https://airflow.<%= dataplatform_domain %>/
+      # A task pod on a node that has not pulled the image yet waits minutes
+      # for it (some GB; measured about four on these boards), and Airflow
+      # fails a task whose pod is pending longer than this (default 300 s)
+      AIRFLOW__KUBERNETES_EXECUTOR__WORKER_PODS_PENDING_TIMEOUT: "1200"
+    config:
+      resources:
+        cpu: {min: 250m, max: "2"}
+        memory: {limit: 2Gi}
+      logging:
+        enableVectorAgent: true
+    roleGroups:
+      default:
+        replicas: 1
+  # One pod per task, in tools, as the pipeline: what platform.py reads.
+  kubernetesExecutors:
+    envOverrides:
+      KEYCLOAK_TOKEN_URL: <%= dataplatform_keycloak_issuer %>/protocol/openid-connect/token
+      LAKEHOUSE_PIPELINE_CLIENT_ID: lakehouse-pipeline
+      LAKEHOUSE_PIPELINE_SECRET_FILE: /stackable/lakehouse-pipeline/client-secret
+      TRINO_URL: https://trino.<%= dataplatform_domain %>
+      S3_ENDPOINT: <%= dataplatform_s3_endpoint %>
+      S3_REGION: <%= dataplatform_s3_region %>
+      ROLE_ARN_PREFIX: arn:aws:iam::<%= dataplatform_rgw_account_id %>:role/
+      USER_ROLE_PREFIX: <%= dataplatform_iam_user_role_prefix %>
+      LAKEHOUSE_BUCKET: <%= dataplatform_bucket %>
+      LAKEHOUSE_PREFIX: lakehouse                  # access.yaml metacatalog.prefix
+      LAKEHOUSE_CATALOG: lakehouse                 # Trino's catalog
+      LABEL_DOMAIN: <%= dataplatform_domain %>
+      SPARK_NAMESPACE: compute
+      SPARK_IMAGE: <%= dataplatform_spark_image %>
+      SPARK_PRODUCT_VERSION: "<%= dataplatform_spark_version %>"
+    podOverrides:
+      spec:
+        volumes:
+          - name: lakehouse-pipeline
+            secret:
+              secretName: lakehouse-pipeline
+        containers:
+          - name: base
+            volumeMounts:
+              - {name: lakehouse-pipeline, mountPath: /stackable/lakehouse-pipeline, readOnly: true}
+    config:
+      resources:
+        cpu: {min: 100m, max: "2"}
+        memory: {limit: 1Gi}
+      logging:
+        enableVectorAgent: true

@@ -1,0 +1,30 @@
+---
+# The last step of make k3s-install: every node's flannel publishes its own
+# address with k3s_flannel_backend (hooks/flannel-check.yml), then each node
+# loses the VXLAN device a switch away from vxlan leaves behind (its routes go
+# with it; host-gw has put its own in their place and checks them every few
+# seconds). Not before every node runs the new backend: a node still on VXLAN
+# reaches the others through their device.
+- name: Check flannel on every node
+  hosts: "{{ groups['k3s_servers'][0] }}"
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Every node's address and backend
+      ansible.builtin.include_tasks: hooks/flannel-check.yml
+
+- name: Remove the VXLAN device no node uses any more
+  hosts: k3s
+  gather_facts: false
+  tasks:
+    - name: The VXLAN device
+      ansible.builtin.command: ip -o link show flannel.1
+      register: k3s_flannel_vxlan
+      changed_when: false
+      failed_when: false
+      when: k3s_flannel_backend != 'vxlan'
+
+    - name: Remove it
+      ansible.builtin.command: ip link delete flannel.1
+      changed_when: true
+      when: k3s_flannel_backend != 'vxlan' and k3s_flannel_vxlan.rc | default(1) == 0

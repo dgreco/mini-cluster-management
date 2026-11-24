@@ -2,8 +2,8 @@
 # The record of what is granted on the platform's data (ConfigMap
 # governance/metacatalog-grants), for platform administrators: what Meta
 # Catalog's authorize and reject wrote. A table has two entries: its folder
-# (folder.<domain>.<subdomain>.<layer>.<table>), which Ceph's STS roles and
-# Trino's S3 mapping follow, and the table in the metastore
+# (folder.<domain>.<layer>.<table>), which Ceph's STS roles and Trino's S3
+# mapping follow, and the table in the metastore
 # (table.<schema>.<table>), which Trino's rules in the Open Policy Agent
 # follow. Grants are given and taken in Meta Catalog; this is for looking at
 # them and for repairs. Needs kubectl (context k3s: make

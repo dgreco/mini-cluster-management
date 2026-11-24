@@ -29,8 +29,8 @@ import yaml
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}[a-z0-9]$")           # users and groups (as iam-sync, lib-iam.sh)
 PATH = re.compile(r"^[a-z0-9][a-z0-9._/-]*[a-z0-9]$")
 BUCKET = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
-# folder.<domain>.<subdomain>.<layer>.<table> or table.<schema>.<table>
-RESOURCE = re.compile(r"^(folder(\.[a-z][a-z0-9_]*){4}|table(\.[a-z][a-z0-9_]*){2})$")
+# folder.<domain>.<layer>.<table> or table.<schema>.<table>
+RESOURCE = re.compile(r"^(folder(\.[a-z][a-z0-9_]*){3}|table(\.[a-z][a-z0-9_]*){2})$")
 IDENT = re.compile(r"^[a-z][a-z0-9_]{0,62}$")                       # a catalog, schema or table name
 
 
@@ -95,7 +95,7 @@ def check_record(path: str, prefix: str) -> tuple:
     for name, r in sorted(doc.items()):
         at = f"{where}: {name}"
         if not RESOURCE.match(name):
-            errors.append(f"{at}: not folder.<domain>.<subdomain>.<layer>.<table> nor table.<schema>.<table>")
+            errors.append(f"{at}: not folder.<domain>.<layer>.<table> nor table.<schema>.<table>")
         if not isinstance(r, dict) or not isinstance(r.get("grants"), list):
             errors.append(f"{at}: must have grants (a list)")
             continue

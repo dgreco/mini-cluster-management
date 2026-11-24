@@ -23,6 +23,14 @@ dataplatform_gitops_dir: "{{ inventory_dir }}/../subsystems/dataplatform/gitops"
 # prefer a read-only deploy key of this project, e.g.
 #   ssh-keygen -t ed25519 -N '' -f .secrets/argocd-git   (add .secrets/argocd-git.pub in GitLab)
 dataplatform_git_ssh_key_file: "{{ lookup('env', 'HOME') }}/.ssh/id_rsa"
+# Airflow's git-sync reads the same repository (the lakehouse example's DAGs)
+# with a key of its own, never the one above (which may be a person's): a
+# read-only deploy key of the project, made once with
+#   ssh-keygen -t ed25519 -N '' -C airflow-git-sync -f .secrets/airflow-git   (add .secrets/airflow-git.pub in GitLab)
+# make dataplatform-openbao puts it and the host keys of
+# gitops/bootstrap/known_hosts into OpenBao tools/airflow-git (and says so
+# while the file is missing: Airflow then has no DAGs).
+dataplatform_airflow_git_ssh_key_file: "{{ secrets_dir }}/airflow-git"
 
 # ---------------------------------------------------------------- names ----
 # Every web UI is https://<name>.<domain> through the Gateway on the
@@ -98,6 +106,19 @@ dataplatform_directory_cache_lifespan: 300
 dataplatform_directory_backup_prefix: samba-ad/
 dataplatform_directory_backup_keep: 14
 
+# ---------------------------------------------------------------- spark ----
+# The image of every Spark job (images/spark-lakehouse: Stackable's Spark with
+# Iceberg's runtime among its jars; make dataplatform-spark-image builds it and
+# prints this pin). A job's sparkImage replaces its template's whole, so each
+# job names it: dp-spark-submit.sh (files/site.env, SPARK_IMAGE), the
+# pipeline's DAGs (Airflow's SPARK_IMAGE), and the templates of compute say
+# the same. Pulled IfNotPresent: a job asks no registry once a board has it.
+# The pin the build prints is <name>@<digest>, written here in two halves.
+dataplatform_spark_image_name: ghcr.io/dgreco/spark-lakehouse:4.1.2-stackable26.7.0-iceberg1.11.0-1
+dataplatform_spark_image_digest: sha256:41f14ca5ff1a81a73abb32f5e0c39d05de1bc43b16e6bdadfeb570d73e50a927
+dataplatform_spark_image: "{{ dataplatform_spark_image_name }}@{{ dataplatform_spark_image_digest }}"
+dataplatform_spark_version: "4.1.2"     # the image's Spark (sparkImage.productVersion), also the history server's
+
 # ---------------------------------------------------------------- storage ----
 dataplatform_storage_class: "{{ site_rbd_storage_class }}"
 
@@ -130,6 +151,8 @@ dataplatform_trino_uid: trino
 # Backups (PostgreSQL, OpenBao snapshots) go to the bucket of subsystems/ceph's
 # backup user (ceph_rgw_backup_*); make dataplatform-ceph puts its key here.
 dataplatform_backup_kv_path: governance/backup-s3
+# ... and a copy for each other namespace with a database (Airflow's in tools)
+dataplatform_backup_kv_copies: [tools/backup-s3]
 # Service users of the platform, all in the account. Their keys go to OpenBao
 # (these paths under secret/dataplatform/), never to .secrets, except for the
 # users with secrets_file, whose key goes to .secrets/<secrets_file>.{json,env}
@@ -205,7 +228,9 @@ dataplatform_s3_users:
   # - When a Spark job commits to an Iceberg table (the metastore's REST
   #   catalog), the metastore reads the table's metadata and writes the new
   #   metadata file itself: <prefix>/<domain>/<subdomain>/<layer>/<table>/
-  #   metadata/. Nothing else of a table: no data file, and nothing deleted.
+  #   metadata/ (the lakehouse example's tables, without a subdomain:
+  #   <prefix>/<domain>/<layer>/<table>/metadata/). Nothing else of a table:
+  #   no data file, and nothing deleted.
   # lakehouse is access.yaml's metacatalog.prefix.
   # Not tried on Ceph yet. The first question is asked by name (a HEAD on a
   # key that is no object); RGW should answer "not found" to whoever may list
@@ -223,7 +248,10 @@ dataplatform_s3_users:
       - Sid: TheTablesIcebergMetadata
         Effect: Allow
         Action: ["s3:GetObject", "s3:PutObject"]
-        Resource: ["arn:aws:s3:::{{ dataplatform_bucket }}/lakehouse/*/*/*/*/metadata/*"]
+        # the platform's tables, and the lakehouse example's
+        # (<prefix>/<domain>/<layer>/<name>_v<version>/metadata/: one level less)
+        Resource: ["arn:aws:s3:::{{ dataplatform_bucket }}/lakehouse/*/*/*/*/metadata/*",
+                   "arn:aws:s3:::{{ dataplatform_bucket }}/lakehouse/*/*/*/metadata/*"]
     openbao: [governance/hive-s3]
 # Service users that are gone: make dataplatform-ceph deletes them from RGW
 # (their objects stay the bucket's) and their key files from .secrets/.
@@ -254,7 +282,9 @@ dataplatform_iam_group_role_prefix: grp-
 # jupyterhub: the hub hands its login token to the notebook servers;
 # metacatalog-provisioner: Meta Catalog makes and empties the tables' folders
 # with its provisioner's own role)
-dataplatform_iam_client_ids: [data-cli, spark, smoke-test, jupyterhub, s3browser, metacatalog-provisioner]
+# lakehouse-pipeline: the lakehouse example's DAGs in Airflow, as its service
+# account (subsystems/dataplatform/examples/lakehouse)
+dataplatform_iam_client_ids: [data-cli, spark, smoke-test, jupyterhub, s3browser, metacatalog-provisioner, lakehouse-pipeline]
 # Longest STS session any role grants (s); RGW's own limit is ceph_rgw_sts_max_session_duration
 dataplatform_sts_max_session_duration: 43200
 # Groups with every permission on the bucket (access.yaml's admins.groups
@@ -307,7 +337,8 @@ dataplatform_openbao_generated:
   governance/keycloak-db: {username: keycloak, password: null}
   governance/keycloak-admin: {username: temp-admin, password: null}      # master realm bootstrap admin
   governance/keycloak-clients: {argocd: null, grafana: null, openbao: null, trino: null, jupyterhub: null, iam-sync: null, smoke-test: null, ansible: null,
-                                s3browser: null, vmui: null, metacatalog: null, metacatalog-provisioner: null, directory: null}
+                                s3browser: null, vmui: null, metacatalog: null, metacatalog-provisioner: null, directory: null,
+                                airflow: null, lakehouse-pipeline: null}
   governance/platform-admin: {username: admin, password: null}           # first user of the directory (in the admin group)
   governance/samba-ad: {admin-password: null, bind-password: null}       # the domain's Administrator; the account Keycloak reads the directory as
   governance/directory-proxy: {cookie-secret: null}           # oauth2-proxy's cookie key in front of LDAP Account Manager
@@ -317,6 +348,8 @@ dataplatform_openbao_generated:
   observability/grafana-admin: {admin-user: admin, admin-password: null}
   observability/vmui-proxy: {cookie-secret: null}              # oauth2-proxy's cookie key in front of VMUI (32 bytes)
   tools/jupyterhub: {cookie-secret: null, crypt-key: null}     # JupyterHub's cookie and auth-state keys (hashed to hex by its ExternalSecret)
+  tools/airflow-db: {username: airflow, password: null}        # owner of Airflow's database
+  tools/airflow-admin: {username: airflow-bootstrap, password: null}   # the user Stackable makes in Airflow's own table (no login: Keycloak only)
 # Copies kept equal to their source on every run: <path>: {<key>: <source path>#<key>}
 dataplatform_openbao_copies:
   argocd/argocd-oidc: {client-secret: "governance/keycloak-clients#argocd"}
@@ -324,5 +357,7 @@ dataplatform_openbao_copies:
   compute/trino-oidc: {client-secret: "governance/keycloak-clients#trino"}
   tools/jupyterhub-oidc: {client-secret: "governance/keycloak-clients#jupyterhub"}
   tools/s3browser-oidc: {client-secret: "governance/keycloak-clients#s3browser"}
+  tools/airflow-oidc: {client-secret: "governance/keycloak-clients#airflow"}
+  tools/lakehouse-pipeline: {client-secret: "governance/keycloak-clients#lakehouse-pipeline"}
   observability/vmui-oidc: {client-secret: "governance/keycloak-clients#vmui"}
   governance/iam-sync: {client-secret: "governance/keycloak-clients#iam-sync"}

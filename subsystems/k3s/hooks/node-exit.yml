@@ -110,3 +110,8 @@
         executable: /bin/bash
       delegate_to: "{{ k3s_maint_server }}"
       changed_when: false
+
+    - name: Every node's flannel address is its own
+      ansible.builtin.include_tasks: flannel-check.yml
+      vars:
+        k3s_flannel_check_host: "{{ k3s_maint_server }}"

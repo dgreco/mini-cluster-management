@@ -65,6 +65,7 @@
         - /var/lib/rancher/k3s
         - /var/lib/kubelet
         - /usr/local/bin/k3s-install.sh
+        - /etc/sysctl.d/90-k3s-inotify.conf
 
     - name: Local kubeconfig
       ansible.builtin.file:

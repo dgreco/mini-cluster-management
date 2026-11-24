@@ -36,7 +36,7 @@ spec:
             seccompProfile: {type: RuntimeDefault}
           containers:
             - name: reconcile
-              image: ghcr.io/dgreco/metacatalog:2.0.0@sha256:3c3996cc7ccac7e8f87e3885d7d5097fb046dd2548d6ba065c823d4326cb36e6
+              image: ghcr.io/dgreco/metacatalog:2.1.1@sha256:af44c0381d85b790248577a37b053f2193c908a690656e1c02518be8dd2d641d
               command: [bash, /opt/metacatalog/provisioning/reconcile.sh, apply]
               envFrom:
                 - configMapRef: {name: metacatalog-iam}

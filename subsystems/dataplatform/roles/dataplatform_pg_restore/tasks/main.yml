@@ -20,3 +20,6 @@
        else [dataplatform_pg_restore_cluster_input] }}
   loop_control:
     loop_var: dataplatform_pg_restore_cluster
+  vars:
+    dataplatform_pg_restore_namespace: >-
+      {{ dataplatform_pg_restore_namespaces[dataplatform_pg_restore_cluster] | default('governance') }}

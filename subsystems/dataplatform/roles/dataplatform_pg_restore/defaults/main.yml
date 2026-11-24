@@ -1,8 +1,10 @@
 ---
 # The CloudNativePG clusters pg-restore.yml knows, in the order -e pg_cluster=all
 # takes them: the least critical first, Keycloak (every login) last.
-dataplatform_pg_restore_clusters: [metacatalog-db, hive-metastore-db, keycloak-db]
+dataplatform_pg_restore_clusters: [metacatalog-db, hive-metastore-db, airflow-db, keycloak-db]
+# their namespace: governance, unless listed here
 dataplatform_pg_restore_namespace: governance
+dataplatform_pg_restore_namespaces: {airflow-db: tools}
 # check (scratch cluster, changes nothing) or replace (deletes and recreates)
 dataplatform_pg_restore_mode: check
 # all, or one name of dataplatform_pg_restore_clusters

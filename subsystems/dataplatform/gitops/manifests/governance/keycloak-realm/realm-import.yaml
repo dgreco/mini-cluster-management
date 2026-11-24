@@ -78,6 +78,14 @@ spec:
       secret:
         name: keycloak-realm-secrets
         key: metacatalog-provisioner
+    AIRFLOW_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: airflow
+    LAKEHOUSE_PIPELINE_SECRET:
+      secret:
+        name: keycloak-realm-secrets
+        key: lakehouse-pipeline
   realm:
     realm: data-platform
     displayName: Data platform
@@ -415,6 +423,72 @@ spec:
         protocolMapper: oidc-audience-mapper
         config:
           included.client.audience: trino
+          id.token.claim: 'false'
+          access.token.claim: 'true'
+          introspection.token.claim: 'true'
+    # Airflow's login (gitops/manifests/tools/airflow): Flask-AppBuilder's
+    # Keycloak provider asks userinfo for the groups, which map to Airflow's
+    # roles at every login.
+    - clientId: airflow
+      name: Airflow
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${AIRFLOW_SECRET}
+      standardFlowEnabled: true
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: false
+      redirectUris:
+      - https://airflow.data.example.org/auth/oauth-authorized/keycloak
+      webOrigins:
+      - +
+      attributes:
+        post.logout.redirect.uris: https://airflow.data.example.org/*
+      protocolMappers:
+      - name: groups
+        protocol: openid-connect
+        protocolMapper: oidc-group-membership-mapper
+        config:
+          claim.name: groups
+          full.path: 'false'
+          id.token.claim: 'true'
+          access.token.claim: 'true'
+          userinfo.token.claim: 'true'
+          introspection.token.claim: 'true'
+    # The lakehouse example's pipeline (examples/lakehouse; Airflow's DAGs):
+    # its service account, service-account-lakehouse-pipeline, is the identity
+    # its tasks run as. Its tokens log in to Trino, to the Kubernetes API
+    # (Spark jobs in compute) and to Ceph's STS (dataplatform_iam_client_ids);
+    # what it may touch is what the tables' grants in Meta Catalog give the
+    # SERVICE principal lakehouse-pipeline. A token lasts four hours: as long
+    # as a Spark job may run with it.
+    - clientId: lakehouse-pipeline
+      name: Lakehouse example pipeline (service account)
+      enabled: true
+      protocol: openid-connect
+      publicClient: false
+      clientAuthenticatorType: client-secret
+      secret: ${LAKEHOUSE_PIPELINE_SECRET}
+      standardFlowEnabled: false
+      directAccessGrantsEnabled: false
+      serviceAccountsEnabled: true
+      attributes:
+        access.token.lifespan: '14400'
+      protocolMappers:
+      - name: audience-trino
+        protocol: openid-connect
+        protocolMapper: oidc-audience-mapper
+        config:
+          included.client.audience: trino
+          id.token.claim: 'false'
+          access.token.claim: 'true'
+          introspection.token.claim: 'true'
+      - name: audience-kubernetes
+        protocol: openid-connect
+        protocolMapper: oidc-audience-mapper
+        config:
+          included.client.audience: kubernetes
           id.token.claim: 'false'
           access.token.claim: 'true'
           introspection.token.claim: 'true'

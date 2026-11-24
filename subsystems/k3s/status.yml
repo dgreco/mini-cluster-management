@@ -2,11 +2,19 @@
 - name: Show the k3s status
   hosts: "{{ groups['k3s_servers'][0] }}"
   gather_facts: false
+  vars:
+    k3s_status_flannel_columns:
+      - NAME:.metadata.name
+      - ADDRESS:.status.addresses[?(@.type=="InternalIP")].address
+      - FLANNEL:.metadata.annotations.flannel\.alpha\.coreos\.com/public-ip
+      - BACKEND:.metadata.annotations.flannel\.alpha\.coreos\.com/backend-type
   tasks:
     - name: Collect
       ansible.builtin.command: /usr/local/bin/k3s kubectl {{ item }}
       loop:
         - get nodes -o wide
+        # the address flannel publishes to the other nodes must be the node's own
+        - "get nodes -o 'custom-columns={{ k3s_status_flannel_columns | join(',') }}'"
         - get pods -A -o wide
         - get storageclass
         - get pv

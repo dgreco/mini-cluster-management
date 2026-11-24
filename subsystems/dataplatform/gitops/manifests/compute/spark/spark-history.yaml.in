@@ -9,7 +9,7 @@ metadata:
   namespace: compute
 spec:
   image:
-    productVersion: "4.1.2"
+    productVersion: "<%= dataplatform_spark_version %>"
   logFileDirectory:
     s3:
       prefix: system/spark-events/

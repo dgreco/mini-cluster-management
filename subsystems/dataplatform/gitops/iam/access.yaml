@@ -18,7 +18,7 @@
 #            Meta Catalog
 #   metacatalog
 #     prefix       the directory under which Meta Catalog makes the tables'
-#                  folders (<prefix>/<domain>/<subdomain>/<layer>/<table>) and
+#                  folders (<prefix>/<domain>/<layer>/<name>_v<version>) and
 #                  grants them; nothing else can be granted
 #     provisioner  the Keycloak user that creates every schema and table, the
 #                  only one with DDL in Trino; it has rw on the prefix (role

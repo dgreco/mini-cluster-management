@@ -1,0 +1,16 @@
+# Apache Airflow (Stackable's AirflowCluster), https://airflow.<platform domain>:
+# the scheduler of the lakehouse example's pipelines
+# (subsystems/dataplatform/examples/lakehouse/dags, read from Git by
+# git-sync). App tools-airflow.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: tools
+resources:
+  - airflow-secrets.yaml
+  - airflow-db.yaml
+  - airflow-db-objectstore.yaml
+  - airflow-db-backup.yaml
+  - vector-discovery.yaml
+  - airflow-authentication.yaml
+  - airflow.yaml
+  - airflow-httproute.yaml

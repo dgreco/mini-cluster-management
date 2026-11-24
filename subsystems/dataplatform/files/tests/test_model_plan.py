@@ -174,6 +174,20 @@ class Notes(unittest.TestCase):
     def test_meta_catalog_s_own_traits_are_no_note(self):
         self.assertEqual(notes(plan()), [])
 
+    def test_traits_a_carried_trait_inherits_or_mixes_in_are_no_note(self):
+        """Asset (2.1.0) is Provisionable with Authorizable mixed in: a type
+        that carries Asset uses all three"""
+        live = copy.deepcopy(LIVE)
+        live["traits"] += [{"name": "Authorizable", "version": 1, "schema": json.dumps(merged({}))},
+                           {"name": "Asset", "version": 1, "schema": json.dumps(PROVISIONABLE),
+                            "inheritsFrom": "Provisionable", "traits": ["Authorizable"]}]
+        live["types"][0]["traits"] = ["Formatted", "Asset"]
+        model = copy.deepcopy(MODEL)
+        model["types"]["Table"]["traits"] = ["Asset", "Formatted"]
+        out = plan(model, live)
+        self.assertEqual(calls(out), [])
+        self.assertEqual(notes(out), [])
+
 
 if __name__ == "__main__":
     unittest.main()

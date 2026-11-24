@@ -17,11 +17,12 @@
 #    tables' policies in Meta Catalog grant their folders in the platform
 #    bucket to. Ceph decides what the job may read and write.
 # 3. Creates the SparkApplication <name> from the template lakehouse (Iceberg
-#    catalog lakehouse on the Hive Metastore's REST catalog, web identity) and
-#    uploads job.py
+#    catalog lakehouse on the Hive Metastore's REST catalog, web identity) in
+#    the platform's Spark image (SPARK_IMAGE: Iceberg is in it, nothing is
+#    downloaded; a job's sparkImage replaces the template's) and uploads job.py
 #    as the ConfigMap job-<name>, owned by the job. The job reads and writes
 #    the Iceberg tables Meta Catalog made
-#    (lakehouse.<domain>_<subdomain>_<layer>.<table>). Tables are Meta
+#    (lakehouse.<domain>_<layer>.<name>_v<version>). Tables are Meta
 #    Catalog's to make and drop: the metastore has no login and would let a
 #    job do it, so do not.
 # 4. With -w, waits for the job and prints the driver's log. -m raises the
@@ -68,6 +69,9 @@ ns=${SPARK_NAMESPACE:-compute}
 # policies of compute (manifests/compute/spark/spark-fence.yaml) refuse
 # anything else, and let a job's pods mount only their own token.
 case $name in "$user"-*) ;; *) name="$user-$name" ;; esac
+# Stackable starts no SparkApplication whose name is longer than 40
+# characters (it only says so in the job's events), so refuse one here.
+[ ${#name} -le 40 ] || { echo "job name $name: ${#name} characters, Stackable takes at most 40: choose a shorter one with -n" >&2; exit 2; }
 secret=spark-token-$name
 
 # ---------------------------------------------------------------- submit ----
@@ -111,7 +115,9 @@ metadata:
 spec:
   mode: cluster
   sparkImage:
-    productVersion: "4.1.2"
+    custom: "${SPARK_IMAGE}"
+    productVersion: "${SPARK_PRODUCT_VERSION}"
+    pullPolicy: IfNotPresent
   mainApplicationFile: local:///stackable/jobs/$file
   volumes:
     - name: job

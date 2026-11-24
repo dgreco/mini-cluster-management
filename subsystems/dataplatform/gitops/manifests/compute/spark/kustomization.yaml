@@ -5,3 +5,4 @@ resources:
   - spark-template.yaml
   - spark-rbac.yaml
   - spark-fence.yaml
+  - spark-pipeline.yaml

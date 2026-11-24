@@ -1,0 +1,2 @@
+# the DAGs' helper package: imported by the DAG files, never a DAG file itself
+lakehouse_pipeline/

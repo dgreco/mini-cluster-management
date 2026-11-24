@@ -1,0 +1,9 @@
+# Where the Vector agents of the Stackable products of this namespace
+# (Airflow) send their logs. The operators read this discovery ConfigMap (key
+# ADDRESS) from the product's own namespace.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-aggregator-discovery
+data:
+  ADDRESS: vector-aggregator.observability.svc.cluster.local:6000

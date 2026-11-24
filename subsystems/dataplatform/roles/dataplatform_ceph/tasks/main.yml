@@ -337,8 +337,13 @@
   ansible.builtin.include_role:
     name: dataplatform_openbao
     tasks_from: kv_put
+  # governance's, and a copy for every other namespace with a database (a
+  # SecretStore reads its own namespace's folder only)
+  loop: "{{ [dataplatform_backup_kv_path] + dataplatform_backup_kv_copies }}"
+  loop_control:
+    loop_var: dataplatform_ceph_backup_kv_path
   vars:
-    dataplatform_openbao_kv_path: "{{ dataplatform_backup_kv_path }}"
+    dataplatform_openbao_kv_path: "{{ dataplatform_ceph_backup_kv_path }}"
     dataplatform_openbao_kv_data:
       access-key: "{{ dataplatform_ceph_backup_key.access_key }}"
       secret-key: "{{ dataplatform_ceph_backup_key.secret_key }}"

@@ -6,6 +6,8 @@
   ansible.builtin.import_playbook: servers.yml
 - name: Agents
   ansible.builtin.import_playbook: agents.yml
+- name: Pod network
+  ansible.builtin.import_playbook: flannel.yml
 - name: Kubeconfig
   ansible.builtin.import_playbook: kubeconfig.yml
 - name: Ceph storage

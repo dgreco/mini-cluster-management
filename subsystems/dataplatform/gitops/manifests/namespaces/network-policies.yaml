@@ -113,6 +113,8 @@ spec:
       ports: [{protocol: TCP, port: 6000}]
     - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: governance}}}]      # the Vector agents of the Hive Metastore and the Open Policy Agent
       ports: [{protocol: TCP, port: 6000}]
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tools}}}]           # the Vector agents of Airflow
+      ports: [{protocol: TCP, port: 6000}]
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -120,10 +122,12 @@ metadata:
   name: ingress
   namespace: tools
 spec:
-  podSelector: {}
+  # every pod but Airflow's database (airflow-db, below)
+  podSelector:
+    matchExpressions: [{key: cnpg.io/cluster, operator: DoesNotExist}]
   policyTypes: [Ingress]
   ingress:
-    - from: [{podSelector: {}}]                                                     # the hub, the proxy and the notebooks among themselves (JupyterHub's own policies narrow it)
+    - from: [{podSelector: {}}]                                                     # the hub, the proxy, the notebooks and Airflow among themselves (JupyterHub's own policies narrow it)
     - from:                                                                             # the nodes themselves, through the overlay
         - {ipBlock: {cidr: 10.42.0.0/32}}
         - {ipBlock: {cidr: 10.42.0.1/32}}
@@ -137,5 +141,35 @@ spec:
     - from:                                                                             # the Gateway's NGINX pods (in core) and its controller: the proxy
         - {namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: core}}}
         - {namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: nginx-gateway}}}
-    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: observability}}}]   # scrapes of the hub's metrics
-      ports: [{protocol: TCP, port: 8081}]
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: observability}}}]   # scrapes: the hub's metrics, Airflow's (statsd exporter)
+      ports: [{protocol: TCP, port: 8081}, {protocol: TCP, port: 9102}]
+---
+# Airflow's database (gitops/manifests/tools/airflow): Airflow's own pods
+# (Stackable labels them app.kubernetes.io/name: airflow; a notebook server
+# is JupyterHub's), its instances among themselves, CloudNativePG's operator
+# and the scrapes of its metrics. The notebooks of tools do not reach it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: airflow-db
+  namespace: tools
+spec:
+  podSelector:
+    matchLabels: {cnpg.io/cluster: airflow-db}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app.kubernetes.io/name: airflow}}}]
+      ports: [{protocol: TCP, port: 5432}]
+    - from: [{podSelector: {matchLabels: {cnpg.io/cluster: airflow-db}}}]          # replication, the instance managers
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: operators}}}]       # CloudNativePG (its instances' status)
+    - from:                                                                             # the nodes themselves, through the overlay
+        - {ipBlock: {cidr: 10.42.0.0/32}}
+        - {ipBlock: {cidr: 10.42.0.1/32}}
+        - {ipBlock: {cidr: 10.42.1.0/32}}
+        - {ipBlock: {cidr: 10.42.1.1/32}}
+        - {ipBlock: {cidr: 10.42.2.0/32}}
+        - {ipBlock: {cidr: 10.42.2.1/32}}
+        - {ipBlock: {cidr: 10.42.3.0/32}}
+        - {ipBlock: {cidr: 10.42.3.1/32}}
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: observability}}}]   # scrapes
+      ports: [{protocol: TCP, port: 9187}]

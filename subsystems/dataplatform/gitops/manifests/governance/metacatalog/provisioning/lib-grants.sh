@@ -15,12 +15,12 @@
 #
 # The entries of a table:
 #
-#   folder.sales.orders.gold.daily_revenue
-#     {"path": "lakehouse/sales/orders/gold/daily_revenue",
+#   folder.sales.gold.daily_sales_v1                (folder.<domain>.<layer>.<table>)
+#     {"path": "lakehouse/sales/gold/daily_sales_v1",
 #      "grants": [{"access": "rw", "users": [], "groups": ["data-engineers"]},
 #                 {"access": "ro", "users": [], "groups": ["data-analysts"]}]}
-#   table.sales_orders_gold.daily_revenue
-#     {"catalog": "lakehouse", "schema": "sales_orders_gold", "table": "daily_revenue",
+#   table.sales_gold.daily_sales_v1                 (table.<schema>.<table>)
+#     {"catalog": "lakehouse", "schema": "sales_gold", "table": "daily_sales_v1",
 #      "grants": [... the same shape ...]}
 #
 # READ -> ro (the files: read and list; the table: SELECT), WRITE -> rw (the

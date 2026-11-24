@@ -19,6 +19,8 @@
     that:
       - site_cluster_name is match('^[a-z0-9][a-z0-9-]*$')
       - site_lan_domain is match('^[a-z0-9.-]+$')
+      - site_lan_search_domain == '' or site_lan_search_domain is match('^[a-z0-9-]+(\.[a-z0-9-]+)*$')
+      - site_lan_search_domain not in [site_lan_domain, site_platform_domain, site_dns_zone, 'cluster.local']
       - site_dns_zone is match('^[a-z0-9-]+(\.[a-z0-9-]+)+$')
       - site_platform_domain is match('^[a-z0-9-]+(\.[a-z0-9-]+)+$')
       - site_s3_host is match('^[a-z0-9-]+(\.[a-z0-9-]+)+$')

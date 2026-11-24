@@ -1,0 +1,89 @@
+# What the lakehouse example's pipeline needs in compute
+# (subsystems/dataplatform/examples/lakehouse: Airflow's DAG lakehouse_spark).
+#
+# The pipeline submits its jobs like a person does with dp-spark-submit.sh,
+# with its own Keycloak token: the Kubernetes user
+# oidc:service-account-lakehouse-pipeline (the service account of the client
+# lakehouse-pipeline; its token's audience includes kubernetes). It is in no
+# group of the directory, so iam-sync's RoleBinding spark-submitter, which
+# binds the groups, leaves it out: this one gives it the submitters' rights.
+# Everything else holds as for a person: the admission policies of
+# spark-fence.yaml name its jobs, tokens and code after it and pin the user
+# label the catalog gate reads; its jobs reach the data its grants in Meta
+# Catalog allow, no more. No Kubernetes service account gets these rights.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spark-submitter-lakehouse-pipeline
+  namespace: compute
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dataplatform-spark-submitter
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: oidc:service-account-lakehouse-pipeline
+---
+# The template lakehouse plus plain files: a job that reads parquet folders
+# of the bucket (the example's bronze tables) with Hadoop's S3A, as its own
+# role (web identity, as the template lakehouse's Iceberg FileIO already
+# does). S3A takes its settings per bucket, and the template lakehouse gives
+# the bucket dataplatform the event log's key (the RGW user spark, which reaches
+# system/spark-events/ only): so no event log here, and these jobs do not
+# show in the Spark history server. A role reaches the inside of the folders
+# granted to it, never the folders' own keys: list a folder, then read its
+# files by name (jobs/bronze_to_silver.py does).
+apiVersion: spark.stackable.tech/v1alpha1
+kind: SparkApplicationTemplate
+metadata:
+  name: lakehouse-files
+  namespace: compute
+spec:
+  mode: cluster
+  # Every job names the same image itself (dp-spark-submit.sh, the pipeline):
+  # a job's sparkImage replaces this one whole. Iceberg's runtime is in it
+  # (images/spark-lakehouse), so nothing is fetched at submission.
+  sparkImage:
+    custom: ghcr.io/dgreco/spark-lakehouse:4.1.2-stackable26.7.0-iceberg1.11.0-1@sha256:41f14ca5ff1a81a73abb32f5e0c39d05de1bc43b16e6bdadfeb570d73e50a927
+    productVersion: "4.1.2"
+    pullPolicy: IfNotPresent
+  mainApplicationFile: local:///stackable/jobs/job.py
+  sparkConf:
+    spark.sql.extensions: org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+    spark.sql.defaultCatalog: lakehouse
+    spark.sql.catalog.lakehouse: org.apache.iceberg.spark.SparkCatalog
+    spark.sql.catalog.lakehouse.type: rest
+    spark.sql.catalog.lakehouse.uri: http://catalog-gate.governance.svc.cluster.local/iceberg
+    spark.sql.catalog.lakehouse.io-impl: org.apache.iceberg.aws.s3.S3FileIO
+    spark.sql.catalog.lakehouse.s3.endpoint: https://s3.example.org
+    spark.sql.catalog.lakehouse.s3.path-style-access: 'true'
+    spark.sql.catalog.lakehouse.client.region: us-east-1
+    spark.sql.catalog.lakehouse.client.credentials-provider: software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider
+    spark.sql.iceberg.vectorization.enabled: 'false'
+    spark.hadoop.fs.s3a.bucket.dataplatform.endpoint: https://s3.example.org
+    spark.hadoop.fs.s3a.bucket.dataplatform.path.style.access: 'true'
+    spark.hadoop.fs.s3a.bucket.dataplatform.endpoint.region: us-east-1
+    spark.hadoop.fs.s3a.bucket.dataplatform.aws.credentials.provider: software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider
+  driver:
+    config:
+      resources:
+        cpu:
+          min: 250m
+          max: '1'
+        memory:
+          limit: 1Gi
+      logging:
+        enableVectorAgent: true
+  executor:
+    replicas: 2
+    config:
+      resources:
+        cpu:
+          min: 250m
+          max: '1'
+        memory:
+          limit: 2Gi
+      logging:
+        enableVectorAgent: true
+  vectorAggregatorConfigMapName: vector-aggregator-discovery

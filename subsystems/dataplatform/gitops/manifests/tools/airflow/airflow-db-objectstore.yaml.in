@@ -1,0 +1,17 @@
+# Where the Barman Cloud plugin archives airflow-db's WAL and base backups:
+# s3://<%= site_backup_bucket %>/cnpg/airflow-db/airflow-db/ (the server name is the cluster's),
+# with the backup key (tools/backup-s3); 14 days kept.
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: airflow-db
+spec:
+  configuration:
+    destinationPath: s3://<%= site_backup_bucket %>/cnpg/airflow-db
+    endpointURL: https://<%= site_s3_host %>
+    s3Credentials:
+      accessKeyId: {name: backup-s3, key: access-key}
+      secretAccessKey: {name: backup-s3, key: secret-key}
+    wal: {compression: gzip}
+    data: {compression: gzip}
+  retentionPolicy: 14d

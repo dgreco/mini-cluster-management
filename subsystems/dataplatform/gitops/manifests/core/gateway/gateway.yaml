@@ -109,6 +109,20 @@ spec:
           selector:
             matchLabels:
               kubernetes.io/metadata.name: tools
+    - name: airflow-https
+      hostname: airflow.data.example.org
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: gateway-tls
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: tools
     - name: s3browser-https
       hostname: s3browser.data.example.org
       port: 443

@@ -11,6 +11,19 @@
     k3s_node_service: "{{ 'k3s' if k3s_node_role == 'server' else 'k3s-agent' }}"
     k3s_node_url: "https://{{ k3s_api_host }}:6443"
 
+- name: Kernel inotify limits for the kubelet and the containerd shims
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/90-k3s-inotify.conf
+    reload: true
+  loop:
+    - {name: fs.inotify.max_user_instances, value: "{{ k3s_inotify_max_user_instances }}"}
+    - {name: fs.inotify.max_user_watches, value: "{{ k3s_inotify_max_user_watches }}"}
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [inotify]
+
 - name: Configuration directory
   ansible.builtin.file:
     path: /etc/rancher/k3s
@@ -159,6 +172,8 @@
       {{ {'tls-san': ([k3s_api_host] + groups['k3s_servers']
                       + (groups['k3s_servers'] | map('extract', hostvars, 'ansible_host') | list)) | unique,
           'disable': k3s_disable,
+          'flannel-backend': k3s_flannel_backend,
+          'flannel-external-ip': true,
           'write-kubeconfig-mode': '0600',
           'etcd-snapshot-retention': k3s_etcd_snapshot_retention}
          | combine({'kube-apiserver-arg': ['authentication-config=/etc/rancher/k3s/authentication-config.yaml']}
@@ -169,10 +184,16 @@
       kubelet-arg:
         - "system-reserved={{ k3s_kubelet_system_reserved }}"
         - "eviction-hard={{ k3s_kubelet_eviction_hard }}"
+    # The node's own LAN address, never a virtual IP the interface may hold
+    # (k3s_flannel_backend in group_vars/k3s.yml)
+    _address:
+      node-ip: "{{ node_ip }}"
+      node-external-ip: "{{ node_ip }}"
     _config: >-
       {{ {'token': k3s_token}
          | combine(_join if k3s_node_is_server else {'server': k3s_node_url})
          | combine(_server if k3s_node_is_server else {})
+         | combine(_address)
          | combine(_kubelet)
          | combine(k3s_server_extra_config if k3s_node_is_server else k3s_agent_extra_config) }}
   register: k3s_node_config
@@ -233,3 +254,27 @@
   ansible.builtin.assert:
     that: k3s_node_ready.stdout == 'True'
     fail_msg: "{{ ansible_facts['nodename'] }} did not become Ready: {{ k3s_node_ready.stderr | default('') }}"
+
+# flannel publishes the address the other nodes route this node's pod subnet
+# to, and its backend (k3s_flannel_backend in group_vars/k3s.yml): node_ip,
+# and the servers' backend (an agent takes it from them).
+- name: The address and backend flannel publishes for {{ ansible_facts['nodename'] }}
+  ansible.builtin.command: >-
+    /usr/local/bin/k3s kubectl get node {{ ansible_facts['nodename'] }}
+    -o 'jsonpath={.metadata.annotations.flannel\.alpha\.coreos\.com/public-ip}
+    {.metadata.annotations.flannel\.alpha\.coreos\.com/backend-type}'
+  delegate_to: "{{ k3s_first_server }}"
+  register: k3s_node_flannel
+  changed_when: false
+  failed_when: false
+  retries: 12
+  delay: 5
+  until: k3s_node_flannel.stdout.split() == [node_ip, k3s_flannel_backend]
+
+- name: Flannel publishes the node's own address
+  ansible.builtin.assert:
+    that: k3s_node_flannel.stdout.split() == [node_ip, k3s_flannel_backend]
+    fail_msg: >-
+      flannel on {{ ansible_facts['nodename'] }} publishes '{{ k3s_node_flannel.stdout }}' (address, backend),
+      not '{{ node_ip }} {{ k3s_flannel_backend }}'. An agent takes the backend from the servers: run
+      servers.yml first. Otherwise see the k3s README, "Pod traffic between the nodes".

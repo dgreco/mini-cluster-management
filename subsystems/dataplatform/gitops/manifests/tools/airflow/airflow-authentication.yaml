@@ -1,0 +1,23 @@
+# Airflow's login: Keycloak (realm data-platform), with the client airflow
+# (airflow.yaml). Stackable's Airflow knows Keycloak only, wants the user name
+# from preferred_username, and never turns certificate checks off. Cluster
+# scoped: an AuthenticationClass of its own, not Trino's (keycloak), so that
+# each product can change without the other.
+apiVersion: authentication.stackable.tech/v1alpha1
+kind: AuthenticationClass
+metadata:
+  name: airflow-keycloak
+spec:
+  provider:
+    oidc:
+      hostname: keycloak.data.example.org
+      port: 443
+      rootPath: /realms/data-platform/
+      scopes: [openid, profile, email]
+      principalClaim: preferred_username
+      providerHint: Keycloak
+      tls:
+        verification:
+          server:
+            caCert:
+              webPki: {}

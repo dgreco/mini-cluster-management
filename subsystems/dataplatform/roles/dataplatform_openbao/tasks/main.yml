@@ -452,3 +452,36 @@
   when: _current | combine(_wanted) != _current
   changed_when: true
   no_log: true
+
+# ---------------------------------------------------------------- Airflow's git-sync ----
+# The deploy key Airflow reads the repository with (the lakehouse example's
+# DAGs), with the host keys the server must present, as Stackable's git-sync
+# wants them (Secret tools/airflow-git: key, knownHosts).
+- name: Look for Airflow's deploy key
+  ansible.builtin.stat:
+    path: "{{ dataplatform_airflow_git_ssh_key_file }}"
+  delegate_to: localhost
+  become: false
+  register: dataplatform_openbao_airflow_key
+
+- name: Store Airflow's deploy key and the pinned host keys
+  ansible.builtin.include_tasks: kv_put.yml
+  vars:
+    dataplatform_openbao_kv_path: tools/airflow-git
+    dataplatform_openbao_kv_data:
+      key: "{{ lookup('ansible.builtin.file', dataplatform_airflow_git_ssh_key_file) ~ '\n' }}"
+      # double-quoted: YAML makes the \n newlines (a block scalar would leave
+      # them to Jinja, which wrote a literal backslash-n: one line, git-sync
+      # then knew only the first key)
+      knownHosts: "{{ (lookup('ansible.builtin.file', dataplatform_gitops_dir ~ '/bootstrap/known_hosts').splitlines()
+        | select('match', '^[^#\\s]') | join('\n')) ~ '\n' }}"
+  when: dataplatform_openbao_airflow_key.stat.exists
+
+- name: Say that Airflow has no deploy key yet
+  ansible.builtin.debug:
+    msg: >-
+      {{ dataplatform_airflow_git_ssh_key_file }} does not exist, so Airflow's git-sync cannot read the
+      repository (no DAGs): make a read-only deploy key with
+      ssh-keygen -t ed25519 -N '' -C airflow-git-sync -f {{ dataplatform_airflow_git_ssh_key_file }},
+      add its .pub to the project's deploy keys, then run make dataplatform-openbao again.
+  when: not dataplatform_openbao_airflow_key.stat.exists

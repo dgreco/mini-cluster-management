@@ -24,12 +24,14 @@ metadata:
   namespace: compute
 spec:
   mode: cluster
+  # Every job names the same image itself (dp-spark-submit.sh, the pipeline):
+  # a job's sparkImage replaces this one whole. Iceberg's runtime is in it
+  # (images/spark-lakehouse), so nothing is fetched at submission.
   sparkImage:
-    productVersion: 4.1.2
+    custom: ghcr.io/dgreco/spark-lakehouse:4.1.2-stackable26.7.0-iceberg1.11.0-1@sha256:41f14ca5ff1a81a73abb32f5e0c39d05de1bc43b16e6bdadfeb570d73e50a927
+    productVersion: "4.1.2"
+    pullPolicy: IfNotPresent
   mainApplicationFile: local:///stackable/jobs/job.py
-  deps:
-    packages:
-    - org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0
   sparkConf:
     spark.sql.extensions: org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
     spark.sql.defaultCatalog: lakehouse

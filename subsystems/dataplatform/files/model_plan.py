@@ -33,14 +33,17 @@ on a file Meta Catalog would refuse in a way that can be seen here.
 
 Meta Catalog answers with merged schemas only, so the merge is done here as
 Meta Catalog does it (JsonUtils.mergeSchemas over TypeLinearization, read in
-its code, commit 29815bb; unchanged in 2.0.0): the type, then its traits from
+its code, commit 29815bb; unchanged in 2.0.0 and, for a trait with no
+mixed-in traits, in 2.1.x): the type, then its traits from
 the last declared to the first, then its father, each followed by its own linearization, an
 element already there dropped from the left; the base schemas merged in the
 reverse of that order, the last definition of a property deciding its value
 and whether it is required. A trait the file does not define (Meta Catalog's
 own: Provisionable, Aggregate, ...) counts with the schema Meta Catalog
 answers for it. Schemas are compared by their properties (as written) and
-required (as a set).
+required (as a set). Since 2.1.0 a trait may also mix in other traits (its
+`traits`, as Meta Catalog's own Asset does); the model file's traits have
+none, and the planner neither sends nor compares them.
 
 Standard library, plus PyYAML to read the model file (requirements.txt).
 """
@@ -149,6 +152,7 @@ def read_model(sections: list) -> dict:
 def read_live(live: dict) -> dict:
     return {
         "traits": {t["name"]: {"schema": schema_of(t), "inheritsFrom": t.get("inheritsFrom"),
+                               "mixins": list(t.get("traits") or []),
                                "version": t.get("version")} for t in live.get("traits") or []},
         "types": {t["name"]: {"schema": schema_of(t), "traits": list(t.get("traits") or []),
                               "inheritsFrom": t.get("inheritsFrom"), "version": t.get("version")}
@@ -351,9 +355,18 @@ def plan(model: dict, live: dict) -> list:
     for name in live["types"]:
         if name not in model["types"]:
             out.append({"note": f"entity type {name} is in Meta Catalog, not in the model file: left as it is"})
-    # Meta Catalog's own traits (Provisionable, Aggregate, ...) are carried by the file's types
+    # Meta Catalog's own traits (Provisionable, Aggregate, ...) are carried by the file's types,
+    # directly or through a trait they carry: its father and, since 2.1.0, the traits it mixes in
+    # (Asset: Provisionable, with Authorizable)
     used = {x for t in model["types"].values() for x in t["traits"]} | \
         {t.get("inheritsFrom") for t in model["traits"].values()}
+    todo = list(used)
+    while todo:
+        t = live["traits"].get(todo.pop())
+        for parent in ([t.get("inheritsFrom")] + t["mixins"]) if t else []:
+            if parent and parent not in used:
+                used.add(parent)
+                todo.append(parent)
     for name in live["traits"]:
         if name not in model["traits"] and name not in used:
             out.append({"note": f"trait {name} is in Meta Catalog, not in the model file: left as it is"})

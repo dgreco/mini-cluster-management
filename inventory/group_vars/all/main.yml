@@ -3,6 +3,9 @@
 # (names, addresses, the Git repository, ...) are in site.yml next to this file.
 
 cluster_domain: "{{ site_lan_domain }}"
+# The router's own domain, which the nodes search (DHCP) and so every pod: the
+# cluster's DNS answers it itself (coredns-custom, gitops core/gateway).
+lan_search_domain: "{{ site_lan_search_domain }}"
 
 # Local, git-ignored directory where generated secrets (dashboard password,
 # STS key, S3 keys) are stored on the Ansible control node.

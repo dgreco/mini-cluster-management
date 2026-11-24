@@ -302,8 +302,13 @@ dataplatform-directory-restore: ## REPLACE the directory (users, groups) by its 
 
 .PHONY: dataplatform-samba-image
 dataplatform-samba-image: ## Build and push the Samba AD image (images/samba-ad) for arm64 and amd64; prints the digest to pin
-	@subsystems/dataplatform/files/dp-samba-image.sh $(ARGS)
+	@subsystems/dataplatform/files/dp-image.sh samba-ad $(ARGS)
 ##> make dataplatform-samba-image ARGS="4.25.0-2"
+
+.PHONY: dataplatform-spark-image
+dataplatform-spark-image: ## Build and push the Spark jobs' image (images/spark-lakehouse: Stackable's Spark with Iceberg) for arm64 and amd64; prints the digest to pin
+	@subsystems/dataplatform/files/dp-image.sh spark-lakehouse $(ARGS)
+##> make dataplatform-spark-image ARGS="4.1.2-stackable26.7.0-iceberg1.11.0-1"
 
 .PHONY: dataplatform-remove
 dataplatform-remove: ## REMOVE the data platform and its data (databases, OpenBao, Keycloak, the directory, metrics, logs)
@@ -339,17 +344,25 @@ dataplatform-spark-submit: ## Run a PySpark job as yourself (Keycloak login, the
 ##> make dataplatform-spark-submit ARGS="-g <group> -w my_job.py"
 
 .PHONY: dataplatform-tables
-dataplatform-tables: ## Tables in Meta Catalog: sync (tables.yaml), model (its changes as versions), load, provision, authorize, status, delete
+dataplatform-tables: ## Domains and tables in Meta Catalog: sync (tables.yaml), model (its changes as versions), load, list, status, provision, authorize, reject, unprovision, delete, remove
 	@subsystems/dataplatform/files/dp-tables.sh $(ARGS)
-##> make dataplatform-tables ARGS="-l admin -n sync"              what sync would do to make the tables those of tables.yaml
-##> make dataplatform-tables ARGS="-l admin sync"                 make, change, provision, authorize, remove them (asks first)
-##> make dataplatform-tables ARGS="load <file.yaml>"              the model, then the tables of a file
-##> make dataplatform-tables ARGS=model                             the model file's changes -> Meta Catalog, as versions (asks first)
-##> make dataplatform-tables ARGS="provision retail"                each table's folder, then the table in the metastore (through Trino)
-##> make dataplatform-tables ARGS="authorize retail/analytics"      their grants -> Ceph and Trino (the admin group only)
-##> make dataplatform-tables ARGS="status retail/orders/silver/orders"   what is provisioned, and for whom
-##> make dataplatform-tables ARGS=list                              every table
-##> make dataplatform-tables ARGS="unprovision retail/orders/bronze/orders_raw"   DROPS the table and deletes its files (asks first)
+##> make dataplatform-tables ARGS="-n sync"                       what sync would do to make Meta Catalog's domains and tables those of tables.yaml
+##> make dataplatform-tables ARGS="-l admin sync"                 make, change, provision, authorize, REMOVE what the file no longer has (asks first)
+##> make dataplatform-tables ARGS=model                           the model file's changes -> Meta Catalog, as versions (asks first)
+##> make dataplatform-tables ARGS="load <file.yaml>"              the model if missing, then the domains and tables of a file
+##> make dataplatform-tables ARGS="provision sales"               each table's folder, then the table in the metastore (through Trino)
+##> make dataplatform-tables ARGS="-l admin authorize sales/gold" their grants -> Ceph and Trino (the admin group only)
+##> make dataplatform-tables ARGS="status sales/silver/orders_v1" what is provisioned, and for whom
+##> make dataplatform-tables ARGS=list                            every domain and table
+##> make dataplatform-tables ARGS="unprovision sales/bronze/orders_v1"   DROPS the table and deletes its files (asks first)
+##> make dataplatform-tables ARGS="-l admin remove"               every domain and table of tables.yaml out of Meta Catalog, data DROPPED (asks first)
+
+.PHONY: dataplatform-lakehouse-reset
+dataplatform-lakehouse-reset: ## The lakehouse example from scratch: its DAGs and Spark jobs stopped, their history deleted, every table of tables.yaml DROPPED with its data and made again, empty
+	$(call countdown,this stops the lakehouse example and drops every table of tables.yaml with its data.)
+	@subsystems/dataplatform/examples/lakehouse/reset.sh $(ARGS)
+##> make dataplatform-lakehouse-reset ARGS="-l admin -n"          what it would do
+##> make dataplatform-lakehouse-reset ARGS="-l admin"             do it (asks; -y does not); then trigger the DAGs in Airflow
 
 ##@ Data platform data access   (Meta Catalog's grants -> Ceph RGW roles, Trino's mapping and Trino's rules; gitops/iam/access.yaml: the platform's part)
 

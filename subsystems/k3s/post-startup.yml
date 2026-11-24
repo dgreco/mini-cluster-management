@@ -1,8 +1,10 @@
 ---
 # Cluster hook: called by cluster/power-on.yml after the Ceph post-startup hook,
 # for a whole-cluster power-on. k3s starts at boot on its own; wait until every
-# node is Ready, then uncordon nodes a single-node shutdown left cordoned. Pods
-# whose volumes could not attach before Ceph was back retry by themselves.
+# node is Ready and publishes its own address to the others
+# (hooks/flannel-check.yml), then uncordon nodes a single-node shutdown left
+# cordoned. Pods whose volumes could not attach before Ceph was back retry by
+# themselves.
 - name: The k3s post-startup hook
   hosts: "{{ groups['k3s_servers'][0] }}"
   gather_facts: false
@@ -32,6 +34,10 @@
       until: >-
         k3s_nodes_ready.rc == 0
         and (k3s_nodes_ready.stdout_lines | select('equalto', 'True') | list | length) == groups['k3s'] | length
+      when: k3s_bin.stat.exists
+
+    - name: Every node's flannel address is its own
+      ansible.builtin.include_tasks: hooks/flannel-check.yml
       when: k3s_bin.stat.exists
 
     # A single-node shutdown (cluster/shutdown.yml -e target=...) followed by a

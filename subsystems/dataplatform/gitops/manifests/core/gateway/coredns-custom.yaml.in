@@ -1,8 +1,19 @@
+# k3s's CoreDNS reads this one ConfigMap: *.override keys go into its main
+# server block, *.server keys are server blocks of their own.
+#
 # Pods resolve the public names *.<%= dataplatform_domain %> to the Gateway's own
 # Service, so in-cluster clients (Argo CD, Grafana, OpenBao, Trino, Spark
 # fetching Keycloak's discovery and keys) use the same URLs and certificate as
-# everyone else without leaving the cluster. k3s's CoreDNS imports *.override
-# keys of this ConfigMap into its main server block.
+# everyone else without leaving the cluster.
+<% if lan_search_domain | length > 0 %>
+#
+# The nodes search the router's own domain (<%= lan_search_domain %>, from DHCP),
+# so every pod tries each name it looks up with it appended before the name
+# itself (ndots 5): CoreDNS answers that domain with "no such name" instead of
+# asking the router, which on 2026-11-24 stopped answering for names of its
+# domain it does not know, so that every lookup in every pod failed ("Try
+# again"). No pod needs a name of that domain.
+<% endif %>
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -11,3 +22,12 @@ metadata:
 data:
   dataplatform.override: |
     rewrite name regex ^(.*\.)?<%= dataplatform_domain | regex_escape %>\.?$ main-gateway-nginx.core.svc.cluster.local answer auto
+<% if lan_search_domain | length > 0 %>
+  lan-search.server: |
+    <%= lan_search_domain %>:53 {
+        errors
+        template ANY ANY {
+            rcode NXDOMAIN
+        }
+    }
+<% endif %>

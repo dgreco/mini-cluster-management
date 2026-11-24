@@ -1,143 +1,104 @@
 # The data model of the platform, in Meta Catalog's bulk format (traits,
 # relationships, entity types, mappings). This file is the whole model, as
-# Meta Catalog gets it: nothing is rendered into it. Loaded once into the
-# running Meta Catalog by `make dataplatform-tables ARGS="load ..."`, which
-# skips what is already there. After a change, `make dataplatform-tables
-# ARGS=model` sends it as versions: it shows what it will make or version
-# and asks first. Entities keep the version they were made with, so a new
+# Meta Catalog gets it: nothing is rendered into it. make dataplatform-tables
+# ARGS=model sends what Meta Catalog lacks and versions what changed (it
+# shows the calls and asks first); sync and load send it when Meta Catalog
+# has none of it. Entities keep the version they were made with, so a new
 # property or enum value is for tables made afterwards.
 #
-# The artifact is a table. A table is an aggregate of its own: the unit that
-# is provisioned and the subject of authorization (its root carries the access
-# policy: principals, permissions, grants). What a table says about itself:
+# Two kinds of thing (the platform's choice of 2026-11-22: domains are
+# entities, a table's version is part of its name):
 #
-#   domain, subdomain   where it belongs: one of the domains of the trait
-#                       DomainMember and one of that domain's subdomains
-#   layer               its place in the medallion: bronze, silver or gold
-#   format              how its files are written: parquet, avro or iceberg
-#   name, description, owner
-#   its schema          a part (TableSchemaType): the columns
-#   its lineage         DEPENDS_ON other tables (`dependsOn` in a file)
+#   a domain   DomainType: a name and a description. It depends on every
+#              table of the domain (DEPENDS_ON), so Meta Catalog's Assets
+#              pages draw each domain over its tables. The links are kept by
+#              make dataplatform-tables from the tables' `domain`.
+#   a table    TableType, a versioned asset (the built-in Asset and
+#              Versionable: Meta Catalog keeps every change of it as a
+#              numbered version). What it says about itself: name,
+#              description, domain (the name of its domain), layer (BRONZE,
+#              SILVER, GOLD), format (parquet, iceberg) and version; its one
+#              part, TableSchemaType, holds the columns (name, type,
+#              description). Lineage: a table DEPENDS_ON the tables it is
+#              built from. A table is the unit that is provisioned and the
+#              subject of authorization (its root carries the access policy:
+#              principals, permissions, grants).
 #
-# The mappings derive the two physical resources of a table:
+# The version is part of a table's identity: v1 and v2 of a table are two
+# tables, side by side, each with its own folder and its own entry in the
+# metastore. The mappings derive the two physical resources of a table from
+# domain, layer, name and version:
 #
-#   table   -> S3FolderType:  the table's folder,
-#              s3://dataplatform/lakehouse/<domain>/<subdomain>/<layer>/<name>
-#   schema  -> HiveTableType: the table in the Hive Metastore (Trino:
-#              lakehouse.<domain>_<subdomain>_<layer>.<name>), at that folder
+#   table  -> S3FolderType:  s3://dataplatform/lakehouse/<domain>/<layer>/<name>_v<version>
+#   schema -> HiveTableType: lakehouse.<domain>_<layer>.<name>_v<version> (Trino),
+#                            at that folder
 #
-# dataplatform is the platform's bucket (site_bucket in
-# inventory/group_vars/all/site.yml), written out in the mappings: on a site
-# with another bucket, change it there before the first load. The
-# provisioning script builds every place again from the names and its own
-# bucket, and refuses a resource whose values say otherwise.
+# with the layer in lower case. A table's place, name, format and version
+# never change: another one is another table.
 #
 # Both are handled by Meta Catalog's `script` task
-# (gitops/manifests/governance/metacatalog/provisioning). Provision makes the
+# (gitops/manifests/governance/metacatalog/provisioning/table.sh), which
+# builds every place again from the names, refuses values that say otherwise
+# and a domain that is no DomainType of Meta Catalog. Provision makes the
 # folder, then registers the table (the schema's mapping reaches the folder
 # through its table, which is what puts the folder first; unprovision goes
 # the other way round). Authorize turns the table's grants into rights where
 # each resource is enforced: on the folder, Ceph's STS roles; on the table,
-# Trino's rules in the Open Policy Agent (the admin group only). Reject
-# withdraws them.
+# Trino's rules in the Open Policy Agent. Reject withdraws them.
 #
-# The folder and the names are built from domain, subdomain, layer and name:
-# they identify the table and are not to be changed afterwards (a table with
-# another name is another table). Domain and subdomain names have no '_', so
-# that <domain>_<subdomain>_<layer> names one schema only. Everything ends up
-# in SQL identifiers and S3 keys: lower-case letters, digits and (table and
-# column names) '_'; the provisioning script checks them again.
+# Mapped values are plain strings: Meta Catalog's expressions call only
+# JsonNode's methods (no toLowerCase), hence the conditional for the layer.
+# dataplatform is the platform's bucket (site_bucket in
+# inventory/group_vars/all/site.yml), written out in the mappings: on a site
+# with another bucket, change it there before the first load. Names: a
+# domain is lower-case letters and digits (no '_': <domain>_<layer> must name
+# one schema), a table lower-case letters, digits and '_'. Everything ends up
+# in SQL identifiers and S3 keys; the provisioning script checks them again.
 
 Traits:
-  # Whatever belongs to a subdomain of a domain says which, by name: the
-  # mappings build the folder and the schema name from these two values.
-  # This trait is the one definition of the domains and their subdomains.
-  #
-  #   domain.enum            the domains
-  #   domain.x-subdomains    each domain's own subdomains: the only pairs a
-  #                          table may name
-  #   subdomain.enum         every subdomain of x-subdomains, once
-  #
-  # Meta Catalog's form shows the two enums as drop-downs and refuses a value
-  # outside them. It keeps no rule that ties two properties together (it
-  # merges only the properties of a type's traits into its schema, and
-  # refuses if/then, allOf and the like), so the pair is checked by make
-  # dataplatform-tables at load and by the provisioning script before it
-  # makes anything, both against x-subdomains of the trait in Meta Catalog.
-  # Meta Catalog keeps that keyword as it is and validates nothing with it.
-  #
-  # Names: lower-case letters and digits, a letter first, at most 24, no '_'
-  # (they become part of every table's folder and schema name). A subdomain
-  # name may repeat in another domain. The domain smoke, with its subdomain
-  # test, is the smoke test's own (make dataplatform-smoke-test).
-  #
-  # After a change here: make dataplatform-tables ARGS=model (it checks the
-  # three lists agree, then sends a new version of this trait and of
-  # TableType). A table keeps the version it was made with. A pair taken out
-  # can no longer be provisioned; its tables can still be unprovisioned,
-  # rejected and deleted.
-  - name: DomainMember
+  # A domain: what it is called and what it holds.
+  - name: Domain
     schema:
       type: object
-      required: [domain, subdomain]
-      properties:
-        domain:
-          type: string
-          description: "One of: retail, smoke"
-          enum: [retail, smoke]
-          x-subdomains:
-            # The shop: what it sells, to whom, and what it is paid.
-            # orders: as the web shop takes them; customers: the CRM's;
-            # payments: from the payments database; analytics: what the
-            # business reads (revenue, customer value)
-            retail: [orders, customers, payments, analytics]
-            # The tables of make dataplatform-smoke-test: made, used and
-            # taken out again at every run
-            smoke: [test]
-        subdomain:
-          type: string
-          description: "One of its domain's: retail (orders, customers, payments, analytics); smoke (test)"
-          enum: [orders, customers, payments, analytics, test]
-
-  # A named set of data; the lineage relationship below is between datasets.
-  - name: Dataset
-    schema:
-      type: object
-      required: [name]
+      required: [name, description]
       properties:
         name:
           type: string
-          pattern: "^[a-z][a-z0-9_]{0,62}$"
+          pattern: "^[a-z][a-z0-9]{0,23}$"
         description:
           type: string
-        owner:
-          type: string
 
-  # The medallion architecture: as it arrived, cleaned, ready for the business.
-  - name: MedallionLayered
+  # A table. `domain` names the DomainType it belongs to (the mappings read
+  # the name from here, never through the domain's link: a link a mapping
+  # walks can never be removed).
+  - name: Dataset
     schema:
       type: object
-      required: [layer]
+      required: [name, description, domain, layer, format, version]
       properties:
+        name:
+          type: string
+          pattern: "^[a-z][a-z0-9_]{0,50}$"
+        description:
+          type: string
+        domain:
+          type: string
+          pattern: "^[a-z][a-z0-9]{0,23}$"
         layer:
           type: string
-          enum: [bronze, silver, gold]
-
-  # How the files are written. parquet and avro are plain files in the folder
-  # (a Hive table); iceberg keeps its own metadata next to the data.
-  - name: StorageFormatted
-    schema:
-      type: object
-      required: [format]
-      properties:
+          enum: [BRONZE, SILVER, GOLD]
         format:
           type: string
-          enum: [parquet, avro, iceberg]
+          enum: [parquet, iceberg]
+        version:
+          type: integer
+          minimum: 1
+          maximum: 999
 
-  # Columns. The types are written once, for every format (string, long, int,
-  # double, decimal(p,s), date, timestamp, boolean, binary, ...); the script
-  # maps them to Trino's and refuses what a format cannot hold.
-  - name: Structured
+  # A table's columns. Types as in the platform's model (string, long, int,
+  # double, decimal(p,s), date, timestamp, boolean, ...): the provisioning
+  # script maps them to Trino's and refuses what the format cannot hold.
+  - name: Columns
     schema:
       type: object
       required: [columns]
@@ -147,7 +108,7 @@ Traits:
           minItems: 1
           items:
             type: object
-            required: [name, type]
+            required: [name, type, description]
             properties:
               name:
                 type: string
@@ -156,13 +117,17 @@ Traits:
                 type: string
               description:
                 type: string
-              pii:
-                type: boolean
 
 ---
 Relationships:
 
-  # Lineage: a silver table depends on the bronze one it is built from.
+  # A domain depends on each of its tables.
+  - sourceTrait: Domain
+    relationshipType: DEPENDS_ON
+    targetTrait: Dataset
+
+  # Lineage: a silver table depends on the bronze ones it is built from, a
+  # gold one on silver ones (of any domain).
   - sourceTrait: Dataset
     relationshipType: DEPENDS_ON
     targetTrait: Dataset
@@ -170,39 +135,42 @@ Relationships:
 ---
 EntityTypes:
 
-  # The table: the aggregate root. Provisionable, and Authorizable: its
-  # principals, permissions and grants are the one access policy of its folder
-  # and of its entry in the metastore.
+  # The domain: an asset of its own, with no part and no resource, so that
+  # the Assets pages list it and draw its dependencies on its tables.
+  # Provisioning or authorizing it does nothing (make dataplatform-tables
+  # never runs either on a domain).
+  - name: DomainType
+    schema:
+      type: object
+      properties: {}
+    traits:
+      - Asset
+      - Domain
+
+  # The table: the aggregate root, a versioned asset. Its principals,
+  # permissions and grants are the one access policy of its folder and of
+  # its entry in the metastore.
   - name: TableType
     schema:
       type: object
-      properties:
-        retentionDays:
-          type: integer
+      properties: {}
     traits:
-      - Provisionable
-      - Authorizable
+      - Asset
+      - Versionable
       - Dataset
-      - DomainMember
-      - MedallionLayered
-      - StorageFormatted
 
-  # The table's schema, its one part. It carries Aggregate as well as
-  # AggregateElement: provisioning collects derived resources from the
-  # Aggregate carriers of the tree, so the metastore table of a pure leaf
-  # would never be provisioned. A table without a schema is a folder only.
+  # The table's schema, its one part (Aggregate as well as AggregateElement:
+  # provisioning collects derived resources from the Aggregate carriers of
+  # the tree only, so the metastore table of a pure leaf would never be
+  # provisioned). A table without a schema is a folder of files only.
   - name: TableSchemaType
     schema:
       type: object
-      properties:
-        primaryKey:
-          type: array
-          items:
-            type: string
+      properties: {}
     traits:
       - Aggregate
       - AggregateElement
-      - Structured
+      - Columns
 
   # The physical side, derived by the mappings below and never written by
   # hand. Mapped values are plain strings (`columns` is the schema's column
@@ -221,8 +189,6 @@ EntityTypes:
         location:
           type: string
         domain:
-          type: string
-        subdomain:
           type: string
         layer:
           type: string
@@ -254,8 +220,6 @@ EntityTypes:
           type: string
         domain:
           type: string
-        subdomain:
-          type: string
         layer:
           type: string
     traits:
@@ -272,15 +236,20 @@ Mappings:
       kind: "'folder'"
       bucket: "'dataplatform'"
       domain: "#source.getValue('$.domain').asText()"
-      subdomain: "#source.getValue('$.subdomain').asText()"
-      layer: "#source.getValue('$.layer').asText()"
-      table: "#source.getValue('$.name').asText()"
+      layer: >-
+        #source.getValue('$.layer').asText() == 'BRONZE' ? 'bronze'
+        : (#source.getValue('$.layer').asText() == 'SILVER' ? 'silver' : 'gold')
+      table: "#source.getValue('$.name').asText() + '_v' + #source.getValue('$.version').asText()"
       path: >-
-        'lakehouse/' + #source.getValue('$.domain').asText() + '/' + #source.getValue('$.subdomain').asText()
-        + '/' + #source.getValue('$.layer').asText() + '/' + #source.getValue('$.name').asText()
+        'lakehouse/' + #source.getValue('$.domain').asText() + '/'
+        + (#source.getValue('$.layer').asText() == 'BRONZE' ? 'bronze'
+           : (#source.getValue('$.layer').asText() == 'SILVER' ? 'silver' : 'gold'))
+        + '/' + #source.getValue('$.name').asText() + '_v' + #source.getValue('$.version').asText()
       location: >-
-        's3://dataplatform/lakehouse/' + #source.getValue('$.domain').asText() + '/' + #source.getValue('$.subdomain').asText()
-        + '/' + #source.getValue('$.layer').asText() + '/' + #source.getValue('$.name').asText()
+        's3://dataplatform/lakehouse/' + #source.getValue('$.domain').asText() + '/'
+        + (#source.getValue('$.layer').asText() == 'BRONZE' ? 'bronze'
+           : (#source.getValue('$.layer').asText() == 'SILVER' ? 'silver' : 'gold'))
+        + '/' + #source.getValue('$.name').asText() + '_v' + #source.getValue('$.version').asText()
     entityPathReferences: []
 
   # Schema -> the table in the metastore. `table` walks up to the table the
@@ -292,17 +261,20 @@ Mappings:
       kind: "'table'"
       catalog: "'lakehouse'"
       domain: "#table.getValue('$.domain').asText()"
-      subdomain: "#table.getValue('$.subdomain').asText()"
-      layer: "#table.getValue('$.layer').asText()"
+      layer: >-
+        #table.getValue('$.layer').asText() == 'BRONZE' ? 'bronze'
+        : (#table.getValue('$.layer').asText() == 'SILVER' ? 'silver' : 'gold')
       schema: >-
-        #table.getValue('$.domain').asText() + '_' + #table.getValue('$.subdomain').asText()
-        + '_' + #table.getValue('$.layer').asText()
-      table: "#table.getValue('$.name').asText()"
+        #table.getValue('$.domain').asText() + '_'
+        + (#table.getValue('$.layer').asText() == 'BRONZE' ? 'bronze'
+           : (#table.getValue('$.layer').asText() == 'SILVER' ? 'silver' : 'gold'))
+      table: "#table.getValue('$.name').asText() + '_v' + #table.getValue('$.version').asText()"
       format: "#table.getValue('$.format').asText()"
       location: "#folder.getValue('$.location').asText()"
       schemaLocation: >-
-        's3://dataplatform/lakehouse/' + #table.getValue('$.domain').asText() + '/' + #table.getValue('$.subdomain').asText()
-        + '/' + #table.getValue('$.layer').asText()
+        's3://dataplatform/lakehouse/' + #table.getValue('$.domain').asText() + '/'
+        + (#table.getValue('$.layer').asText() == 'BRONZE' ? 'bronze'
+           : (#table.getValue('$.layer').asText() == 'SILVER' ? 'silver' : 'gold'))
       columns: "#source.getValue('$.columns').toString()"
     entityPathReferences:
       - alias: "table"

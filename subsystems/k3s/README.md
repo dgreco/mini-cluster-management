@@ -24,6 +24,7 @@ by the `[k3s_servers]` / `[k3s_agents]` groups in `inventory/hosts.ini`.
 |---|---|---|
 | `k3s_version` | `v1.36.4+k3s1` | pinned; bump and re-run `make k3s-install` to upgrade |
 | `k3s_disable` | `[traefik]` | packaged components left out |
+| `k3s_flannel_backend` | `host-gw` | pod traffic between the nodes: plain routes via each node's LAN address (see "Pod traffic between the nodes") |
 | `k3s_server_extra_config` / `k3s_agent_extra_config` | `{}` | merged into `/etc/rancher/k3s/config.yaml` |
 | `k3s_ceph_storage_enabled` | `true` | ceph-csi and the two Ceph StorageClasses |
 | `k3s_ceph_csi_version` | `3.15.1` | chart and driver; the newest that maps RBD on the 5.10 kernel (see below) |
@@ -53,6 +54,9 @@ kubectl get nodes          # context k3s, merged into ~/.kube/config
 - `servers.yml` — one server at a time: the first bootstraps etcd
   (`cluster-init`), the others join it. Waits for each node to be Ready.
 - `agents.yml` — the agents join.
+- `flannel.yml` — every node's flannel publishes its own LAN address with
+  `k3s_flannel_backend` (`hooks/flannel-check.yml`); then each node loses the
+  VXLAN device that a switch away from `vxlan` leaves behind.
 - `kubeconfig.yml` — admin kubeconfig for the control node, pointing at the
   first server by IP (macOS resolves `.local` names through mDNS first, which
   stalls every call), with cluster/context/user named `k3s`. Written to
@@ -99,13 +103,48 @@ cheap and a version bump is an in-place upgrade (servers one at a time).
 | `hooks/rolling-start.yml` | before a rolling reboot: every node Ready and not cordoned, API `/readyz` ok, `k3s etcd-snapshot save --name rolling-reboot`; agents go first |
 | `hooks/pick-server.yml` | shared by the node hooks (and the data platform's): another server whose API answers, and whether the node is a cluster member; fails when k3s is installed but no server answers |
 | `hooks/node-enter.yml` | from that server: every server Ready, `kubectl drain` (on failure: list the pods, uncordon, stop), then report Ceph volumes still mapped (before the Ceph hook) |
-| `hooks/node-exit.yml` | wait until the node is Ready with its new boot ID and the ceph-csi node plugins run since the boot, uncordon, wait for `/readyz` and every node Ready (after the Ceph hook) |
+| `hooks/node-exit.yml` | wait until the node is Ready with its new boot ID and the ceph-csi node plugins run since the boot, uncordon, wait for `/readyz` and every node Ready, then `hooks/flannel-check.yml` (after the Ceph hook) |
+| `hooks/flannel-check.yml` | shared: every node's flannel publishes the node's own address (`node_ip`) with `k3s_flannel_backend`; fails otherwise (within two minutes) |
 | `hooks/rolling-end.yml` | after a rolling reboot: `kubectl get nodes` |
 | `pre-shutdown.yml` | whole-cluster shutdown: `k3s-killall.sh` on every node and unmap RBD images, before Ceph is quiesced (a single node is drained instead) |
-| `post-startup.yml` | whole-cluster power-on: wait for every node to be Ready, after Ceph is back, and uncordon what a single-node shutdown left cordoned |
+| `post-startup.yml` | whole-cluster power-on: wait for every node to be Ready, after Ceph is back, check every node's flannel address (`hooks/flannel-check.yml`), and uncordon what a single-node shutdown left cordoned |
 
 All of them do nothing when k3s is not installed; the node hooks fail when it
 is installed but no server answers.
+
+## Pod traffic between the nodes
+
+k3s's flannel gives every node a pod subnet (`10.42.<n>.0/24`) and tells the
+other nodes, in the node annotation `flannel.alpha.coreos.com/public-ip`, the
+address to send that subnet's traffic to. `k3s_flannel_backend: host-gw` makes
+that a plain route via the node's LAN address (`ip route` shows
+`10.42.<n>.0/24 via <node_ip> dev eth0`); the boards share one LAN, so nothing
+is wrapped. Every node's `config.yaml` names its own address (`node-ip`,
+`node-external-ip`: `node_ip`), and the servers' `flannel-external-ip: true`
+makes flannel publish it.
+
+Why not k3s's default, VXLAN: it sends from the first IPv4 address of the
+default interface, and k3s has no setting to choose another. An ingress node
+(`ceph_ingress`) also holds the S3 virtual IP at times. On 2026-11-24 one did
+when k3s started after a power-on; flannel took that address, keepalived then
+moved it to the other ingress node, and for three hours every pod of the
+first node reached no pod elsewhere (DNS: `Try again`; Keycloak, the Hive
+Metastore, JupyterHub's hub in CrashLoopBackOff) while the node stayed Ready.
+host-gw has no tunnel source of its own: the published address decides.
+
+`make k3s-status` shows each node's address, the one flannel publishes and the
+backend; the power-on and node-exit hooks fail when they differ. To repair a
+node by hand: `systemctl restart k3s` (a server) or `k3s-agent`, once its own
+address is the first IPv4 address of `eth0` (`ip -4 addr show eth0`); running
+pods are kept.
+
+Both flannel settings are critical to k3s: every server must have the same, or
+k3s refuses to start it. A change goes through `make k3s-install`: the servers
+restart one at a time, the first one first (it joins nobody, so nobody
+compares), then the agents, which take the backend from the servers; the last
+step removes the VXLAN device (`flannel.1`). Until then a node on the new
+backend still receives its neighbours' VXLAN traffic through that device, and
+answers them with plain routes.
 
 ## A virtual IP for the API server (optional)
 

@@ -1,280 +1,383 @@
-# The platform's tables: this file is their one definition. Every table of
-# every domain but smoke (the smoke test's own) is what this file says:
+# The platform's domains and tables: this file is their one definition.
+# Every domain and table of Meta Catalog but the smoke test's (smoke, smoke*)
+# is what this file says:
 #
-#   make dataplatform-tables ARGS="-n sync"   # what sync would do, changing nothing
-#   make dataplatform-tables ARGS=sync        # do it (shows it and asks; ARGS="-y sync" does not)
+#   make dataplatform-tables ARGS="-n sync"        # what sync would do, changing nothing
+#   make dataplatform-tables ARGS="-l admin sync"  # do it (shows it and asks; ARGS="-y ..." does not)
 #
-# sync makes a table that is new here, provisions it (its folder, then its
-# table in the metastore) and authorizes it (its grants -> Ceph and Trino);
-# a table whose values, columns or grants changed here gets them in Meta
-# Catalog, and is provisioned and authorized again; a table that is no longer
-# here is rejected, unprovisioned (DROPPED, its files DELETED) and taken out of
-# Meta Catalog. A change made in Meta Catalog's UI to one of these tables is
-# put back as this file says. Authorizing needs the admin group: run it as
-# ARGS="-l admin sync" (the login is kept for an hour).
+# sync makes what is new here, gives a table whose description, columns,
+# lineage or grants changed here those of this file (one new version of it
+# in Meta Catalog), keeps every domain depending on exactly its own tables,
+# provisions and authorizes every table (rejects one with no grant), and
+# REMOVES what is no longer here: a table is rejected, unprovisioned (DROPPED,
+# its files DELETED) and deleted, then a domain with no table left.
+# Authorizing needs the admin group (-l admin; the login is kept an hour).
 #
-# Each document is one table: its place (domain, subdomain, layer) and name,
-# which identify it, its format, its access policy, its schema (the part with
-# the columns) and what it is built from (dependsOn: the `ref` of other
-# tables of this file). A table's place, name and format never change: a
-# table with another one is another table (sync drops the old one). A column
-# is added by provisioning, never dropped, and its type never changes.
+# Each document is a domain (DomainType: name, description) or a table
+# (TableType). A table names its domain (`domain`), its layer (BRONZE,
+# SILVER, GOLD), its format (parquet, iceberg) and its version, which with
+# its name identify it: a new version is a new table next to the old one
+# (copy the document, change `ref` and `version` together). The old version
+# stays as long as its document stays here: take it out and sync drops it,
+# with its data. The pipelines (examples/lakehouse/dags) use the highest
+# version of each table here. `dependsOn` is its lineage: the `ref` of the
+# tables it is built from. A table without parts is a folder of files only
+# (no table in the metastore). A domain's dependencies on its tables are not
+# written here: sync derives them from the tables' `domain`.
 #
-# A table is granted on its own. Principals are Keycloak groups (GROUP) and
-# users (USER); a SERVICE is a Keycloak client's service account
-# (service-account-<id>). Permissions: READ (query the table, read its
-# files) and WRITE (also change its rows and its files). A grant reaches the
-# table's folder (Ceph) and its entry in the metastore (Trino) alike, unless
-# it selects one: `resources: { entityTypes: ["S3FolderType"] }` grants the
-# files without the table. A table without grants is rejected (nobody but
-# the admin group reaches it). Creating, altering and dropping tables is
-# Meta Catalog's alone; platform-admins reads and writes every table without
-# a grant. The groups are the site's (inventory/group_vars/all/site.yml),
-# written out: a grant names a group as it is in the directory.
+# Who owns what (READ: query the table, read its files; WRITE: also change
+# its rows and write its files; nobody but Meta Catalog makes, alters or
+# drops a table, and the admin group reads and writes every table anyway):
 #
-#   domain retail (the example domain of the model's trait DomainMember)
-#   layer    table                     format    data-engineers   data-analysts
-#   bronze   orders_raw                avro      read, write      -
-#   bronze   customers_raw             parquet   read, write      -
-#   bronze   payments_raw              avro      read, write      -
-#   silver   orders, customers, payments  iceberg  read, write    -
-#   gold     daily_revenue             iceberg   read, write      read
-#   gold     customer_lifetime_value   parquet   read, write      read
-#   gold     monthly_revenue           iceberg   read, write      read
-ref: "orders_raw"
-entityType: "TableType"
+#   layer   data-engineers   data-analysts   lakehouse-pipeline (SERVICE)
+#   BRONZE  read, write      -               read, write
+#   SILVER  read, write      -               read, write
+#   GOLD    read, write      read            read, write
+#
+# lakehouse-pipeline is the Keycloak client whose service account
+# (service-account-lakehouse-pipeline) Airflow's DAGs run as. The groups are
+# the site's (inventory/group_vars/all/site.yml), written out as they are
+# in the directory.
+#
+#   domain     layer   table                    format   built from
+#   sales      BRONZE  customers_v1             parquet  (the generator: examples/lakehouse)
+#   sales      BRONZE  orders_v1                parquet  (the generator)
+#   sales      SILVER  customers_v1             iceberg  bronze customers
+#   sales      SILVER  orders_v1                iceberg  bronze orders
+#   sales      GOLD    daily_sales_v1           iceberg  silver orders, customers
+#   sales      GOLD    customer_value_v1        iceberg  silver orders, customers
+#   logistics  BRONZE  carriers_v1              parquet  (the generator)
+#   logistics  BRONZE  shipments_v1             parquet  (the generator)
+#   logistics  SILVER  shipments_v1             iceberg  bronze shipments, carriers
+#   logistics  GOLD    delivery_performance_v1  iceberg  silver shipments; sales silver orders, customers
+ref: "sales"
+entityType: "DomainType"
 values:
-  name: "orders_raw"
-  description: "Order events exactly as the web shop emits them"
-  domain: "retail"
-  subdomain: "orders"
-  layer: "bronze"
-  format: "avro"
-  retentionDays: 30
-  principals:
-    - { id: "data-engineers", type: "GROUP" }
-  permissions:
-    - { name: "READ", description: "Query the table, read its files" }
-    - { name: "WRITE", description: "Change its rows, write its files" }
-  grants:
-    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
-parts:
-  - entityType: "TableSchemaType"
-    values:
-      columns:
-        - { name: "payload", type: "string" }
-        - { name: "received_at", type: "timestamp" }
+  name: "sales"
+  description: "The web shop's customers and orders: who buys what, through which channel, for how much"
 ---
-ref: "customers_raw"
-entityType: "TableType"
+ref: "logistics"
+entityType: "DomainType"
 values:
-  name: "customers_raw"
-  description: "The nightly CRM export, as it came"
-  domain: "retail"
-  subdomain: "customers"
-  layer: "bronze"
-  format: "parquet"
-  retentionDays: 30
-  principals:
-    - { id: "data-engineers", type: "GROUP" }
-  permissions:
-    - { name: "READ", description: "Query the table, read its files" }
-    - { name: "WRITE", description: "Change its rows, write its files" }
-  grants:
-    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
-parts:
-  - entityType: "TableSchemaType"
-    values:
-      columns:
-        - { name: "line", type: "string", pii: true }
-        - { name: "file_name", type: "string" }
+  name: "logistics"
+  description: "Getting the orders to the customers: carriers, shipments and how well they deliver"
 ---
-ref: "payments_raw"
+ref: "sales_bronze_customers_v1"
 entityType: "TableType"
-values:
-  name: "payments_raw"
-  description: "Change data capture from the payments database"
-  domain: "retail"
-  subdomain: "payments"
-  layer: "bronze"
-  format: "avro"
-  retentionDays: 30
-  principals:
-    - { id: "data-engineers", type: "GROUP" }
-  permissions:
-    - { name: "READ", description: "Query the table, read its files" }
-    - { name: "WRITE", description: "Change its rows, write its files" }
-  grants:
-    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
-parts:
-  - entityType: "TableSchemaType"
-    values:
-      columns:
-        - { name: "op", type: "string" }
-        - { name: "after", type: "string" }
-        - { name: "ts_ms", type: "long" }
----
-ref: "orders"
-entityType: "TableType"
-dependsOn: ["orders_raw"]
-values:
-  name: "orders"
-  description: "One row per order, cleaned"
-  domain: "retail"
-  subdomain: "orders"
-  layer: "silver"
-  format: "iceberg"
-  principals:
-    - { id: "data-engineers", type: "GROUP" }
-  permissions:
-    - { name: "READ", description: "Query the table, read its files" }
-    - { name: "WRITE", description: "Change its rows, write its files" }
-  grants:
-    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
-parts:
-  - entityType: "TableSchemaType"
-    values:
-      primaryKey: ["order_id"]
-      columns:
-        - { name: "order_id", type: "long" }
-        - { name: "customer_id", type: "long" }
-        - { name: "total", type: "decimal(10,2)" }
-        - { name: "ordered_at", type: "timestamptz" }
----
-ref: "customers"
-entityType: "TableType"
-dependsOn: ["customers_raw"]
 values:
   name: "customers"
-  description: "One row per customer, cleaned"
-  domain: "retail"
-  subdomain: "customers"
-  layer: "silver"
-  format: "iceberg"
-  principals:
-    - { id: "data-engineers", type: "GROUP" }
-  permissions:
-    - { name: "READ", description: "Query the table, read its files" }
-    - { name: "WRITE", description: "Change its rows, write its files" }
-  grants:
-    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
-parts:
-  - entityType: "TableSchemaType"
-    values:
-      primaryKey: ["customer_id"]
-      columns:
-        - { name: "customer_id", type: "long" }
-        - { name: "full_name", type: "string", pii: true }
-        - { name: "email", type: "string", pii: true }
-        - { name: "country", type: "string" }
----
-ref: "payments"
-entityType: "TableType"
-dependsOn: ["payments_raw"]
-values:
-  name: "payments"
-  description: "One row per payment, cleaned"
-  domain: "retail"
-  subdomain: "payments"
-  layer: "silver"
-  format: "iceberg"
-  principals:
-    - { id: "data-engineers", type: "GROUP" }
-  permissions:
-    - { name: "READ", description: "Query the table, read its files" }
-    - { name: "WRITE", description: "Change its rows, write its files" }
-  grants:
-    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
-parts:
-  - entityType: "TableSchemaType"
-    values:
-      primaryKey: ["payment_id"]
-      columns:
-        - { name: "payment_id", type: "long" }
-        - { name: "order_id", type: "long" }
-        - { name: "amount", type: "decimal(10,2)" }
-        - { name: "paid_at", type: "timestamptz" }
----
-ref: "daily_revenue"
-entityType: "TableType"
-dependsOn: ["orders", "payments"]
-values:
-  name: "daily_revenue"
-  description: "Revenue and orders per day, for finance"
-  domain: "retail"
-  subdomain: "analytics"
-  layer: "gold"
-  format: "iceberg"
-  principals:
-    - { id: "data-engineers", type: "GROUP" }
-    - { id: "data-analysts", type: "GROUP" }
-  permissions:
-    - { name: "READ", description: "Query the table, read its files" }
-    - { name: "WRITE", description: "Change its rows, write its files" }
-  grants:
-    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
-    - { principals: ["data-analysts"], permissions: ["READ"] }
-parts:
-  - entityType: "TableSchemaType"
-    values:
-      columns:
-        - { name: "day", type: "date" }
-        - { name: "revenue", type: "decimal(12,2)" }
-        - { name: "orders", type: "long" }
----
-ref: "customer_lifetime_value"
-entityType: "TableType"
-dependsOn: ["orders", "customers"]
-values:
-  name: "customer_lifetime_value"
-  description: "What each customer has spent, for marketing; rewritten every week"
-  domain: "retail"
-  subdomain: "analytics"
-  layer: "gold"
+  description: "The CRM's customer export, as it came: names and countries as typed, one row per customer"
+  domain: "sales"
+  layer: "BRONZE"
   format: "parquet"
+  version: 1
   principals:
     - { id: "data-engineers", type: "GROUP" }
-    - { id: "data-analysts", type: "GROUP" }
+    - { id: "lakehouse-pipeline", type: "SERVICE" }
   permissions:
     - { name: "READ", description: "Query the table, read its files" }
     - { name: "WRITE", description: "Change its rows, write its files" }
   grants:
-    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
-    - { principals: ["data-analysts"], permissions: ["READ"] }
+    - { principals: ["data-engineers", "lakehouse-pipeline"], permissions: ["READ", "WRITE"] }
 parts:
   - entityType: "TableSchemaType"
     values:
       columns:
-        - { name: "customer_id", type: "long" }
-        - { name: "country", type: "string" }
-        - { name: "lifetime_value", type: "decimal(12,2)" }
+        - { name: "customer_id", type: "long", description: "The customer's number in the CRM" }
+        - { name: "full_name", type: "string", description: "First and last name, as typed" }
+        - { name: "email", type: "string", description: "E-mail address, mixed case" }
+        - { name: "country", type: "string", description: "ISO 3166 country code, in either case" }
+        - { name: "segment", type: "string", description: "consumer, smb or enterprise" }
+        - { name: "signup_date", type: "date", description: "Day the customer signed up" }
+        - { name: "ingested_at", type: "timestamp", description: "When the export was loaded" }
 ---
-ref: "monthly_revenue"
+ref: "sales_bronze_orders_v1"
 entityType: "TableType"
-dependsOn: ["orders", "payments"]
 values:
-  name: "monthly_revenue"
-  description: "Revenue per month: orders paid, their total and average"
-  domain: "retail"
-  subdomain: "analytics"
-  layer: "gold"
-  format: "iceberg"
+  name: "orders"
+  description: "Order events from the web shop, as emitted: a status change repeats the order, some rows are broken"
+  domain: "sales"
+  layer: "BRONZE"
+  format: "parquet"
+  version: 1
   principals:
     - { id: "data-engineers", type: "GROUP" }
-    - { id: "data-analysts", type: "GROUP" }
+    - { id: "lakehouse-pipeline", type: "SERVICE" }
   permissions:
     - { name: "READ", description: "Query the table, read its files" }
     - { name: "WRITE", description: "Change its rows, write its files" }
   grants:
-    - { principals: ["data-engineers"], permissions: ["READ", "WRITE"] }
+    - { principals: ["data-engineers", "lakehouse-pipeline"], permissions: ["READ", "WRITE"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      columns:
+        - { name: "order_id", type: "long", description: "The order's number" }
+        - { name: "customer_id", type: "long", description: "Who ordered (missing on a few broken events)" }
+        - { name: "order_ts", type: "timestamp", description: "When the order was placed (UTC)" }
+        - { name: "status", type: "string", description: "placed, paid, shipped, delivered, cancelled or returned" }
+        - { name: "currency", type: "string", description: "EUR, USD, GBP or CHF" }
+        - { name: "amount", type: "double", description: "Order total in its currency (zero or negative on broken events)" }
+        - { name: "items", type: "int", description: "Number of items" }
+        - { name: "channel", type: "string", description: "web, app, store or marketplace" }
+        - { name: "ingested_at", type: "timestamp", description: "When the event was loaded" }
+---
+ref: "logistics_bronze_carriers_v1"
+entityType: "TableType"
+values:
+  name: "carriers"
+  description: "The carriers the shop ships with and their service levels, from the carrier contracts"
+  domain: "logistics"
+  layer: "BRONZE"
+  format: "parquet"
+  version: 1
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+    - { id: "lakehouse-pipeline", type: "SERVICE" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers", "lakehouse-pipeline"], permissions: ["READ", "WRITE"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      columns:
+        - { name: "carrier_code", type: "string", description: "Short code of the carrier" }
+        - { name: "carrier_name", type: "string", description: "The carrier's name" }
+        - { name: "service_level", type: "string", description: "economy, standard or express" }
+        - { name: "home_country", type: "string", description: "ISO 3166 code of the carrier's home market" }
+        - { name: "promised_hours", type: "int", description: "Delivery time the contract promises, in hours" }
+        - { name: "ingested_at", type: "timestamp", description: "When the contract list was loaded" }
+---
+ref: "logistics_bronze_shipments_v1"
+entityType: "TableType"
+values:
+  name: "shipments"
+  description: "Shipment tracking events from the warehouses: one row per parcel, as the tracking feed reports it"
+  domain: "logistics"
+  layer: "BRONZE"
+  format: "parquet"
+  version: 1
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+    - { id: "lakehouse-pipeline", type: "SERVICE" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers", "lakehouse-pipeline"], permissions: ["READ", "WRITE"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      columns:
+        - { name: "shipment_id", type: "long", description: "The parcel's tracking number" }
+        - { name: "order_id", type: "long", description: "The order it carries" }
+        - { name: "carrier_code", type: "string", description: "Who carries it" }
+        - { name: "warehouse", type: "string", description: "Where it left from" }
+        - { name: "shipped_ts", type: "timestamp", description: "When it left the warehouse (UTC)" }
+        - { name: "delivered_ts", type: "timestamp", description: "When it was delivered (UTC); empty while under way" }
+        - { name: "status", type: "string", description: "in_transit, delivered, returned or lost" }
+        - { name: "weight_kg", type: "double", description: "Parcel weight in kilograms" }
+        - { name: "ingested_at", type: "timestamp", description: "When the event was loaded" }
+---
+ref: "sales_silver_customers_v1"
+entityType: "TableType"
+dependsOn: ["sales_bronze_customers_v1"]
+values:
+  name: "customers"
+  description: "One clean row per customer: e-mail in lower case with its domain, country codes in upper case"
+  domain: "sales"
+  layer: "SILVER"
+  format: "iceberg"
+  version: 1
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+    - { id: "lakehouse-pipeline", type: "SERVICE" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers", "lakehouse-pipeline"], permissions: ["READ", "WRITE"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      columns:
+        - { name: "customer_id", type: "long", description: "The customer's number" }
+        - { name: "full_name", type: "string", description: "First and last name" }
+        - { name: "email", type: "string", description: "E-mail address, lower case" }
+        - { name: "email_domain", type: "string", description: "The part of the address after @" }
+        - { name: "country", type: "string", description: "ISO 3166 country code, upper case" }
+        - { name: "segment", type: "string", description: "consumer, smb or enterprise" }
+        - { name: "signup_date", type: "date", description: "Day the customer signed up" }
+---
+ref: "sales_silver_orders_v1"
+entityType: "TableType"
+dependsOn: ["sales_bronze_orders_v1"]
+values:
+  name: "orders"
+  description: "One row per order in its latest status, broken events left out, totals in EUR"
+  domain: "sales"
+  layer: "SILVER"
+  format: "iceberg"
+  version: 1
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+    - { id: "lakehouse-pipeline", type: "SERVICE" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers", "lakehouse-pipeline"], permissions: ["READ", "WRITE"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      columns:
+        - { name: "order_id", type: "long", description: "The order's number" }
+        - { name: "customer_id", type: "long", description: "Who ordered" }
+        - { name: "order_date", type: "date", description: "Day the order was placed (UTC)" }
+        - { name: "order_ts", type: "timestamp", description: "When the order was placed (UTC)" }
+        - { name: "status", type: "string", description: "The order's latest status" }
+        - { name: "currency", type: "string", description: "Currency the customer paid in" }
+        - { name: "amount", type: "decimal(12,2)", description: "Order total in its currency" }
+        - { name: "amount_eur", type: "decimal(12,2)", description: "Order total in EUR (fixed rates of the example)" }
+        - { name: "items", type: "int", description: "Number of items" }
+        - { name: "channel", type: "string", description: "web, app, store or marketplace" }
+---
+ref: "logistics_silver_shipments_v1"
+entityType: "TableType"
+dependsOn: ["logistics_bronze_shipments_v1", "logistics_bronze_carriers_v1"]
+values:
+  name: "shipments"
+  description: "One row per parcel with its carrier's name and service level, transit time and whether it came on time"
+  domain: "logistics"
+  layer: "SILVER"
+  format: "iceberg"
+  version: 1
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+    - { id: "lakehouse-pipeline", type: "SERVICE" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers", "lakehouse-pipeline"], permissions: ["READ", "WRITE"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      columns:
+        - { name: "shipment_id", type: "long", description: "The parcel's tracking number" }
+        - { name: "order_id", type: "long", description: "The order it carries" }
+        - { name: "carrier_code", type: "string", description: "Who carries it" }
+        - { name: "carrier_name", type: "string", description: "The carrier's name" }
+        - { name: "service_level", type: "string", description: "economy, standard or express" }
+        - { name: "warehouse", type: "string", description: "Where it left from" }
+        - { name: "shipped_date", type: "date", description: "Day it left the warehouse (UTC)" }
+        - { name: "shipped_ts", type: "timestamp", description: "When it left the warehouse (UTC)" }
+        - { name: "delivered_ts", type: "timestamp", description: "When it was delivered (UTC), if it was" }
+        - { name: "transit_hours", type: "double", description: "Hours from the warehouse to the door, if delivered" }
+        - { name: "promised_hours", type: "int", description: "Hours the carrier's service level promises" }
+        - { name: "on_time", type: "boolean", description: "Delivered within the promised hours" }
+        - { name: "status", type: "string", description: "in_transit, delivered, returned or lost" }
+        - { name: "weight_kg", type: "double", description: "Parcel weight in kilograms" }
+---
+ref: "sales_gold_daily_sales_v1"
+entityType: "TableType"
+dependsOn: ["sales_silver_orders_v1", "sales_silver_customers_v1"]
+values:
+  name: "daily_sales"
+  description: "Revenue per day, country and channel, of the orders that were paid (cancelled and returned ones left out)"
+  domain: "sales"
+  layer: "GOLD"
+  format: "iceberg"
+  version: 1
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+    - { id: "data-analysts", type: "GROUP" }
+    - { id: "lakehouse-pipeline", type: "SERVICE" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers", "lakehouse-pipeline"], permissions: ["READ", "WRITE"] }
     - { principals: ["data-analysts"], permissions: ["READ"] }
 parts:
   - entityType: "TableSchemaType"
     values:
-      primaryKey: ["month"]
       columns:
-        - { name: "month", type: "date", description: "First day of the month" }
-        - { name: "orders", type: "long", description: "Orders paid in the month" }
-        - { name: "revenue", type: "decimal(12,2)", description: "Total paid" }
-        - { name: "average_order", type: "decimal(10,2)", description: "Revenue divided by orders" }
-        - { name: "customers", type: "long", description: "Customers who paid in the month" }
+        - { name: "order_date", type: "date", description: "The day (UTC)" }
+        - { name: "country", type: "string", description: "The customers' country" }
+        - { name: "channel", type: "string", description: "web, app, store or marketplace" }
+        - { name: "orders", type: "long", description: "Paid orders" }
+        - { name: "customers", type: "long", description: "Distinct customers who ordered" }
+        - { name: "items", type: "long", description: "Items sold" }
+        - { name: "revenue_eur", type: "decimal(18,2)", description: "Revenue in EUR" }
+        - { name: "avg_order_eur", type: "decimal(12,2)", description: "Average order in EUR" }
+---
+ref: "sales_gold_customer_value_v1"
+entityType: "TableType"
+dependsOn: ["sales_silver_orders_v1", "sales_silver_customers_v1"]
+values:
+  name: "customer_value"
+  description: "What each customer brought in over their life: orders, revenue, first and last order, value band"
+  domain: "sales"
+  layer: "GOLD"
+  format: "iceberg"
+  version: 1
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+    - { id: "data-analysts", type: "GROUP" }
+    - { id: "lakehouse-pipeline", type: "SERVICE" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers", "lakehouse-pipeline"], permissions: ["READ", "WRITE"] }
+    - { principals: ["data-analysts"], permissions: ["READ"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      columns:
+        - { name: "customer_id", type: "long", description: "The customer's number" }
+        - { name: "country", type: "string", description: "ISO 3166 country code" }
+        - { name: "segment", type: "string", description: "consumer, smb or enterprise" }
+        - { name: "first_order_date", type: "date", description: "Day of the first paid order" }
+        - { name: "last_order_date", type: "date", description: "Day of the last paid order" }
+        - { name: "orders", type: "long", description: "Paid orders" }
+        - { name: "revenue_eur", type: "decimal(18,2)", description: "Revenue in EUR" }
+        - { name: "value_band", type: "string", description: "low, mid, high or top (by revenue)" }
+---
+ref: "logistics_gold_delivery_performance_v1"
+entityType: "TableType"
+dependsOn: ["logistics_silver_shipments_v1", "sales_silver_orders_v1", "sales_silver_customers_v1"]
+values:
+  name: "delivery_performance"
+  description: "How each carrier and service level delivers, per day and destination country: on-time rate and transit times"
+  domain: "logistics"
+  layer: "GOLD"
+  format: "iceberg"
+  version: 1
+  principals:
+    - { id: "data-engineers", type: "GROUP" }
+    - { id: "data-analysts", type: "GROUP" }
+    - { id: "lakehouse-pipeline", type: "SERVICE" }
+  permissions:
+    - { name: "READ", description: "Query the table, read its files" }
+    - { name: "WRITE", description: "Change its rows, write its files" }
+  grants:
+    - { principals: ["data-engineers", "lakehouse-pipeline"], permissions: ["READ", "WRITE"] }
+    - { principals: ["data-analysts"], permissions: ["READ"] }
+parts:
+  - entityType: "TableSchemaType"
+    values:
+      columns:
+        - { name: "shipped_date", type: "date", description: "Day the parcels left (UTC)" }
+        - { name: "carrier_name", type: "string", description: "The carrier" }
+        - { name: "service_level", type: "string", description: "economy, standard or express" }
+        - { name: "destination_country", type: "string", description: "The customers' country" }
+        - { name: "shipments", type: "long", description: "Parcels shipped" }
+        - { name: "delivered", type: "long", description: "Parcels delivered" }
+        - { name: "on_time", type: "long", description: "Parcels delivered within the promised hours" }
+        - { name: "on_time_rate", type: "double", description: "on_time / delivered" }
+        - { name: "avg_transit_hours", type: "double", description: "Average hours to the door" }
+        - { name: "p95_transit_hours", type: "double", description: "95th percentile of the hours to the door" }

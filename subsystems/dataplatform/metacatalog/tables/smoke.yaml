@@ -1,30 +1,39 @@
-# The smoke test's tables (make dataplatform-smoke-test; their domain smoke,
-# of the model's trait DomainMember): Meta Catalog makes every table and grants every one, so
-# the test writes and reads tables of its own instead of making any. Their
-# policies are shaped for the checks, not for a real medallion:
+# The smoke test's domain and tables (make dataplatform-smoke-test; the
+# domain smoke, a DomainType of its own): Meta Catalog makes every table and
+# grants every one, so the test writes and reads tables of its own instead of
+# making any. Their policies are shaped for the checks, not for a real
+# medallion:
 #
-#   bronze  eng_t      iceberg  data-engineers read and write, data-analysts read
-#                               (Trino writes it, a Spark job reads it)
-#   bronze  spark_t    iceberg  data-engineers read and write (a Spark job writes it)
-#   bronze  avro_t     avro     data-engineers read and write
-#   bronze  drop_zone  parquet  data-engineers read and write: no schema, so a folder
-#                               and nothing in the metastore (the S3 checks' objects)
-#   gold    ana_t      parquet  data-analysts read and write
+#   BRONZE  eng_t_v1      iceberg  data-engineers read and write, data-analysts read
+#                                  (Trino writes it, a Spark job reads it)
+#   BRONZE  spark_t_v1    iceberg  data-engineers read and write (a Spark job writes it)
+#   BRONZE  files_t_v1    parquet  data-engineers read and write (plain files, through Trino)
+#   BRONZE  drop_zone_v1  parquet  data-engineers read and write: no schema, so a folder
+#                                  and nothing in the metastore (the S3 checks' objects)
+#   GOLD    ana_t_v1      parquet  data-analysts read and write
 #
 # The smoke test loads and provisions them on every run, authorizes them as
-# its temporary member of platform-admins, and takes them out of Meta Catalog
-# again at the end. The groups are the site's engineer and analyst groups
-# (site_engineer_group, site_analyst_group), written out: the test puts its
-# users in those and stops at once when this file names others.
+# its temporary member of platform-admins, and takes them and the domain out
+# of Meta Catalog again at the end. make dataplatform-tables ARGS=sync leaves
+# the smoke test's domains (smoke, smoke*) alone. The groups are the site's
+# engineer and analyst groups (site_engineer_group, site_analyst_group),
+# written out: the test puts its users in those and stops at once when this
+# file names others.
+ref: "smoke"
+entityType: "DomainType"
+values:
+  name: "smoke"
+  description: "The smoke test's own tables: made, used and taken out again at every run"
+---
 ref: "eng_t"
 entityType: "TableType"
 values:
   name: "eng_t"
   description: "Trino writes it, a Spark job reads it"
   domain: "smoke"
-  subdomain: "test"
-  layer: "bronze"
+  layer: "BRONZE"
   format: "iceberg"
+  version: 1
   principals:
     - { id: "data-engineers", type: "GROUP" }
     - { id: "data-analysts", type: "GROUP" }
@@ -38,7 +47,7 @@ parts:
   - entityType: "TableSchemaType"
     values:
       columns:
-        - { name: "x", type: "int" }
+        - { name: "x", type: "int", description: "A number" }
 ---
 ref: "spark_t"
 entityType: "TableType"
@@ -46,9 +55,9 @@ values:
   name: "spark_t"
   description: "A Spark job writes it, Trino reads it"
   domain: "smoke"
-  subdomain: "test"
-  layer: "bronze"
+  layer: "BRONZE"
   format: "iceberg"
+  version: 1
   principals:
     - { id: "data-engineers", type: "GROUP" }
   permissions:
@@ -60,17 +69,17 @@ parts:
   - entityType: "TableSchemaType"
     values:
       columns:
-        - { name: "id", type: "long" }
+        - { name: "id", type: "long", description: "A number" }
 ---
-ref: "avro_t"
+ref: "files_t"
 entityType: "TableType"
 values:
-  name: "avro_t"
+  name: "files_t"
   description: "A table of plain files, through Trino"
   domain: "smoke"
-  subdomain: "test"
-  layer: "bronze"
-  format: "avro"
+  layer: "BRONZE"
+  format: "parquet"
+  version: 1
   principals:
     - { id: "data-engineers", type: "GROUP" }
   permissions:
@@ -82,8 +91,8 @@ parts:
   - entityType: "TableSchemaType"
     values:
       columns:
-        - { name: "x", type: "int" }
-        - { name: "at", type: "timestamp" }
+        - { name: "x", type: "int", description: "A number" }
+        - { name: "at", type: "timestamp", description: "A time" }
 ---
 ref: "drop_zone"
 entityType: "TableType"
@@ -91,9 +100,9 @@ values:
   name: "drop_zone"
   description: "A folder with no table: files only"
   domain: "smoke"
-  subdomain: "test"
-  layer: "bronze"
+  layer: "BRONZE"
   format: "parquet"
+  version: 1
   principals:
     - { id: "data-engineers", type: "GROUP" }
   permissions:
@@ -109,9 +118,9 @@ values:
   name: "ana_t"
   description: "The analysts own"
   domain: "smoke"
-  subdomain: "test"
-  layer: "gold"
+  layer: "GOLD"
   format: "parquet"
+  version: 1
   principals:
     - { id: "data-analysts", type: "GROUP" }
   permissions:
@@ -123,4 +132,4 @@ parts:
   - entityType: "TableSchemaType"
     values:
       columns:
-        - { name: "y", type: "int" }
+        - { name: "y", type: "int", description: "A number" }

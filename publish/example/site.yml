@@ -16,6 +16,7 @@
 # ---------------------------------------------------------------- cluster ----
 site_cluster_name: homelab               # (install-time) kubeconfig cluster and context, the metrics' cluster label
 site_lan_domain: home.arpa               # the nodes' DNS domain (hosts.ini names them <node>.<it>)
+site_lan_search_domain: ""               # the search domain the LAN's DHCP gives the nodes (the router's), which the cluster's DNS answers itself; '' = none
 site_lan_network: 192.168.1.0/24         # the boards' LAN: Ceph's public and cluster network, trusted by the platform's network policies
 site_s3_vip: 192.168.1.200/24            # the S3 ingress' virtual IP: a free address of the LAN
 site_k3s_api_vip: ""                     # a free LAN address for the Kubernetes API (kube-vip); '' = off

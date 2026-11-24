@@ -1,0 +1,34 @@
+# Airflow's metadata database (runs, task states, users of its own table).
+# Airflow owns the schema (the scheduler migrates it at its start), so the
+# bootstrap only makes the database and its owner. Two instances, like the
+# platform's other databases: a node's drain never takes it away.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: airflow-db
+spec:
+  instances: 2
+  storage:
+    storageClass: <%= dataplatform_storage_class %>
+    size: 2Gi
+  bootstrap:
+    initdb:
+      database: airflow
+      owner: airflow
+      secret:
+        name: airflow-db-owner
+  # Continuous WAL archiving and the nightly base backups go through the
+  # Barman Cloud plugin to the ObjectStore airflow-db (airflow-db-objectstore.yaml):
+  # s3://<%= site_backup_bucket %>/cnpg/airflow-db/airflow-db/, with the backup key.
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: airflow-db
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+    limits: {memory: 512Mi}
+  inheritedMetadata:
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9187"

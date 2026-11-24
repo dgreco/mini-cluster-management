@@ -21,6 +21,20 @@ k3s_api_vip_interface: eth0
 k3s_api_vip_image: ghcr.io/kube-vip/kube-vip:v1.2.4
 k3s_api_host: "{{ k3s_api_vip if k3s_api_vip | length > 0 else hostvars[k3s_first_server]['ansible_host'] }}"
 k3s_disable: [traefik]                  # packaged components to leave out (servicelb stays)
+# Pod traffic between the nodes (k3s's flannel). host-gw: a route per node's
+# pod subnet via that node's LAN address, the boards being on one LAN. VXLAN,
+# k3s's default, sends from the first IPv4 address of the default interface,
+# and k3s cannot name another: on 2026-11-24 an ingress node held the S3
+# virtual IP when k3s started after a power-on, flannel took it, the address
+# moved to the other ingress node, and every pod of the first one was cut off
+# from the other nodes for three hours. The role also pins node-ip and
+# node-external-ip to node_ip, and flannel-external-ip makes flannel publish
+# that address whatever the interface holds; host-gw has no tunnel source of
+# its own. Both flannel settings must be the same on every server (k3s
+# refuses a server that differs): a change restarts the servers one at a
+# time, the first one first, then the agents (make k3s-install); its last step
+# (flannel.yml) checks every node and removes the VXLAN device left behind.
+k3s_flannel_backend: host-gw
 k3s_server_extra_config: {}             # merged into /etc/rancher/k3s/config.yaml on servers
 k3s_agent_extra_config: {}              # same for agents
 # Every board also runs Ceph (an OSD with osd_memory_target 4 GiB, and mon,
@@ -29,6 +43,14 @@ k3s_agent_extra_config: {}              # same for agents
 # picks a Ceph daemon. 32 GiB boards: 24-25 GiB stay allocatable.
 k3s_kubelet_system_reserved: "cpu=1,memory=6Gi"
 k3s_kubelet_eviction_hard: "memory.available<1Gi,nodefs.available<10%"
+# inotify limits of the kernel, per user (root runs the kubelet and every
+# containerd shim). Ubuntu's 128 instances ran out at some 30 pods a node
+# (2026-11-22: three per shim, 17 for k3s, cephadm's conmon): the kubelet
+# could no longer follow a log ("failed to create fsnotify watcher: too many
+# open files"), so `kubectl logs -f` stopped short. A limit costs nothing
+# until used.
+k3s_inotify_max_user_instances: 8192
+k3s_inotify_max_user_watches: 524288
 k3s_kubeconfig: "{{ secrets_dir }}/k3s.yaml"
 # The control node's kubeconfig, where the `k3s` context is merged (replacing
 # entries of an earlier install) and made current. '' to skip.

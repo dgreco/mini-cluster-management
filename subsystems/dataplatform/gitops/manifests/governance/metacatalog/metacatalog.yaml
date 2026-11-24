@@ -43,7 +43,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: metacatalog
-          image: ghcr.io/dgreco/metacatalog:2.0.0@sha256:3c3996cc7ccac7e8f87e3885d7d5097fb046dd2548d6ba065c823d4326cb36e6
+          image: ghcr.io/dgreco/metacatalog:2.1.1@sha256:af44c0381d85b790248577a37b053f2193c908a690656e1c02518be8dd2d641d
           ports:
             - {name: http, containerPort: 8080}
           env:
@@ -90,6 +90,10 @@ spec:
             - {name: PROVISIONER_CLIENT_SECRET_FILE, value: /etc/metacatalog/provisioner/client-secret}
             # its own Service: reconcile.sh lists its folders and tables there
             - {name: METACATALOG_API, value: http://metacatalog.governance.svc/metacatalog/v1}
+            # the metastore's Iceberg REST catalog: table.sh drops there the
+            # entry of an Iceberg table whose metadata files are gone, which
+            # Trino's lakehouse connector cannot drop
+            - {name: METASTORE_REST, value: http://hive-metastore-iceberg.governance.svc.cluster.local:9001/iceberg}
           # ... the record of grants, Ceph and the names of the platform's
           # tables (metacatalog-grants.yaml)
           envFrom:

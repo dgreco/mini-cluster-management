@@ -1,0 +1,44 @@
+---
+# Task file: every node's flannel publishes its own LAN address (node_ip) and
+# the backend of k3s_flannel_backend. The other nodes route a node's pod subnet
+# to that address, so a wrong one cuts the node's pods off from the rest while
+# the node itself looks Ready (2026-11-24: an ingress node published the S3
+# virtual IP for three hours after a power-on). Runs where `k3s kubectl`
+# works: k3s_flannel_check_host (default: this host). Included by
+# post-startup.yml, hooks/node-exit.yml and flannel.yml.
+- name: Every node's flannel publishes its own address
+  ansible.builtin.shell: |
+    set -o pipefail
+    jp='{range .items[*]}{.metadata.name}{"|"}{.status.addresses[?(@.type=="InternalIP")].address}{"|"}'
+    jp+='{.metadata.annotations.flannel\.alpha\.coreos\.com/public-ip}{"|"}'
+    jp+='{.metadata.annotations.flannel\.alpha\.coreos\.com/backend-type}{"\n"}{end}'
+    want="{{ groups['k3s'] | map('extract', hostvars, 'node_ip') | sort | join(' ') }}"
+    end=$((SECONDS + 120))
+    while :; do
+      out=$(/usr/local/bin/k3s kubectl get nodes -o "jsonpath=$jp")
+      bad=$(awk -F'|' -v b='{{ k3s_flannel_backend }}' '$2 != $3 || $4 != b {
+              printf "%s: node address %s, flannel publishes %s with backend %s\n", $1, $2, $3 ? $3 : "nothing", $4 ? $4 : "none" }' <<<"$out")
+      have=$(awk -F'|' '{ print $2 }' <<<"$out" | LC_ALL=C sort | xargs)
+      [ -z "$bad" ] && [ "$have" = "$want" ] && exit 0
+      [ $SECONDS -lt $end ] || break
+      sleep 5
+    done
+    [ -z "$bad" ] || echo "$bad"
+    [ "$have" = "$want" ] || echo "node addresses: $have; node_ip in the inventory: $want"
+    exit 1
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ k3s_flannel_check_host | default(inventory_hostname) }}"
+  register: k3s_flannel_check
+  changed_when: false
+  failed_when: false
+
+- name: The addresses flannel publishes are the nodes' own
+  ansible.builtin.assert:
+    that: k3s_flannel_check.rc == 0
+    fail_msg: >-
+      {{ k3s_flannel_check.stdout_lines | join('; ') }}. A node whose flannel publishes another
+      address than its own has its pods cut off from the other nodes; another backend than
+      {{ k3s_flannel_backend }} means k3s has not restarted with k3s_flannel_backend yet (make k3s-install).
+      See the k3s README, "Pod traffic between the nodes".
+    quiet: true

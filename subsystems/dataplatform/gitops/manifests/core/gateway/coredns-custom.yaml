@@ -1,8 +1,10 @@
+# k3s's CoreDNS reads this one ConfigMap: *.override keys go into its main
+# server block, *.server keys are server blocks of their own.
+#
 # Pods resolve the public names *.data.example.org to the Gateway's own
 # Service, so in-cluster clients (Argo CD, Grafana, OpenBao, Trino, Spark
 # fetching Keycloak's discovery and keys) use the same URLs and certificate as
-# everyone else without leaving the cluster. k3s's CoreDNS imports *.override
-# keys of this ConfigMap into its main server block.
+# everyone else without leaving the cluster.
 apiVersion: v1
 kind: ConfigMap
 metadata:
